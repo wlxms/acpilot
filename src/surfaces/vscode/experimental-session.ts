@@ -50,7 +50,6 @@ import { getCheckpointApproval, snapshotTurnIndex } from '../../backend/checkpoi
 import { pushSnapshotTextEditParts, replaySnapshotsToWorkspace } from '../../backend/checkpoint/replay';
 import { applySessionTitle } from '../../participant/session-title';
 import type { SessionTitleSource } from '../../backend/serializable/types';
-import { OpenCodeProtocolBridge } from '../../backends/opencode/opencode-bridge';
 
 // ---------------------------------------------------------------------------
 // Internal types for session content restoration

@@ -220,9 +220,10 @@ describe('OpenCodeBridge', () => {
       await bridge.run((async function* () {
         yield {
           type: 'session.updated',
-          properties: { info: { id: 'test-session', title: 'how to implement oauth middleware' } },
+          sessionId: 'test-session',
+          title: 'how to implement oauth middleware',
         } as any;
-        yield { type: 'session.idle', properties: { sessionID: 'test-session' } } as any;
+        yield { type: 'session.idle', sessionId: 'test-session' } as any;
       })(), mockToken());
       await sss.flush();
 
@@ -273,9 +274,10 @@ describe('OpenCodeBridge', () => {
       await bridge.run((async function* () {
         yield {
           type: 'session.updated',
-          properties: { info: { id: 'test-session', title: 'refactor bridge title flow...' } },
+          sessionId: 'test-session',
+          title: 'refactor bridge title flow...',
         } as any;
-        yield { type: 'session.idle', properties: { sessionID: 'test-session' } } as any;
+        yield { type: 'session.idle', sessionId: 'test-session' } as any;
       })(), mockToken());
       await sss.flush();
 
@@ -313,9 +315,10 @@ describe('OpenCodeBridge', () => {
       await bridge.run((async function* () {
         yield {
           type: 'session.updated',
-          properties: { info: { id: 'test-session', title: 'OAuth Middleware' } },
+          sessionId: 'test-session',
+          title: 'OAuth Middleware',
         } as any;
-        yield { type: 'session.idle', properties: { sessionID: 'test-session' } } as any;
+        yield { type: 'session.idle', sessionId: 'test-session' } as any;
       })(), mockToken());
       await sss.flush();
 

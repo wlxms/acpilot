@@ -152,14 +152,19 @@ export async function writeTurnEnd(
 }
 
 // ===========================================================================
-// v2 serialization (events, snapshots)
+// v2 serialization (snapshots)
 // ===========================================================================
 
 /**
- * Write a legacy raw ACP event as a JSONL line (append-mode).
+ * Write a legacy raw event line as a JSONL line (append-mode).
+ *
+ * No longer used in production (SSP stream-parts are the sole persistence
+ * format), but retained as a test helper for exercising the legacy `event`
+ * line readers ({@link readLegacySessionEvents} /
+ * {@link readLegacySessionTurnEvents}) that the on-disk migration still reads.
  *
  * @param filePath - Absolute path to the session events file
- * @param event    - The ACP event to persist
+ * @param event    - The event to persist
  */
 export async function writeLegacyEvent(
   filePath: string,

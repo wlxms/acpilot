@@ -24,14 +24,14 @@ export interface SelectionState {
 // ===========================================================================
 
 export interface AppEventMap {
-  /** Fired when the backend has completed startup and is ready for use */
-  'backend-ready': void;
-  /** Fired when the backend session list has changed (created, deleted, etc.) */
-  'session-list-changed': void;
-  /** Fired when the user changes agent or model selection */
-  'selection-changed': SelectionState;
+  /** Fired when a backend has completed startup and is ready for use */
+  'backend-ready': { backendId: string };
+  /** Fired when a backend's session list has changed (created, deleted, etc.) */
+  'session-list-changed': { backendId: string };
+  /** Fired when the user changes agent or model selection for a backend */
+  'selection-changed': SelectionState & { backendId: string };
   /** Fired when a specific session's status transitions (idle → busy → retry → idle) */
-  'session-status-changed': { sessionId: string; status: AcpSessionStatus };
+  'session-status-changed': { sessionId: string; status: AcpSessionStatus; backendId: string };
 }
 
 // ===========================================================================

@@ -5,7 +5,7 @@ import { SerializableSessionStream } from '../acp/streaming/session-stream';
 import { UserPromptSSP } from '../ssp/impl/user-prompt';
 import { applyProvisionalSessionTitle, applySessionTitle, isPlaceholderSessionTitle } from './session-title';
 
-import type { ExtensionState, TurnMapping } from '../types';
+import type { ExtensionState, TurnMapping, BackendContext } from '../types';
 import type { AcpChildSessionInfo, AcpSessionStatus, AcpResult, AcpModel, AcpAgent } from '../acp/types';
 import type { AcpEvent } from '../acp/types';
 import type { SessionTitleSource } from '../acp/serializable/types';
@@ -47,12 +47,13 @@ import { extractAttachmentsFromReferences } from './references';
 export async function resolvePromptModel(
   request: vscode.ChatRequest,
   state: ExtensionState,
+  ctx: BackendContext,
 ): Promise<{ providerID: string; modelID: string } | undefined> {
   const nativeModel = request.model;
 
   // Fast path: no native model - use custom store
   if (!nativeModel) {
-    return state.selection.get().model;
+    return ctx.selection.get().model;
   }
 
   // ACPModels primary resolution
@@ -68,11 +69,11 @@ export async function resolvePromptModel(
     const resolution = state.acpModels.resolve(vendor, modelId);
     if (resolution.kind === 'backend' && resolution.providerID && resolution.modelID) {
       // Unique match - sync to SelectionStore and return
-      const sel = state.selection.get();
+      const sel = ctx.selection.get();
       if (!sel.model ||
           sel.model.providerID !== resolution.providerID ||
           sel.model.modelID !== resolution.modelID) {
-        await state.selection.setModel(resolution.providerID, resolution.modelID);
+        await ctx.selection.setModel(resolution.providerID, resolution.modelID);
       }
       return { providerID: resolution.providerID, modelID: resolution.modelID };
     }
@@ -83,12 +84,12 @@ export async function resolvePromptModel(
 
   // Fetch the backend model catalogue for matching.
   // Errors are non-fatal - fall back to SelectionStore on failure.
-  const modelsResult = await state.backend.config.models();
+  const modelsResult = await ctx.backend.config.models();
   const backendModels: AcpModel[] = modelsResult.data ?? [];
 
   if (backendModels.length === 0) {
     // No catalogue to match against - use SelectionStore
-    return state.selection.get().model;
+    return ctx.selection.get().model;
   }
 
   // Strip vendor prefix (e.g. "opencode-cli/") from nativeModel.id so that
@@ -139,10 +140,10 @@ export async function resolvePromptModel(
   if (uniqueCandidates.length === 1) {
     // Unique match - sync to SelectionStore and return
     const match = uniqueCandidates[0];
-    const sel = state.selection.get();
+    const sel = ctx.selection.get();
     // Only sync if different from current selection
     if (!sel.model || sel.model.providerID !== match.providerID || sel.model.modelID !== match.modelID) {
-      await state.selection.setModel(match.providerID, match.modelID);
+      await ctx.selection.setModel(match.providerID, match.modelID);
     }
     return match;
   }
@@ -155,13 +156,13 @@ export async function resolvePromptModel(
       `[handler] Native model "${nativeModel.id}" matched ${uniqueCandidates.length} backend models - ` +
       `falling back to SelectionStore to avoid ambiguity`,
     );
-    return state.selection.get().model;
+    return ctx.selection.get().model;
   }
 
   // No match at all - native model not in backend catalogue.
   // Fall back to SelectionStore. This can happen when the native picker shows
   // models that the backend doesn't serve (e.g. Copilot-only models).
-  return state.selection.get().model;
+  return ctx.selection.get().model;
 }
 
 /**
@@ -173,15 +174,16 @@ export async function resolvePromptModel(
  */
 export async function resolvePromptAgent(
   state: ExtensionState,
+  ctx: BackendContext,
   directory?: string,
 ): Promise<string | undefined> {
-  const selected = state.selection.get().agent?.trim();
+  const selected = ctx.selection.get().agent?.trim();
   if (!selected) {
     return undefined;
   }
 
   try {
-    const result = await state.backend.config.agents(directory);
+    const result = await ctx.backend.config.agents(directory);
     const agents = result.data ?? [];
     if (agents.length === 0) {
       return selected;
@@ -195,7 +197,7 @@ export async function resolvePromptAgent(
     const byName = agents.filter((agent: AcpAgent) => agent.name?.trim() === selected);
     if (byName.length === 1) {
       const resolved = byName[0].id;
-      await state.selection.setAgent(resolved);
+      await ctx.selection.setAgent(resolved);
       state.outputChannel.appendLine(
         `[handler] Agent selection normalized from ${JSON.stringify(selected)} to ${JSON.stringify(resolved)}`,
       );
@@ -208,7 +210,7 @@ export async function resolvePromptAgent(
     );
     if (byCaseInsensitiveName.length === 1) {
       const resolved = byCaseInsensitiveName[0].id;
-      await state.selection.setAgent(resolved);
+      await ctx.selection.setAgent(resolved);
       state.outputChannel.appendLine(
         `[handler] Agent selection normalized from ${JSON.stringify(selected)} to ${JSON.stringify(resolved)}`,
       );
@@ -266,17 +268,18 @@ function prependReferencedPaths(
  */
 export async function ensureServer(
   state: ExtensionState,
+  ctx: BackendContext,
   stream: vscode.ChatResponseStream,
 ): Promise<boolean> {
-  const status = state.backend.getStatus();
+  const status = ctx.backend.getStatus();
   if (status === 'running') {
     return true;
   }
 
   try {
-    stream.progress(status === 'starting' ? `${state.backend.name} is starting...` : `Starting ${state.backend.name} server...`);
+    stream.progress(status === 'starting' ? `${ctx.backend.name} is starting...` : `Starting ${ctx.backend.name} server...`);
     const workspacePath = getWorkspaceDirectory();
-    const result = await state.backend.start(workspacePath);
+    const result = await ctx.backend.start(workspacePath);
     if (result.error || !result.data) {
       const msg = typeof result.error === 'string' ? result.error : 'Unknown error';
       stream.markdown(`Failed to start backend: ${msg}`);
@@ -339,6 +342,7 @@ function getSessionResourceKey(request: vscode.ChatRequest): string | undefined 
 
 function aliasSessionState(
   state: ExtensionState,
+  ctx: BackendContext,
   sourceKey: string | undefined,
   targetKey: string | undefined,
 ): void {
@@ -346,9 +350,9 @@ function aliasSessionState(
     return;
   }
 
-  const existing = state.sessions.get(sourceKey);
-  if (existing && !state.sessions.has(targetKey)) {
-    state.sessions.set(targetKey, existing);
+  const existing = ctx.sessions.get(sourceKey);
+  if (existing && !ctx.sessions.has(targetKey)) {
+    ctx.sessions.set(targetKey, existing);
   }
 }
 
@@ -381,16 +385,17 @@ function isProvisionalTitleEcho(
  */
 async function resolveSession(
   state: ExtensionState,
+  ctx: BackendContext,
   context: vscode.ChatContext,
   stream: vscode.ChatResponseStream,
   vscodeSessionId: string,
   directory?: string,
 ): Promise<string | null> {
   // Get or create per-VSCode-chat state
-  let chatState = state.sessions.get(vscodeSessionId);
+  let chatState = ctx.sessions.get(vscodeSessionId);
   if (!chatState) {
     chatState = { backendSessionId: '', turnMap: [] };
-    state.sessions.set(vscodeSessionId, chatState);
+    ctx.sessions.set(vscodeSessionId, chatState);
   }
 
   // Check for metadata recovery (VSCode restart / tab restore)
@@ -414,7 +419,7 @@ async function resolveSession(
   // --- Case 1: New chat (no prior session) ---
   if (!chatState.backendSessionId) {
     stream.progress('Creating new session...');
-    const result = await state.backend.sessions.create({
+    const result = await ctx.backend.sessions.create({
       title: getInitialSessionTitle(vscodeSessionId),
       directory,
     });
@@ -431,18 +436,18 @@ async function resolveSession(
     // left fire-and-forget, the initial placeholder write can race with the
     // first-prompt provisional title update and overwrite it.
     try {
-      await state.sessionStore.writeMeta(result.data.id, {
+      await ctx.sessionStore.writeMeta(result.data.id, {
         id: result.data.id,
         title: result.data.title ?? getInitialSessionTitle(vscodeSessionId),
         titleSource: chatState.titleSource,
         titleUpdatedAt: new Date().toISOString(),
         createdAt: result.data.createdAt?.toISOString() ?? new Date().toISOString(),
-        backendName: state.backend.name,
+        backendName: ctx.backend.name,
       });
     } catch (err) {
       state.outputChannel.appendLine(`[handler] writeMeta failed: ${err}`);
     }
-    state.bus.emit('session-list-changed', void 0);
+    state.bus.emit('session-list-changed', { backendId: ctx.id });
     state.outputChannel.appendLine(
       `[handler] Created new session ${chatState.backendSessionId} for VSCode chat ${vscodeSessionId}`,
     );
@@ -474,7 +479,7 @@ async function resolveSession(
       for (let i = chatState.turnMap.length - 1; i >= currentTurnIndex; i--) {
         const entry = chatState.turnMap[i];
         if (entry?.messageId) {
-          const revertResult = await state.backend.sessions.revert(
+          const revertResult = await ctx.backend.sessions.revert(
             chatState.backendSessionId,
             entry.messageId,
             undefined,
@@ -497,7 +502,7 @@ async function resolveSession(
         state.outputChannel.appendLine(
           `[handler] Revert failure - creating new session as fallback`,
         );
-        const createResult = await state.backend.sessions.create({
+        const createResult = await ctx.backend.sessions.create({
           directory,
         });
         if (createResult.error || !createResult.data) {
@@ -543,6 +548,7 @@ async function resolveSession(
  */
 export function createParticipantHandler(
   state: ExtensionState,
+  ctx: BackendContext,
 ): vscode.ChatRequestHandler {
   return async (
     request: vscode.ChatRequest,
@@ -559,7 +565,7 @@ export function createParticipantHandler(
 
       // 2. Slash command routing
       if (request.command) {
-        return await routeCommand(request.command, state, stream, token);
+        return await routeCommand(request.command, state, ctx, stream, token);
       }
 
       // 3. Empty prompt check
@@ -569,7 +575,7 @@ export function createParticipantHandler(
       }
 
       // 4. Start server if needed
-      const ready = await ensureServer(state, stream);
+      const ready = await ensureServer(state, ctx, stream);
       if (!ready) {return { metadata: {} };}
 
       // 4b. Compute workspace directory for session/prompt API calls
@@ -584,14 +590,14 @@ export function createParticipantHandler(
       // before the first follow-up prompt arrives with a VSCode chat sessionId.
       // Alias that restored state so the request handler reuses the selected
       // session instead of creating a detached one.
-      aliasSessionState(state, sessionResourceKey, vscodeSessionId);
+      aliasSessionState(state, ctx, sessionResourceKey, vscodeSessionId);
 
-      const backendSessionId = await resolveSession(state, context, stream, vscodeSessionId, directory);
+      const backendSessionId = await resolveSession(state, ctx, context, stream, vscodeSessionId, directory);
       if (!backendSessionId) {return { metadata: {} };}
 
-      aliasSessionState(state, vscodeSessionId, sessionResourceKey);
+      aliasSessionState(state, ctx, vscodeSessionId, sessionResourceKey);
 
-      const activeChatState = state.sessions.get(vscodeSessionId);
+      const activeChatState = ctx.sessions.get(vscodeSessionId);
       if (activeChatState) {
         activeChatState.createdAt = activeChatState.createdAt ?? new Date();
       }
@@ -605,7 +611,7 @@ export function createParticipantHandler(
         const provisionalTitle = request.prompt.length > 60
           ? `${request.prompt.slice(0, 57).trimEnd()}...`
           : request.prompt;
-        await applyProvisionalSessionTitle(state, {
+        await applyProvisionalSessionTitle(state, ctx, {
           backendSessionId,
           vscodeSessionId,
           title: provisionalTitle,
@@ -620,7 +626,7 @@ export function createParticipantHandler(
 
       const executeTurnWithBridge = async (): Promise<void> => {
         stream.progress('Connecting to event stream...');
-        await state.backend.events.ensureStarted();
+        await ctx.backend.events.ensureStarted();
 
         // 7. Fire the user prompt WITHOUT awaiting (only once per turn)
         stream.progress('Sending message...');
@@ -680,12 +686,12 @@ export function createParticipantHandler(
           agent?: string;
           attachments?: typeof attachments;
         } = {};
-        const resolvedAgent = await resolvePromptAgent(state, directory);
+        const resolvedAgent = await resolvePromptAgent(state, ctx, directory);
         if (resolvedAgent) {
           promptOptions.agent = resolvedAgent;
         }
         // Resolve model: native VS Code picker -> backend match -> SelectionStore fallback
-        const resolvedModel = await resolvePromptModel(request, state);
+        const resolvedModel = await resolvePromptModel(request, state, ctx);
         if (resolvedModel) {
           promptOptions.model = resolvedModel;
         }
@@ -702,7 +708,7 @@ export function createParticipantHandler(
           ? prependReferencedPaths(request.prompt, paths, state.outputChannel)
           : request.prompt;
 
-        const promptPromise = state.backend.sessions.prompt(
+        const promptPromise = ctx.backend.sessions.prompt(
           backendSessionId,
           promptText,
           directory,
@@ -727,7 +733,7 @@ export function createParticipantHandler(
             `[handler] Cancellation requested, aborting session ${backendSessionId} and descendants`,
           );
           // Abort the parent session
-          state.backend.sessions.abort(backendSessionId, directory).then((result: { data?: unknown }) => {
+          ctx.backend.sessions.abort(backendSessionId, directory).then((result: { data?: unknown }) => {
             state.outputChannel.appendLine(
               `[handler] Abort parent result: ${JSON.stringify(result?.data)}`,
             );
@@ -736,9 +742,9 @@ export function createParticipantHandler(
             state.outputChannel.appendLine(`[handler] Abort parent error: ${msg}`);
           });
           // Abort all descendant sessions (children, grandchildren, etc.)
-          const descendants = state.backend.sessions.descendants(backendSessionId);
+          const descendants = ctx.backend.sessions.descendants(backendSessionId);
           for (const childId of descendants) {
-            state.backend.sessions.abort(childId, directory).then((result: { data?: unknown }) => {
+            ctx.backend.sessions.abort(childId, directory).then((result: { data?: unknown }) => {
               state.outputChannel.appendLine(
                 `[handler] Abort descendant ${childId} result: ${JSON.stringify(result?.data)}`,
               );
@@ -775,12 +781,12 @@ export function createParticipantHandler(
         // SSS persistence (v2 architecture)
         const workspaceRoot = getWorkspaceDirectory() ?? '';
         state.outputChannel.appendLine(
-          `[handler] workspaceRoot="${workspaceRoot}" backend="${state.backend.name}" ` +
+          `[handler] workspaceRoot="${workspaceRoot}" backend="${ctx.backend.name}" ` +
           `backendSessionId="${backendSessionId}" requestId="${request.id}" turn=${liveTurnIndex}`,
         );
         sss = new SerializableSessionStream(stream, {
           workspaceRoot,
-          backendName: state.backend.name,
+          backendName: ctx.backend.name,
           sessionId: backendSessionId,
           turnIndex: liveTurnIndex,
           requestId: request.id,
@@ -790,7 +796,7 @@ export function createParticipantHandler(
             titleUpdateChain = titleUpdateChain
               .catch(() => undefined)
               .then(async () => {
-                const applied = await applySessionTitle(state, {
+                const applied = await applySessionTitle(state, ctx, {
                   backendSessionId,
                   vscodeSessionId,
                   title: update.title,
@@ -835,9 +841,9 @@ export function createParticipantHandler(
             state.outputChannel.appendLine(`[handler] bridge run start for session ${backendSessionId}`);
             stream.progress('Waiting for response...');
 
-            const events = state.backend.events.openSessionStream(backendSessionId);
+            const events = ctx.backend.events.openSessionStream(backendSessionId);
 
-            const bridge = state.backend.createBridge(backendSessionId, directory);
+            const bridge = ctx.backend.createBridge(backendSessionId, directory);
             (bridge as any).setLogger?.(state.outputChannel);
             bridge.setSSS(sss);
             state.outputChannel.appendLine(`[handler] Bridge created, SSS set`);
@@ -847,7 +853,7 @@ export function createParticipantHandler(
             await sss.flush();
             state.outputChannel.appendLine(`[handler] bridge.run() completed.`);
 
-            state.backend.events.closeSessionStream(backendSessionId);
+            ctx.backend.events.closeSessionStream(backendSessionId);
 
             // Capture userMessageId from the first bridge run
             if (!userMessageId) {
@@ -869,14 +875,14 @@ export function createParticipantHandler(
             // After subagent tasks completed, send continuation prompt and loop
             if (bridge.getHadSubagentTasks() && !token.isCancellationRequested) {
               state.outputChannel.appendLine('[handler] Subagent tasks completed - sending continuation prompt');
-              await state.backend.sessions.prompt(backendSessionId, '', directory);
+              await ctx.backend.sessions.prompt(backendSessionId, '', directory);
             } else {
               needsContinue = false;
             }
           }
         } finally {
           cancelDisposable.dispose();
-          state.backend.events.closeSessionStream(backendSessionId);
+          ctx.backend.events.closeSessionStream(backendSessionId);
           await sss.drain();
           await titleUpdateChain;
           sss.close();
@@ -887,7 +893,7 @@ export function createParticipantHandler(
         await promptPromise;
 
         // 10. Record user message ID
-        const chatState = state.sessions.get(vscodeSessionId);
+        const chatState = ctx.sessions.get(vscodeSessionId);
         state.outputChannel.appendLine(
           `[handler] User message ID for turn: ${!!chatState && !!userMessageId} (${userMessageId})`,
         );
@@ -926,7 +932,7 @@ export function createParticipantHandler(
 
         if (!resolvedTitle || isPlaceholderSessionTitle(resolvedTitle)) {
           try {
-            const sessionInfo = await state.backend.sessions.get(backendSessionId, directory);
+            const sessionInfo = await ctx.backend.sessions.get(backendSessionId, directory);
             const backendTitle = sessionInfo.data?.title?.trim() ?? '';
             if (isProvisionalTitleEcho(backendTitle, chatState)) {
               state.outputChannel.appendLine(
@@ -953,7 +959,7 @@ export function createParticipantHandler(
 
         // Persist resolved title across backend/sessionMap/SessionStore.
         if (shouldApplyReconciledTitle) {
-          await applySessionTitle(state, {
+          await applySessionTitle(state, ctx, {
             backendSessionId,
             vscodeSessionId,
             title: resolvedTitle,
@@ -968,7 +974,7 @@ export function createParticipantHandler(
         }
 
         state.outputChannel.appendLine(`[handler] Refreshing Session list for session ${backendSessionId}`);
-        state.bus.emit('session-list-changed', void 0);
+        state.bus.emit('session-list-changed', { backendId: ctx.id });
       };
 
       // 11. Execute turn
@@ -979,7 +985,7 @@ export function createParticipantHandler(
         metadata: {
           sessionId: backendSessionId,
           backendSessionId,
-          turnMap: state.sessions.get(vscodeSessionId)?.turnMap ?? [],
+          turnMap: ctx.sessions.get(vscodeSessionId)?.turnMap ?? [],
         },
       };
     } catch (err) {

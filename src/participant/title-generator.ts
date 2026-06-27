@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import type { ExtensionState } from '../types';
+import type { ExtensionState, BackendContext } from '../types';
 import { applySessionTitle, isPlaceholderSessionTitle } from './session-title';
 
 // ===========================================================================
@@ -130,6 +130,7 @@ async function collectLmText(text: AsyncIterable<string>): Promise<string> {
 export async function retitleSession(
   prompt: string,
   state: ExtensionState,
+  ctx: BackendContext,
   backendSessionId: string,
   vscodeSessionId: string,
   directory: string | undefined,
@@ -137,7 +138,7 @@ export async function retitleSession(
   const logger = state.outputChannel;
   const llmTitle = await generateSessionTitle(prompt, state);
   if (llmTitle && !isPlaceholderSessionTitle(llmTitle)) {
-    await applySessionTitle(state, {
+    await applySessionTitle(state, ctx, {
       backendSessionId,
       vscodeSessionId,
       title: llmTitle,

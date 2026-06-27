@@ -52,6 +52,7 @@ export class SelectionStore {
   constructor(
     private readonly backend: AcpBackend,
     private readonly bus: AppEventBus,
+    private readonly backendId: string,
     private readonly storage?: SelectionStorage,
   ) {}
 
@@ -71,7 +72,7 @@ export class SelectionStore {
   async setAgent(agentId: string): Promise<void> {
     this.state = { ...this.state, agent: agentId };
     this.persist();
-    this.bus.emit('selection-changed', { ...this.state });
+    this.bus.emit('selection-changed', { ...this.state, backendId: this.backendId });
   }
 
   /**
@@ -99,7 +100,7 @@ export class SelectionStore {
       modelDisplayName,
     };
     this.persist();
-    this.bus.emit('selection-changed', { ...this.state });
+    this.bus.emit('selection-changed', { ...this.state, backendId: this.backendId });
   }
 
   // -- hydration / defaults ----------------------------------------------

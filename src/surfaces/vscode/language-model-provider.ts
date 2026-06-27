@@ -31,7 +31,7 @@
  */
 
 import * as vscode from 'vscode';
-import type { ExtensionState } from '../../types';
+import type { ExtensionState, BackendContext } from '../../types';
 import { streamViaProvider } from './streaming-client';
 import { providerRegistry } from '../../acpmodels/provider-registry';
 import { AuthReader } from '../../acpmodels/auth-reader';
@@ -80,6 +80,7 @@ export function hasRegisterLanguageModelChatProvider(): boolean {
  */
 export function createLanguageModelChatProvider(
   state: ExtensionState,
+  ctx: BackendContext,
   vendorId: string,
 ): { provider: vscode.LanguageModelChatProvider<OpenCodeLanguageModelChatInformation>; dispose: () => void } {
   const logger = state.outputChannel;
@@ -88,12 +89,15 @@ export function createLanguageModelChatProvider(
   // Track cached models to avoid unnecessary refresh
   let cachedModels: OpenCodeLanguageModelChatInformation[] = [];
 
-  // Subscribe to bus events that signal model list may have changed
-  const unsubBackendReady = state.bus.on('backend-ready', () => {
+  // Subscribe to bus events that signal model list may have changed.
+  // Only react to events from THIS backend's channel.
+  const unsubBackendReady = state.bus.on('backend-ready', (e) => {
+    if (e.backendId !== ctx.id) {return;}
     onChangeEmitter.fire();
   });
 
-  const unsubSelectionChanged = state.bus.on('selection-changed', () => {
+  const unsubSelectionChanged = state.bus.on('selection-changed', (e) => {
+    if (e.backendId !== ctx.id) {return;}
     onChangeEmitter.fire();
   });
 
@@ -110,7 +114,7 @@ export function createLanguageModelChatProvider(
       _token: vscode.CancellationToken,
     ): Promise<OpenCodeLanguageModelChatInformation[]> {
       try {
-        if (!state.backend.isRunning()) {
+        if (!ctx.backend.isRunning()) {
           logger.appendLine(`[lm-provider:${vendorId}] Backend not running — returning cached/empty model list`);
           return cachedModels;
         }
@@ -130,7 +134,7 @@ export function createLanguageModelChatProvider(
             capabilities: r.capabilities,
             isUserSelectable: true,
             isDefault: i === 0 ? true : undefined,
-            targetChatSessionType: r.sessionOnly ? 'acpilot.opencode' : undefined,
+            targetChatSessionType: r.sessionOnly ? ctx.scheme : undefined,
             providerID: routeProviderID,
           }));
 
@@ -235,6 +239,7 @@ export function createLanguageModelChatProvider(
  */
 export function registerLanguageModelChatProvider(
   state: ExtensionState,
+  ctx: BackendContext,
 ): vscode.Disposable | undefined {
   if (!hasRegisterLanguageModelChatProvider()) {
     state.outputChannel.appendLine('[lm-provider] vscode.lm.registerLanguageModelChatProvider unavailable — skipping');
@@ -244,12 +249,13 @@ export function registerLanguageModelChatProvider(
   const registrations: vscode.Disposable[] = [];
   const disposables: (() => void)[] = [];
 
-  // Create a separate provider instance per vendor, each filtering its own models
-  for (const vendor of ['opencode-cli', 'opencode-zen']) {
-    const { provider, dispose } = createLanguageModelChatProvider(state, vendor);
+  // Create a separate provider instance per vendor owned by this backend,
+  // each filtering its own models.
+  for (const vendor of ctx.vendors) {
+    const { provider, dispose } = createLanguageModelChatProvider(state, ctx, vendor);
     registrations.push(vscode.lm.registerLanguageModelChatProvider(vendor, provider));
     disposables.push(dispose);
-    state.outputChannel.appendLine(`[lm-provider] Registered LM provider (vendor="${vendor}")`);
+    state.outputChannel.appendLine(`[lm-provider:${ctx.id}] Registered LM provider (vendor="${vendor}")`);
   }
 
   return {

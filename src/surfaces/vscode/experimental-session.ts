@@ -12,7 +12,7 @@
  */
 import * as vscode from 'vscode';
 import * as path from 'path';
-import type { ExtensionState } from '../../types';
+import type { ExtensionState, BackendContext } from '../../types';
 import type { AcpEvent } from '../../acp/types';
 import type {
   FileSnapshotRecord,
@@ -116,8 +116,8 @@ function getWorkspaceDirectory(): string | undefined {
   return vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
 }
 
-function createSessionResource(sessionId: string): vscode.Uri {
-  return vscode.Uri.parse(`${ACP_SESSION_SCHEME}:/${sessionId}`);
+function createSessionResource(scheme: string, sessionId: string): vscode.Uri {
+  return vscode.Uri.parse(`${scheme}:/${sessionId}`);
 }
 
 /**
@@ -135,8 +135,8 @@ function createSessionResource(sessionId: string): vscode.Uri {
  * Flow:
  * 1. Controller's `getChatSessionInputState` creates tracked inputState
  * 2. VSCode tracks it, fires `onDidChange` when user changes picker
- * 3. We subscribe to `onDidChange`, parse groups, and update selection via state.selection.setAgent
- * 4. Handler reads state.selection.get() at prompt time
+ * 3. We subscribe to `onDidChange`, parse groups, and update selection via ctx.selection.setAgent
+ * 4. Handler reads ctx.selection.get() at prompt time
  *
  * @param state - The global extension state.
  * @param context - The extension context (for subscriptions).
@@ -158,6 +158,7 @@ export function isPlaceholderSessionTitle(title: string | undefined): boolean {
 
 export function createSessionContentProvider(
   state: ExtensionState,
+  ctx: BackendContext,
   context: vscode.ExtensionContext,
 ): {
   provider: vscode.ChatSessionContentProvider;
@@ -235,7 +236,7 @@ export function createSessionContentProvider(
   async function doRefreshOptionGroups(): Promise<void> {
     try {
       // If backend is not running, show placeholder groups without calling backend
-      if (!state.backend.isRunning()) {
+      if (!ctx.backend.isRunning()) {
         const prevGroups = cachedOptionGroups;
         cachedOptionGroups = buildConnectingOptionGroups();
         // Only fire event if groups actually changed (avoid re-triggering VSCode re-poll)
@@ -254,7 +255,7 @@ export function createSessionContentProvider(
       logger.appendLine(`[session-provider] Refreshing option groups (backend running=true)...`);
 
       // Fetch agents (model selection is delegated to VS Code's native model picker)
-      const agentsResult = await state.backend.config.agents(directory);
+      const agentsResult = await ctx.backend.config.agents(directory);
 
       const agents = (agentsResult.data ?? []).filter((a: { hidden?: boolean; mode?: string }) => isUserSelectableAgent(a as any));
 
@@ -262,7 +263,7 @@ export function createSessionContentProvider(
         `[session-provider] Backend returned: ${agentsResult.data?.length ?? 0} agents (error=${agentsResult.error ?? 'none'})`,
       );
 
-      const sel = state.selection.get();
+      const sel = ctx.selection.get();
 
       // Build agent option items
       const agentItems: vscode.ChatSessionProviderOptionItem[] = (agents as any[]).map((a: any) => ({
@@ -297,10 +298,10 @@ export function createSessionContentProvider(
   }
 
   async function ensureBackendRunning(): Promise<void> {
-    if (state.backend.getStatus() === 'running') {
+    if (ctx.backend.getStatus() === 'running') {
       return;
     }
-    if (state.backend.getStatus() === 'starting' && backendStartInFlight) {
+    if (ctx.backend.getStatus() === 'starting' && backendStartInFlight) {
       return backendStartInFlight;
     }
     if (backendStartInFlight) {
@@ -308,7 +309,7 @@ export function createSessionContentProvider(
     }
 
     backendStartInFlight = (async () => {
-      const result = await state.backend.start(directory);
+      const result = await ctx.backend.start(directory);
       if (result.error) {
         throw new Error(typeof result.error === 'string' ? result.error : 'Failed to start backend');
       }
@@ -322,7 +323,7 @@ export function createSessionContentProvider(
   }
 
   function kickBackendStart(reason: string): void {
-    const status = state.backend.getStatus();
+    const status = ctx.backend.getStatus();
     if (status === 'running' || status === 'starting') {
       return;
     }
@@ -331,7 +332,7 @@ export function createSessionContentProvider(
     ensureBackendRunning()
       .then(() => {
         logger.appendLine('[session-provider] Backend ready from provider startup');
-        state.bus.emit('backend-ready', void 0);
+        state.bus.emit('backend-ready', { backendId: ctx.id });
       })
       .catch((err) => {
         logger.appendLine(`[session-provider] Backend provider startup failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -360,13 +361,13 @@ export function createSessionContentProvider(
   function collectRuntimeSessions(): SessionListEntry[] {
     const runtimeSessions = new Map<string, SessionListEntry>();
 
-    for (const [stateKey, chatState] of state.sessions.entries()) {
+    for (const [stateKey, chatState] of ctx.sessions.entries()) {
       if (!chatState.backendSessionId) {
         continue;
       }
-      const resource = stateKey.startsWith('acpilot.opencode:')
+      const resource = stateKey.startsWith(ctx.scheme + ':')
         ? vscode.Uri.parse(stateKey)
-        : createSessionResource(stateKey);
+        : createSessionResource(ctx.scheme, stateKey);
 
       const existing = runtimeSessions.get(chatState.backendSessionId);
       const newTitle = chatState.title ?? '';
@@ -813,7 +814,7 @@ export function createSessionContentProvider(
     };
 
     try {
-      const current = await state.sessionStore.readMeta(sessionId);
+      const current = await ctx.sessionStore.readMeta(sessionId);
       const acceptedThroughTurn = current?.checkpointCursor?.acceptedThroughTurn ?? -1;
       const previousReplayedThroughTurn = current?.checkpointCursor?.replayedThroughTurn;
       update.checkpointCursor = {
@@ -824,7 +825,7 @@ export function createSessionContentProvider(
       if (!hasConflicts && maxTurn !== undefined && acceptedThroughTurn >= maxTurn) {
         update.changeApprovalState = 'accepted';
       }
-      await state.sessionStore.updateMeta(sessionId, update);
+      await ctx.sessionStore.updateMeta(sessionId, update);
       logger.appendLine(
         `[session-provider] Replayed ${result.applied} checkpoint file(s) for ${sessionId} via active response ` +
         `(external=${result.externalEdits}, fallback=${result.fallbackEdits}, conflicts=${result.conflicts.length})`,
@@ -926,7 +927,7 @@ export function createSessionContentProvider(
   function publishSessionItems(controller: vscode.ChatSessionItemController, sessions: readonly SessionListEntry[]): void {
     const sessionThemeIcon = new vscode.ThemeIcon('opencode-logo');
     const items = sessions.map((session) => {
-      const resource = session.resource ?? createSessionResource(session.id);
+      const resource = session.resource ?? createSessionResource(ctx.scheme, session.id);
       const item = controller.createChatSessionItem(resource, getSessionLabel(session));
       item.iconPath = sessionThemeIcon;
       item.description = getSessionDescription(session);
@@ -962,7 +963,7 @@ export function createSessionContentProvider(
     // Skip session list refresh when backend is not running.
     // This preserves VSCode's default session list (user can navigate back)
     // instead of replacing it with an empty list.
-    if (!state.backend.isRunning()) {
+    if (!ctx.backend.isRunning()) {
       logger.appendLine('[session-provider] Backend not running; skipping session list refresh');
       return;
     }
@@ -981,7 +982,7 @@ export function createSessionContentProvider(
     sessionRefreshInFlight = true;
     try {
       // Use filesystem-backed SessionStore (single source of truth)
-      const sessions = await state.sessionStore.listSessions();
+      const sessions = await ctx.sessionStore.listSessions();
 
       logger.appendLine(
         `[session-provider] Refreshing Session list from SessionStore (count=${sessions.length})`,
@@ -1008,7 +1009,8 @@ export function createSessionContentProvider(
   // Register a one-shot callback so that when the backend finishes starting,
   // we immediately refresh option groups + session list with real data.
   // This avoids polling: no repeated requests while backend is offline.
-  const onBackendReadyHandler = () => {
+  const onBackendReadyHandler = (e: { backendId: string }) => {
+    if (e.backendId !== ctx.id) {return;}
     logger.appendLine('[session-provider] Backend ready; refreshing option groups and session list');
     refreshOptionGroups().catch(err => {
       logger.appendLine(`[session-provider] Backend-ready option groups refresh failed: ${err}`);
@@ -1027,7 +1029,7 @@ export function createSessionContentProvider(
   ): Promise<vscode.ChatSessionItem> {
     const directory = getWorkspaceDirectory();
     const title = createSessionLabelFromPrompt(request.prompt, 'new');
-    const result = await state.backend.sessions.create({
+    const result = await ctx.backend.sessions.create({
       title,
       directory,
     });
@@ -1039,7 +1041,7 @@ export function createSessionContentProvider(
 
     const sessionId = result.data.id;
     const createdAt = result.data.createdAt ?? new Date();
-    const resource = createSessionResource(sessionId);
+    const resource = createSessionResource(ctx.scheme, sessionId);
     const resolvedTitle = result.data.title?.trim() || title;
     const titleSource: SessionTitleSource = isPlaceholderSessionTitle(resolvedTitle) ? 'placeholder' : 'history';
     const provisionalTitle = !isPlaceholderSessionTitle(resolvedTitle);
@@ -1052,16 +1054,16 @@ export function createSessionContentProvider(
       createdAt,
     };
 
-    state.sessions.set(sessionId, chatState);
-    state.sessions.set(resource.toString(), chatState);
-    await state.sessionStore.writeMeta(sessionId, {
+    ctx.sessions.set(sessionId, chatState);
+    ctx.sessions.set(resource.toString(), chatState);
+    await ctx.sessionStore.writeMeta(sessionId, {
       id: sessionId,
       title: resolvedTitle,
       titleSource,
       titleUpdatedAt: new Date().toISOString(),
       provisionalTitle,
       createdAt: createdAt.toISOString(),
-      backendName: state.backend.name,
+      backendName: ctx.backend.name,
     });
 
     const item = ctrl.createChatSessionItem(resource, resolvedTitle);
@@ -1093,7 +1095,7 @@ export function createSessionContentProvider(
 
   if (hasControllerAPI) {
     controller = (vscode.chat as any).createChatSessionItemController(
-      ACP_SESSION_SCHEME,
+      ctx.scheme,
       async (_token: vscode.CancellationToken) => {
         await Promise.all([
           refreshOptionGroups(),
@@ -1117,7 +1119,8 @@ export function createSessionContentProvider(
       return createNewSessionItemFromInitialRequest(controller!, handlerContext.request);
     };
 
-    sessionListChangedDispose = state.bus.on('session-list-changed', () => {
+    sessionListChangedDispose = state.bus.on('session-list-changed', (e) => {
+      if (e.backendId !== ctx.id) {return;}
       refreshSessionItems().catch((err) => {
         logger.appendLine(
           `[session-provider] Session list refresh on event failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -1131,7 +1134,7 @@ export function createSessionContentProvider(
         return;
       }
 
-      state.sessionStore.updateMeta(sessionId, { archived: !!item.archived }).catch((err) => {
+      ctx.sessionStore.updateMeta(sessionId, { archived: !!item.archived }).catch((err) => {
         logger.appendLine(
           `[session-provider] Failed to persist archived state for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
         );
@@ -1181,7 +1184,7 @@ export function createSessionContentProvider(
 
           if (group.id === 'agents') {
             const agentId = selected.id.replace(/^agent-/, '');
-            state.selection.setAgent(agentId).catch((err: unknown) => {
+            ctx.selection.setAgent(agentId).catch((err: unknown) => {
               logger.appendLine(`[session-provider] Failed to set agent: ${err}`);
             });
             // [debug] logger.appendLine(`[session-provider] Picker set currentAgent=${agentId}`);
@@ -1242,7 +1245,7 @@ export function createSessionContentProvider(
    *
    * For untitled sessions, the URI contains the VSCode-generated ID (e.g.
    * "untitled-xxx") which must be mapped to the OpenCode session ID via
-   * `state.sessions`. For real sessions (from the session list), the URI
+   * `ctx.sessions`. For real sessions (from the session list), the URI
    * already contains the OpenCode session ID.
    */
   function resolveOpenCodeSessionId(sessionResource: vscode.Uri): string | undefined {
@@ -1255,14 +1258,14 @@ export function createSessionContentProvider(
 
     // Untitled sessions: look up the OpenCode session ID via sessions
     if (rawId) {
-      const chatState = state.sessions.get(rawId);
+      const chatState = ctx.sessions.get(rawId);
       if (chatState?.backendSessionId) {
         return chatState.backendSessionId;
       }
 
       // Also check by the full URI string (sessionResource-based keys)
       const uriKey = sessionResource.toString();
-      const uriState = state.sessions.get(uriKey);
+      const uriState = ctx.sessions.get(uriKey);
       if (uriState?.backendSessionId) {
         return uriState.backendSessionId;
       }
@@ -1274,7 +1277,7 @@ export function createSessionContentProvider(
   function findLiveSessionEntryByBackendId(
     sessionId: string,
   ): { key: string; state: import('../../types').SessionState } | undefined {
-    for (const [key, chatState] of state.sessions.entries()) {
+    for (const [key, chatState] of ctx.sessions.entries()) {
       if (chatState.backendSessionId === sessionId && chatState.turnMap.length > 0) {
         return { key, state: chatState };
       }
@@ -1710,7 +1713,7 @@ export function createSessionContentProvider(
         throw new Error(msg);
       }
 
-      const result = await state.backend.sessions.create({
+      const result = await ctx.backend.sessions.create({
         parentId: sessionId,
         directory,
         title,
@@ -1723,7 +1726,7 @@ export function createSessionContentProvider(
       }
 
       const newSessionId = result.data.id;
-      const newResource = createSessionResource(newSessionId);
+      const newResource = createSessionResource(ctx.scheme, newSessionId);
 
       const item = ctrl.createChatSessionItem(newResource, getSessionLabel({ id: newSessionId, title }));
       item.status = vscode.ChatSessionStatus.Completed;
@@ -1754,11 +1757,11 @@ export function createSessionContentProvider(
     token: vscode.CancellationToken,
     options?: { replayPendingChanges?: boolean },
   ): Promise<RestoredSessionHistory> {
-    const turnsPath = state.sessionStore.getTurnsPath(sessionId);
-    const sessionDir = state.sessionStore.getSessionDir(sessionId);
+    const turnsPath = ctx.sessionStore.getTurnsPath(sessionId);
+    const sessionDir = ctx.sessionStore.getSessionDir(sessionId);
     const sessionStreamPath = getSessionStreamPath(sessionDir);
     const metaStreamPath = getSessionMetaStreamPath(sessionDir);
-    const meta = await state.sessionStore.readMeta(sessionId);
+    const meta = await ctx.sessionStore.readMeta(sessionId);
 
     const mainRecords = await readAllStreamParts(sessionStreamPath);
     if (mainRecords.length > 0) {
@@ -1813,7 +1816,7 @@ export function createSessionContentProvider(
           `[session-provider] Restored request id for ${sessionId}: ` +
           `turn=${turnIndex} requestId=${requestId.id} source=${requestId.source}`,
         );
-        return createRequestTurn(prompt, undefined, [], requestId.id);
+        return createRequestTurn(prompt, undefined, [], ctx.scheme, requestId.id);
       };
 
       const buildResponseTurn = (
@@ -1845,7 +1848,7 @@ export function createSessionContentProvider(
         }
 
         return collector.parts.length > 0
-          ? collector.buildTurn(getRestoredTurnMetadata(snapshotsForResponse, toolIdEditMap))
+          ? collector.buildTurn(getRestoredTurnMetadata(snapshotsForResponse, toolIdEditMap), ctx.scheme)
           : undefined;
       };
 
@@ -1948,7 +1951,7 @@ export function createSessionContentProvider(
         prompt,
         undefined,
         [],
-        'acpilot.opencode',
+        ctx.scheme,
         [],
         undefined,
         requestId.id,
@@ -1988,9 +1991,9 @@ export function createSessionContentProvider(
       // SSS without initialize(): no disk writes during replay
       const sss = new SerializableSessionStream(
         collector as unknown as vscode.ChatResponseStream,
-        { workspaceRoot: '', backendName: state.backend.name, sessionId, turnIndex: 0, requestId: '' },
+        { workspaceRoot: '', backendName: ctx.backend.name, sessionId, turnIndex: 0, requestId: '' },
       );
-      const bridge = new AcpProtocolBridge(state.backend, sessionId);
+      const bridge = new AcpProtocolBridge(ctx.backend, sessionId);
       attachRestoreBridge(bridge, collector, sss);
 
       async function* singleEvent(event: AcpEvent) {
@@ -2017,7 +2020,7 @@ export function createSessionContentProvider(
       if (collector.parts.length === 0) {
         return undefined;
       }
-      return collector.buildTurn(getRestoredTurnMetadata(snapshotsForResponse, toolIdEditMap));
+      return collector.buildTurn(getRestoredTurnMetadata(snapshotsForResponse, toolIdEditMap), ctx.scheme);
     };
 
     if (hasPersistedTurns) {
@@ -2042,23 +2045,23 @@ export function createSessionContentProvider(
       let collectorRestoreSnapshots: FileSnapshotRecord[] = [];
       let sss = new SerializableSessionStream(
         collector as unknown as vscode.ChatResponseStream,
-        { workspaceRoot: '', backendName: state.backend.name, sessionId, turnIndex: 0, requestId: '' },
+        { workspaceRoot: '', backendName: ctx.backend.name, sessionId, turnIndex: 0, requestId: '' },
       );
-      let bridge = new AcpProtocolBridge(state.backend, sessionId);
+      let bridge = new AcpProtocolBridge(ctx.backend, sessionId);
       attachRestoreBridge(bridge, collector, sss);
 
       const flushAssistantTurn = (): void => {
         if (collector.parts.length === 0) {
           return;
         }
-        history.push(collector.buildTurn(getRestoredTurnMetadata(collectorRestoreSnapshots, toolIdEditMap)));
+        history.push(collector.buildTurn(getRestoredTurnMetadata(collectorRestoreSnapshots, toolIdEditMap), ctx.scheme));
         collector = new CollectorStream();
         collectorRestoreSnapshots = [];
         sss = new SerializableSessionStream(
           collector as unknown as vscode.ChatResponseStream,
-          { workspaceRoot: '', backendName: state.backend.name, sessionId, turnIndex: 0, requestId: '' },
+          { workspaceRoot: '', backendName: ctx.backend.name, sessionId, turnIndex: 0, requestId: '' },
         );
-        bridge = new AcpProtocolBridge(state.backend, sessionId);
+        bridge = new AcpProtocolBridge(ctx.backend, sessionId);
         attachRestoreBridge(bridge, collector, sss);
       };
 
@@ -2169,7 +2172,7 @@ export function createSessionContentProvider(
       // Refresh option groups if they haven't been populated yet.
       // This handles the case where the backend wasn't running during
       // provider creation but is now available (user just selected the target).
-      if (cachedOptionGroups.length === 0 && state.backend.isRunning()) {
+      if (cachedOptionGroups.length === 0 && ctx.backend.isRunning()) {
         refreshOptionGroups().catch(() => { /* already logged */ });
       }
 
@@ -2185,7 +2188,7 @@ export function createSessionContentProvider(
         return Promise.resolve({
           title: 'New OpenCode Session',
           history: [],
-          requestHandler: createParticipantHandler(state),
+          requestHandler: createParticipantHandler(state, ctx),
           ...(sessionForkHandler ? { forkHandler: sessionForkHandler } : {}),
         });
       }
@@ -2194,7 +2197,7 @@ export function createSessionContentProvider(
       // that was previously created via requestHandler. The sessions key is
       // request.sessionId which matches the untitled-* ID from the URI path.
       if (sessionId.startsWith('untitled-')) {
-        const chatState = state.sessions.get(sessionId);
+        const chatState = ctx.sessions.get(sessionId);
         if (chatState?.backendSessionId) {
           const backendSessionId = chatState.backendSessionId;
           logger.appendLine(
@@ -2221,11 +2224,11 @@ export function createSessionContentProvider(
                 // Try fetching the latest title from backend; it may have been
                 // auto-generated after the first response completed.
                 try {
-                  const sessionInfo = await state.backend.sessions.get(backendSessionId);
+                  const sessionInfo = await ctx.backend.sessions.get(backendSessionId);
                   const backendTitle = sessionInfo.data?.title?.trim() ?? '';
                   if (!isPlaceholderSessionTitle(backendTitle)) {
                     title = backendTitle;
-                    await applySessionTitle(state, {
+                    await applySessionTitle(state, ctx, {
                       backendSessionId,
                       title: backendTitle,
                       overwrite: false,
@@ -2240,7 +2243,7 @@ export function createSessionContentProvider(
                 }
               }
               if (!isPlaceholderSessionTitle(title)) {
-                await applySessionTitle(state, {
+                await applySessionTitle(state, ctx, {
                   backendSessionId,
                   title,
                   overwrite: false,
@@ -2252,7 +2255,7 @@ export function createSessionContentProvider(
               return {
                 title,
                 history,
-                requestHandler: createParticipantHandler(state),
+                requestHandler: createParticipantHandler(state, ctx),
                 ...(sessionForkHandler ? { forkHandler: sessionForkHandler } : {}),
               };
             } catch (err) {
@@ -2262,7 +2265,7 @@ export function createSessionContentProvider(
               return {
                 title: chatState.title?.trim() || 'OpenCode (offline)',
                 history: [],
-                requestHandler: createParticipantHandler(state),
+                requestHandler: createParticipantHandler(state, ctx),
                 ...(sessionForkHandler ? { forkHandler: sessionForkHandler } : {}),
               };
             }
@@ -2273,7 +2276,7 @@ export function createSessionContentProvider(
         return Promise.resolve({
           title: 'New OpenCode Session',
           history: [],
-          requestHandler: createParticipantHandler(state),
+          requestHandler: createParticipantHandler(state, ctx),
           ...(sessionForkHandler ? { forkHandler: sessionForkHandler } : {}),
         });
       }
@@ -2284,12 +2287,12 @@ export function createSessionContentProvider(
           await ensureBackendRunning();
 
           // Get session info for title
-          const sessionInfo = await state.backend.sessions.get(sessionId);
+          const sessionInfo = await ctx.backend.sessions.get(sessionId);
           const vscodeSessionKey = resource.toString();
           const liveEntry = findLiveSessionEntryByBackendId(sessionId);
           const isLiveInMemory = !!liveEntry;
-          if (liveEntry && !state.sessions.has(vscodeSessionKey)) {
-            state.sessions.set(vscodeSessionKey, liveEntry.state);
+          if (liveEntry && !ctx.sessions.has(vscodeSessionKey)) {
+            ctx.sessions.set(vscodeSessionKey, liveEntry.state);
             logger.appendLine(
               `[session-provider] Aliased provider resource ${vscodeSessionKey} to live session ${sessionId} from ${liveEntry.key}`,
             );
@@ -2307,7 +2310,7 @@ export function createSessionContentProvider(
             : getHistoryDerivedSessionTitle(history, sessionId);
 
           // Store in session map for request handler continuity
-          const existingState = state.sessions.get(vscodeSessionKey);
+          const existingState = ctx.sessions.get(vscodeSessionKey);
           let bestTitle = title;
           if (existingState) {
             existingState.backendSessionId = sessionId;
@@ -2322,14 +2325,14 @@ export function createSessionContentProvider(
             // check if any other sessions entry for the same sessionId
             // already has a non-placeholder title (from a previous handler run).
             if (isPlaceholderSessionTitle(title)) {
-              for (const cs of state.sessions.values()) {
+              for (const cs of ctx.sessions.values()) {
                 if (cs.backendSessionId === sessionId && !isPlaceholderSessionTitle(cs.title)) {
                   bestTitle = cs.title ?? bestTitle;
                   break;
                 }
               }
             }
-            state.sessions.set(vscodeSessionKey, {
+            ctx.sessions.set(vscodeSessionKey, {
               backendSessionId: sessionId,
               turnMap: [],
               title: bestTitle,
@@ -2339,7 +2342,7 @@ export function createSessionContentProvider(
           }
 
           if (!isPlaceholderSessionTitle(bestTitle)) {
-            await applySessionTitle(state, {
+            await applySessionTitle(state, ctx, {
               backendSessionId: sessionId,
               title: bestTitle,
               createdAt: sessionInfo.data?.createdAt,
@@ -2352,7 +2355,7 @@ export function createSessionContentProvider(
           return {
             title: bestTitle,
             history,
-            requestHandler: createParticipantHandler(state),
+            requestHandler: createParticipantHandler(state, ctx),
             ...(pendingReplaySnapshots.length > 0
               ? {
                   activeResponseCallback: async (
@@ -2372,7 +2375,7 @@ export function createSessionContentProvider(
           return {
             title: 'OpenCode (offline)',
             history: [],
-            requestHandler: createParticipantHandler(state),
+            requestHandler: createParticipantHandler(state, ctx),
             ...(sessionForkHandler ? { forkHandler: sessionForkHandler } : {}),
           };
         }
@@ -2407,6 +2410,7 @@ function createRequestTurn(
   prompt: string,
   command: string | undefined,
   references: readonly vscode.ChatPromptReference[],
+  participantId: string,
   requestId?: string,
 ): vscode.ChatRequestTurn {
   const Ctor = vscode.ChatRequestTurn as unknown as new (
@@ -2418,7 +2422,7 @@ function createRequestTurn(
     editedFileEvents: readonly unknown[] | undefined,
     id: string | undefined,
   ) => vscode.ChatRequestTurn;
-  return new Ctor(prompt, command, references, PARTICIPANT_ID, [], undefined, requestId);
+  return new Ctor(prompt, command, references, participantId, [], undefined, requestId);
 }
 
 /**

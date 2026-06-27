@@ -7,7 +7,7 @@
  */
 
 import * as vscode from 'vscode';
-import type { ExtensionState } from '../../types';
+import type { ExtensionState, BackendContext } from '../../types';
 import { createParticipantHandler } from '../../participant/handler';
 
 export interface StableHandlerOptions {
@@ -16,7 +16,8 @@ export interface StableHandlerOptions {
 
 export function createStableHandler(
   state: ExtensionState,
+  ctx: BackendContext,
   _options?: StableHandlerOptions,
 ): vscode.ChatRequestHandler {
-  return createParticipantHandler(state);
+  return createParticipantHandler(state, ctx);
 }

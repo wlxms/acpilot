@@ -1,4 +1,4 @@
-import type { ExtensionState } from '../types';
+import type { ExtensionState, BackendContext } from '../types';
 import type { SessionTitleSource } from '../acp/serializable/types';
 
 export interface ApplySessionTitleOptions {
@@ -66,6 +66,7 @@ function shouldOverwriteTitle(
  */
 export async function applySessionTitle(
   state: ExtensionState,
+  ctx: BackendContext,
   options: ApplySessionTitleOptions,
 ): Promise<string | undefined> {
   let title = options.title?.replace(/\s+/g, ' ').trim();
@@ -77,7 +78,7 @@ export async function applySessionTitle(
 
   if (options.updateBackend) {
     try {
-      const updateResult = await state.backend.sessions.update(options.backendSessionId, {
+      const updateResult = await ctx.backend.sessions.update(options.backendSessionId, {
         title,
         directory: options.directory,
       });
@@ -95,7 +96,7 @@ export async function applySessionTitle(
   let createdAt = options.createdAt;
   const updateState = (stateKey?: string) => {
     if (!stateKey) return;
-    const sessionState = state.sessions.get(stateKey);
+    const sessionState = ctx.sessions.get(stateKey);
     if (!sessionState || sessionState.backendSessionId !== options.backendSessionId) return;
     createdAt = createdAt ?? sessionState.createdAt;
     if (shouldOverwriteTitle(sessionState.title, sessionState.titleSource, options.source, options.overwrite)) {
@@ -106,7 +107,7 @@ export async function applySessionTitle(
   };
 
   updateState(options.vscodeSessionId);
-  for (const sessionState of state.sessions.values()) {
+  for (const sessionState of ctx.sessions.values()) {
     if (sessionState.backendSessionId !== options.backendSessionId) continue;
     createdAt = createdAt ?? sessionState.createdAt;
     if (shouldOverwriteTitle(sessionState.title, sessionState.titleSource, options.source, options.overwrite)) {
@@ -117,13 +118,13 @@ export async function applySessionTitle(
   }
 
   try {
-    await state.sessionStore.updateMeta(options.backendSessionId, {
+    await ctx.sessionStore.updateMeta(options.backendSessionId, {
       title,
       titleSource: options.source,
       titleUpdatedAt: new Date().toISOString(),
       provisionalTitle: false,
       createdAt: (createdAt ?? new Date()).toISOString(),
-      backendName: state.backend.name,
+      backendName: ctx.backend.name,
     });
   } catch (err) {
     logger.appendLine(
@@ -132,13 +133,14 @@ export async function applySessionTitle(
   }
 
   if (options.emitListChanged !== false) {
-    state.bus.emit('session-list-changed', void 0);
+    state.bus.emit('session-list-changed', { backendId: ctx.id });
   }
   return title;
 }
 
 export async function applyProvisionalSessionTitle(
   state: ExtensionState,
+  ctx: BackendContext,
   options: ApplyProvisionalSessionTitleOptions,
 ): Promise<string | undefined> {
   let title = options.title?.replace(/\s+/g, ' ').trim();
@@ -149,7 +151,7 @@ export async function applyProvisionalSessionTitle(
   const logger = state.outputChannel;
   if (options.updateBackend) {
     try {
-      const updateResult = await state.backend.sessions.update(options.backendSessionId, {
+      const updateResult = await ctx.backend.sessions.update(options.backendSessionId, {
         title,
         directory: options.directory,
       });
@@ -165,7 +167,7 @@ export async function applyProvisionalSessionTitle(
   let createdAt = options.createdAt;
   const updateState = (stateKey?: string) => {
     if (!stateKey) return;
-    const sessionState = state.sessions.get(stateKey);
+    const sessionState = ctx.sessions.get(stateKey);
     if (!sessionState || sessionState.backendSessionId !== options.backendSessionId) return;
     createdAt = createdAt ?? sessionState.createdAt;
     if (isPlaceholderSessionTitle(sessionState.title) || sessionState.provisionalTitle) {
@@ -176,7 +178,7 @@ export async function applyProvisionalSessionTitle(
   };
 
   updateState(options.vscodeSessionId);
-  for (const sessionState of state.sessions.values()) {
+  for (const sessionState of ctx.sessions.values()) {
     if (sessionState.backendSessionId !== options.backendSessionId) continue;
     createdAt = createdAt ?? sessionState.createdAt;
     if (isPlaceholderSessionTitle(sessionState.title) || sessionState.provisionalTitle) {
@@ -187,13 +189,13 @@ export async function applyProvisionalSessionTitle(
   }
 
   try {
-    await state.sessionStore.updateMeta(options.backendSessionId, {
+    await ctx.sessionStore.updateMeta(options.backendSessionId, {
       title,
       titleSource: 'history',
       titleUpdatedAt: new Date().toISOString(),
       provisionalTitle: true,
       createdAt: (createdAt ?? new Date()).toISOString(),
-      backendName: state.backend.name,
+      backendName: ctx.backend.name,
     });
   } catch (err) {
     logger.appendLine(
@@ -202,7 +204,7 @@ export async function applyProvisionalSessionTitle(
   }
 
   if (options.emitListChanged !== false) {
-    state.bus.emit('session-list-changed', void 0);
+    state.bus.emit('session-list-changed', { backendId: ctx.id });
   }
   return title;
 }
@@ -213,8 +215,9 @@ export async function applyProvisionalSessionTitle(
  */
 export async function applySessionTitleLegacy(
   state: ExtensionState,
+  ctx: BackendContext,
   options: Omit<ApplySessionTitleOptions, 'backendSessionId'> & { sessionId: string },
 ): Promise<string | undefined> {
   const { sessionId, ...rest } = options;
-  return applySessionTitle(state, { ...rest, backendSessionId: sessionId });
+  return applySessionTitle(state, ctx, { ...rest, backendSessionId: sessionId });
 }

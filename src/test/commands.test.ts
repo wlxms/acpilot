@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import * as vscode from 'vscode';
 import type { AcpBackend } from '../acp/backend';
 import type { AcpServerStatus } from '../acp/types';
-import type { ExtensionState } from '../types';
+import type { ExtensionState, BackendContext } from '../types';
 import { routeCommand } from '../participant/commands';
 import { AppEventBus } from '../acp/app-event-bus';
 
@@ -45,6 +45,7 @@ function createMockClient() {
 
 describe('routeCommand', () => {
   let state: ExtensionState;
+  let ctx: BackendContext;
   let stream: vscode.ChatResponseStream;
   let token: vscode.CancellationToken;
   let backendStatus: AcpServerStatus;
@@ -113,30 +114,44 @@ describe('routeCommand', () => {
         getHadSubagentTasks: vi.fn().mockReturnValue(false),
       })) as unknown as AcpBackend['createBridge'],
     };
-    state = {
+    const outputChannel = {
+      name: 'test',
+      lines: [] as string[],
+      appendLine: vi.fn(),
+      append: vi.fn(),
+      clear: vi.fn(),
+      show: vi.fn(),
+      hide: vi.fn(),
+      dispose: vi.fn(),
+    } as unknown as vscode.OutputChannel;
+
+    ctx = {
+      id: 'opencode',
+      scheme: 'acpilot.opencode',
+      vendors: ['opencode-cli', 'opencode-zen'],
       backend,
-      outputChannel: {
-        name: 'test',
-        lines: [] as string[],
-        appendLine: vi.fn(),
-        append: vi.fn(),
-        clear: vi.fn(),
-        show: vi.fn(),
-        hide: vi.fn(),
-        dispose: vi.fn(),
-      } as unknown as vscode.OutputChannel,
       sessions: {
         get: vi.fn((key: string) => sessionStore.get(key)),
         has: vi.fn((key: string) => sessionStore.has(key)),
         set: vi.fn((key: string, value: unknown) => { sessionStore.set(key, value); }),
         values: vi.fn(() => sessionStore.values()),
-      } as unknown as ExtensionState['sessions'],
-      statusBar: {} as ExtensionState['statusBar'],
+      } as unknown as BackendContext['sessions'],
       selection: {
         get: vi.fn(() => ({ agent: undefined, model: undefined, modelDisplayName: undefined })),
         setAgent: vi.fn(async () => {}),
         setModel: vi.fn(async () => {}),
-      } as unknown as ExtensionState['selection'],
+      } as unknown as BackendContext['selection'],
+      sessionStore: {
+        getTurnsPath: vi.fn().mockReturnValue(''),
+        getSessionDir: vi.fn().mockReturnValue(''),
+        initialize: vi.fn().mockResolvedValue(undefined),
+      } as any,
+    };
+
+    state = {
+      backends: new Map([['opencode', ctx]]),
+      outputChannel,
+      statusBar: {} as ExtensionState['statusBar'],
       bus: new AppEventBus(),
       acpModels: {
         sync: vi.fn(async () => {}),
@@ -145,11 +160,6 @@ describe('routeCommand', () => {
         refresh: vi.fn(async () => {}),
         dispose: vi.fn(),
       } as unknown as ExtensionState['acpModels'],
-      sessionStore: {
-        getTurnsPath: vi.fn().mockReturnValue(''),
-        getSessionDir: vi.fn().mockReturnValue(''),
-        initialize: vi.fn().mockResolvedValue(undefined),
-      } as any,
     };
     stream = {
       markdown: vi.fn(),
@@ -167,23 +177,23 @@ describe('routeCommand', () => {
   // -----------------------------------------------------------------------
 
   it('should create a new session and update state for /new command', async () => {
-    vi.mocked(state.backend.sessions.create).mockResolvedValue({
+    vi.mocked(ctx.backend.sessions.create).mockResolvedValue({
       data: { id: 'session-new', title: '', createdAt: new Date() },
     });
 
-    await routeCommand('new', state, stream, token);
+    await routeCommand('new', state, ctx, stream, token);
 
-    expect(state.backend.start).toHaveBeenCalledOnce();
-    expect(state.backend.sessions.create).toHaveBeenCalledWith();
+    expect(ctx.backend.start).toHaveBeenCalledOnce();
+    expect(ctx.backend.sessions.create).toHaveBeenCalledWith();
     expect(stream.markdown).toHaveBeenCalledWith(
       expect.stringContaining('Started a new conversation session'),
     );
   });
 
   it('should show error when /new is called without a connected client', async () => {
-    vi.mocked(state.backend.start).mockResolvedValue({ error: 'Server not available' });
+    vi.mocked(ctx.backend.start).mockResolvedValue({ error: 'Server not available' });
 
-    await routeCommand('new', state, stream, token);
+    await routeCommand('new', state, ctx, stream, token);
 
     expect(stream.markdown).toHaveBeenCalledWith(
       expect.stringContaining('Failed to start backend'),
@@ -191,11 +201,11 @@ describe('routeCommand', () => {
   });
 
   it('should show error on /new when session creation fails', async () => {
-    vi.mocked(state.backend.sessions.create).mockRejectedValue(
+    vi.mocked(ctx.backend.sessions.create).mockRejectedValue(
       new Error('Session limit reached'),
     );
 
-    await routeCommand('new', state, stream, token);
+    await routeCommand('new', state, ctx, stream, token);
 
     expect(stream.markdown).toHaveBeenCalledWith(
       expect.stringContaining('Session error'),
@@ -207,7 +217,7 @@ describe('routeCommand', () => {
   // -----------------------------------------------------------------------
 
   it('should show formatted help text for /help command', async () => {
-    await routeCommand('help', state, stream, token);
+    await routeCommand('help', state, ctx, stream, token);
 
     expect(stream.markdown).toHaveBeenCalledTimes(1);
     const helpText = (stream.markdown as ReturnType<typeof vi.fn>).mock
@@ -224,14 +234,14 @@ describe('routeCommand', () => {
 
   it('should show providers and models for /model command', async () => {
     backendStatus = 'running';
-    vi.mocked(state.backend.config.models).mockResolvedValue({
+    vi.mocked(ctx.backend.config.models).mockResolvedValue({
       data: [
         { id: 'gpt-4o', name: 'GPT-4o', provider: 'OpenAI' },
         { id: 'claude-3-opus', name: 'Claude 3 Opus', provider: 'Anthropic' },
       ],
     });
 
-    await routeCommand('model', state, stream, token);
+    await routeCommand('model', state, ctx, stream, token);
 
     const modelText = (stream.markdown as ReturnType<typeof vi.fn>).mock
       .calls[0][0] as string;
@@ -247,9 +257,9 @@ describe('routeCommand', () => {
   });
 
   it('should show error when /model is called without a connected client', async () => {
-    vi.mocked(state.backend.start).mockResolvedValue({ error: 'Server not available' });
+    vi.mocked(ctx.backend.start).mockResolvedValue({ error: 'Server not available' });
 
-    await routeCommand('model', state, stream, token);
+    await routeCommand('model', state, ctx, stream, token);
 
     expect(stream.markdown).toHaveBeenCalledWith(
       expect.stringContaining('Failed to start backend'),
@@ -258,9 +268,9 @@ describe('routeCommand', () => {
 
   it('should show error when providers call fails', async () => {
     backendStatus = 'running';
-    vi.mocked(state.backend.config.models).mockRejectedValue(new Error('API error'));
+    vi.mocked(ctx.backend.config.models).mockRejectedValue(new Error('API error'));
 
-    await routeCommand('model', state, stream, token);
+    await routeCommand('model', state, ctx, stream, token);
 
     expect(stream.markdown).toHaveBeenCalledWith(
       expect.stringContaining('Unable to retrieve model information'),
@@ -269,9 +279,9 @@ describe('routeCommand', () => {
 
   it('should show message when no providers configured', async () => {
     backendStatus = 'running';
-    vi.mocked(state.backend.config.models).mockResolvedValue({ data: [] });
+    vi.mocked(ctx.backend.config.models).mockResolvedValue({ data: [] });
 
-    await routeCommand('model', state, stream, token);
+    await routeCommand('model', state, ctx, stream, token);
 
     expect(stream.markdown).toHaveBeenCalledWith(
       expect.stringContaining('No providers configured'),
@@ -283,7 +293,7 @@ describe('routeCommand', () => {
   // -----------------------------------------------------------------------
 
   it('should show error for unknown command', async () => {
-    await routeCommand('unknown', state, stream, token);
+    await routeCommand('unknown', state, ctx, stream, token);
 
     expect(stream.markdown).toHaveBeenCalledWith(
       expect.stringContaining('Unknown command'),
@@ -291,13 +301,13 @@ describe('routeCommand', () => {
   });
 
   it('should be case-insensitive for command names', async () => {
-    vi.mocked(state.backend.sessions.create).mockResolvedValue({
+    vi.mocked(ctx.backend.sessions.create).mockResolvedValue({
       data: { id: 'session-case', title: '', createdAt: new Date() },
     });
 
-    await routeCommand('New', state, stream, token);
+    await routeCommand('New', state, ctx, stream, token);
 
-    expect(state.backend.sessions.create).toHaveBeenCalledOnce();
+    expect(ctx.backend.sessions.create).toHaveBeenCalledOnce();
   });
 
   // -----------------------------------------------------------------------
@@ -306,9 +316,9 @@ describe('routeCommand', () => {
 
   it('should skip providers with no active models in /model output', async () => {
     backendStatus = 'running';
-    vi.mocked(state.backend.config.models).mockResolvedValue({ data: [] });
+    vi.mocked(ctx.backend.config.models).mockResolvedValue({ data: [] });
 
-    await routeCommand('model', state, stream, token);
+    await routeCommand('model', state, ctx, stream, token);
 
     const modelText = (stream.markdown as ReturnType<typeof vi.fn>).mock
       .calls[0][0] as string;

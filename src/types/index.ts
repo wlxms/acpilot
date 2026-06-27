@@ -9,6 +9,31 @@ export interface SessionInfo {
   createdAt: Date;
 }
 
+/**
+ * Per-backend runtime context.
+ *
+ * Each registered backend gets its own isolated state: a backend instance,
+ * its own selection/session/sessionStore, and the scheme + vendors it owns.
+ * Surfaces (participant, session provider, LM provider) are registered
+ * per-context and route via closure-captured ctx rather than a global backend.
+ */
+export interface BackendContext {
+  /** Stable backend id, matches package.json chatSessions type suffix (e.g. 'opencode', 'acp') */
+  readonly id: string;
+  /** Chat session scheme, e.g. 'acpilot.opencode' / 'acpilot.acp' */
+  readonly scheme: string;
+  /** Language-model vendor ids this backend owns (e.g. ['opencode-cli','opencode-zen'] / ['acp']) */
+  readonly vendors: readonly string[];
+  /** The ACP-compatible backend instance */
+  readonly backend: AcpBackend;
+  /** Centralised agent/model selection state (per-backend, namespaced) */
+  selection: import('../acp/selection-store').SelectionStore;
+  /** Centralised session mapping (per-backend) */
+  sessions: import('../acp/session-manager').SessionManager;
+  /** Filesystem-backed persistent session store (path namespaced by id) */
+  sessionStore: import('../acp/streaming/session-store').SessionStore;
+}
+
 /** Tracks the mapping between VSCode chat turns and backend message IDs */
 export interface TurnMapping {
   /** 0-based index of the VSCode user turn */
@@ -44,20 +69,14 @@ export interface PersistedSettingsState {
 
 /** Global extension state shared across modules */
 export interface ExtensionState {
-  /** ACP-compatible backend abstraction used by all surfaces */
-  backend: AcpBackend;
+  /** All assembled backend contexts, keyed by backend id (e.g. 'opencode', 'acp') */
+  backends: Map<string, BackendContext>;
   /** ACPModels bidirectional model registry (Copilot ↔ ACP backends) */
   acpModels: import('../acpmodels/index').AcpModels;
   /** Output channel for logging */
   outputChannel: vscode.OutputChannel;
   /** Status bar controller (shows backend / agent / model) */
   statusBar: StatusBarManager;
-  /** Centralised agent/model selection state */
-  selection: import('../acp/selection-store').SelectionStore;
-  /** Centralised session mapping (VSCode chat → backend session) */
-  sessions: import('../acp/session-manager').SessionManager;
-  /** Filesystem-backed persistent session store */
-  sessionStore: import('../acp/streaming/session-store').SessionStore;
-  /** Application-level typed event bus */
+  /** Application-level typed event bus (channel-scoped by backendId) */
   bus: import('../acp/app-event-bus').AppEventBus;
 }

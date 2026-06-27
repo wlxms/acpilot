@@ -7,7 +7,7 @@ import { createSessionContentProvider } from '../surfaces/vscode/experimental-se
 import { isUserSelectableAgent } from '../acp/types';
 import type { AcpAgent } from '../acp/types';
 import type { AcpBackend } from '../acp/backend';
-import type { ExtensionState } from '../types';
+import type { ExtensionState, BackendContext } from '../types';
 import { AppEventBus } from '../acp/app-event-bus';
 import { readLegacySessionEvents, readLegacySessionTurnEvents, readSessionTurnStreamParts } from '../acp/serializable/serializer';
 import { readCheckpoints } from '../acp/checkpoint/checkpoint-store';
@@ -52,6 +52,7 @@ function getFirstResponseParts(session: vscode.ChatSession): unknown[] {
 
 describe('createSessionContentProvider', () => {
   let state: ExtensionState;
+  let ctx: BackendContext;
 
   beforeEach(() => {
     const sessionStore = new Map<string, unknown>();
@@ -82,86 +83,81 @@ describe('createSessionContentProvider', () => {
     vi.mocked(readSessionTurnStreamParts).mockResolvedValue([]);
     vi.mocked(readCheckpoints).mockResolvedValue([]);
 
-    state = {
-      backend: {
-        name: 'opencode',
-        start: vi.fn(async () => ({ data: { url: 'http://127.0.0.1:4096', status: 'running' as const } })),
-        stop: vi.fn(async () => undefined),
-        getStatus: vi.fn((): import('../acp/types').AcpServerStatus => 'running'),
-        getUrl: vi.fn(() => 'http://127.0.0.1:4096'),
-        isRunning: vi.fn(() => true),
-        sessions: {
-          create: vi.fn(),
-          get: sessionGet,
-          update: vi.fn(async () => ({ data: { id: 'updated-session', title: 'Updated Title', createdAt: new Date() } })),
-          prompt: vi.fn(),
-          revert: vi.fn(),
-          abort: vi.fn(),
-          list: sessionsList,
-          children: vi.fn(),
-          status: vi.fn(),
-          descendants: vi.fn(() => []),
-          findAncestor: vi.fn(),
-          parent: vi.fn(),
-          messages: sessionMessages,
-        },
-        config: {
-          models: vi.fn(async () => ({ data: [] })),
-          agents: vi.fn(async () => ({ data: [] })),
-          get: vi.fn(),
-          update: vi.fn(),
-          updateGlobal: vi.fn(async () => ({ data: undefined })),
-        },
-        auth: {
-          setKey: vi.fn(async () => ({ data: undefined })),
-          removeKey: vi.fn(async () => ({ data: undefined })),
-        },
-        events: {
-          ensureStarted: vi.fn(),
-          openSessionStream: vi.fn(),
-          openGlobalStream: vi.fn(),
-          closeSessionStream: vi.fn(),
-        },
-        permissions: {
-          reply: vi.fn(),
-        },
-        questions: {
-          reply: vi.fn(),
-          reject: vi.fn(),
-        },
-        createBridge: vi.fn(() => ({
-          setStream: vi.fn(),
-          setCallbacks: vi.fn(),
-          setTracker: vi.fn(),
-          processEvent: vi.fn(),
-          run: vi.fn().mockResolvedValue(true),
-          getUserMessageId: vi.fn().mockReturnValue(null),
-          getSessionTitle: vi.fn().mockReturnValue(null),
-          getHadSubagentTasks: vi.fn().mockReturnValue(false),
-        })) as unknown as AcpBackend['createBridge'],
+    const backend: AcpBackend = {
+      name: 'opencode',
+      start: vi.fn(async () => ({ data: { url: 'http://127.0.0.1:4096', status: 'running' as const } })),
+      stop: vi.fn(async () => undefined),
+      getStatus: vi.fn((): import('../acp/types').AcpServerStatus => 'running'),
+      getUrl: vi.fn(() => 'http://127.0.0.1:4096'),
+      isRunning: vi.fn(() => true),
+      sessions: {
+        create: vi.fn(),
+        get: sessionGet,
+        update: vi.fn(async () => ({ data: { id: 'updated-session', title: 'Updated Title', createdAt: new Date() } })),
+        prompt: vi.fn(),
+        revert: vi.fn(),
+        abort: vi.fn(),
+        list: sessionsList,
+        children: vi.fn(),
+        status: vi.fn(),
+        descendants: vi.fn(() => []),
+        findAncestor: vi.fn(),
+        parent: vi.fn(),
+        messages: sessionMessages,
       },
-      outputChannel: vscode.window.createOutputChannel('test'),
+      config: {
+        models: vi.fn(async () => ({ data: [] })),
+        agents: vi.fn(async () => ({ data: [] })),
+        get: vi.fn(),
+        update: vi.fn(),
+        updateGlobal: vi.fn(async () => ({ data: undefined })),
+      },
+      auth: {
+        setKey: vi.fn(async () => ({ data: undefined })),
+        removeKey: vi.fn(async () => ({ data: undefined })),
+      },
+      events: {
+        ensureStarted: vi.fn(),
+        openSessionStream: vi.fn(),
+        openGlobalStream: vi.fn(),
+        closeSessionStream: vi.fn(),
+      },
+      permissions: {
+        reply: vi.fn(),
+      },
+      questions: {
+        reply: vi.fn(),
+        reject: vi.fn(),
+      },
+      createBridge: vi.fn(() => ({
+        setStream: vi.fn(),
+        setCallbacks: vi.fn(),
+        setTracker: vi.fn(),
+        processEvent: vi.fn(),
+        run: vi.fn().mockResolvedValue(true),
+        getUserMessageId: vi.fn().mockReturnValue(null),
+        getSessionTitle: vi.fn().mockReturnValue(null),
+        getHadSubagentTasks: vi.fn().mockReturnValue(false),
+      })) as unknown as AcpBackend['createBridge'],
+    };
+
+    ctx = {
+      id: 'opencode',
+      scheme: 'acpilot.opencode',
+      vendors: ['opencode-cli', 'opencode-zen'],
+      backend,
       sessions: {
         get: vi.fn((key: string) => sessionStore.get(key)),
         has: vi.fn((key: string) => sessionStore.has(key)),
         set: vi.fn((key: string, value: unknown) => { sessionStore.set(key, value); }),
         values: vi.fn(() => sessionStore.values()),
         entries: vi.fn(() => sessionStore.entries()),
-      } as unknown as ExtensionState['sessions'],
-      statusBar: { update: vi.fn() } as unknown as ExtensionState['statusBar'],
+      } as unknown as BackendContext['sessions'],
       selection: {
         get: vi.fn(() => ({ agent: undefined, model: undefined, modelDisplayName: undefined })),
         setAgent: vi.fn(async () => {}),
         setModel: vi.fn(async () => {}),
-      } as unknown as ExtensionState['selection'],
-      bus: new AppEventBus(),
-      acpModels: {
-        sync: vi.fn(async () => {}),
-        resolve: vi.fn(() => ({ kind: 'not-found' as const })),
-        getModelsForCopilotRegistration: vi.fn(() => []),
-        refresh: vi.fn(async () => {}),
-        dispose: vi.fn(),
-      } as unknown as ExtensionState['acpModels'],
+      } as unknown as BackendContext['selection'],
       sessionStore: {
         listSessions: vi.fn().mockResolvedValue([]),
         getTurnsPath: vi.fn().mockReturnValue(''),
@@ -173,6 +169,20 @@ describe('createSessionContentProvider', () => {
       } as any,
     };
 
+    state = {
+      backends: new Map([['opencode', ctx]]),
+      outputChannel: vscode.window.createOutputChannel('test'),
+      statusBar: { update: vi.fn() } as unknown as ExtensionState['statusBar'],
+      bus: new AppEventBus(),
+      acpModels: {
+        sync: vi.fn(async () => {}),
+        resolve: vi.fn(() => ({ kind: 'not-found' as const })),
+        getModelsForCopilotRegistration: vi.fn(() => []),
+        refresh: vi.fn(async () => {}),
+        dispose: vi.fn(),
+      } as unknown as ExtensionState['acpModels'],
+    };
+
     (vscode.workspace as { workspaceFolders?: Array<{ uri: vscode.Uri; name: string; index: number }> }).workspaceFolders = [
       { uri: vscode.Uri.parse('file:///test-workspace'), name: 'test', index: 0 },
     ];
@@ -180,13 +190,14 @@ describe('createSessionContentProvider', () => {
 
   it('publishes session items from SessionStore during refresh', async () => {
     // Mock SessionStore to return expected sessions
-    (state.sessionStore.listSessions as any).mockResolvedValue([
+    (ctx.sessionStore.listSessions as any).mockResolvedValue([
       { id: 'ses_1', title: 'First Session', createdAt: '2026-05-28T01:00:00Z', backendName: 'opencode' },
       { id: 'ses_2', title: 'Session ses_2', createdAt: '2026-05-28T01:30:00Z', backendName: 'opencode' },
     ]);
 
     const { controller } = createSessionContentProvider(
       state,
+      ctx,
       { subscriptions: [] } as unknown as vscode.ExtensionContext,
     );
 
@@ -211,12 +222,13 @@ describe('createSessionContentProvider', () => {
 
   it('creates a real session item before the first request for edit-session storage', async () => {
     const createdAt = new Date('2026-06-11T00:00:00.000Z');
-    (state.backend.sessions.create as any).mockResolvedValue({
+    (ctx.backend.sessions.create as any).mockResolvedValue({
       data: { id: 'ses_new_real', title: 'Fix restored edits', createdAt },
     });
 
     const { controller } = createSessionContentProvider(
       state,
+      ctx,
       { subscriptions: [] } as unknown as vscode.ExtensionContext,
     );
 
@@ -233,8 +245,8 @@ describe('createSessionContentProvider', () => {
     expect(item.resource.path).toBe('/ses_new_real');
     expect(item.label).toBe('Fix restored edits');
     expect(controller!.items.get(item.resource)).toBe(item);
-    expect(state.sessions.get(item.resource.toString())?.backendSessionId).toBe('ses_new_real');
-    expect(state.sessionStore.writeMeta).toHaveBeenCalledWith('ses_new_real', expect.objectContaining({
+    expect(ctx.sessions.get(item.resource.toString())?.backendSessionId).toBe('ses_new_real');
+    expect(ctx.sessionStore.writeMeta).toHaveBeenCalledWith('ses_new_real', expect.objectContaining({
       id: 'ses_new_real',
       title: 'Fix restored edits',
       titleSource: 'history',
@@ -245,12 +257,13 @@ describe('createSessionContentProvider', () => {
   });
 
   it('publishes runtime session when backend list is empty', async () => {
-    (state.sessionStore.listSessions as any).mockResolvedValue([
+    (ctx.sessionStore.listSessions as any).mockResolvedValue([
       { id: 'ses_runtime', title: 'Runtime Session', createdAt: '2026-05-28T02:00:00.000Z', backendName: 'opencode' },
     ]);
 
     const { controller } = createSessionContentProvider(
       state,
+      ctx,
       { subscriptions: [] } as unknown as vscode.ExtensionContext,
     );
 
@@ -267,7 +280,7 @@ describe('createSessionContentProvider', () => {
   });
 
   it('publishes archived state from persisted session metadata', async () => {
-    (state.sessionStore.listSessions as any).mockResolvedValue([
+    (ctx.sessionStore.listSessions as any).mockResolvedValue([
       {
         id: 'ses_archived',
         title: 'Archived Session',
@@ -279,6 +292,7 @@ describe('createSessionContentProvider', () => {
 
     const { controller } = createSessionContentProvider(
       state,
+      ctx,
       { subscriptions: [] } as unknown as vscode.ExtensionContext,
     );
 
@@ -294,7 +308,7 @@ describe('createSessionContentProvider', () => {
   });
 
   it('persists chat session item archive state changes', async () => {
-    (state.sessionStore.listSessions as any).mockResolvedValue([
+    (ctx.sessionStore.listSessions as any).mockResolvedValue([
       {
         id: 'ses_unarchive',
         title: 'Unarchive Session',
@@ -306,6 +320,7 @@ describe('createSessionContentProvider', () => {
 
     const { controller } = createSessionContentProvider(
       state,
+      ctx,
       { subscriptions: [] } as unknown as vscode.ExtensionContext,
     );
 
@@ -319,17 +334,18 @@ describe('createSessionContentProvider', () => {
     (controller as any).fireDidChangeChatSessionItemState(item);
 
     await vi.waitFor(() => {
-      expect(state.sessionStore.updateMeta).toHaveBeenCalledWith('ses_unarchive', { archived: false });
+      expect(ctx.sessionStore.updateMeta).toHaveBeenCalledWith('ses_unarchive', { archived: false });
     });
   });
 
   it('preserves restored provider session title in Session list items', async () => {
-    (state.sessionStore.listSessions as any).mockResolvedValue([
+    (ctx.sessionStore.listSessions as any).mockResolvedValue([
       { id: 'ses_restore', title: 'Restored Session', createdAt: '2026-05-28T03:00:00.000Z', backendName: 'opencode' },
     ]);
 
     const { controller } = createSessionContentProvider(
       state,
+      ctx,
       { subscriptions: [] } as unknown as vscode.ExtensionContext,
     );
 
@@ -344,7 +360,7 @@ describe('createSessionContentProvider', () => {
   });
 
   it('does not inject persisted diffs into Session list item changes', async () => {
-    (state.sessionStore.listSessions as any).mockResolvedValue([
+    (ctx.sessionStore.listSessions as any).mockResolvedValue([
       { id: 'ses_changes', title: 'Changed Session', createdAt: '2026-05-28T04:00:00.000Z', backendName: 'opencode' },
     ]);
     vi.mocked(readLegacySessionEvents).mockResolvedValue([
@@ -360,6 +376,7 @@ describe('createSessionContentProvider', () => {
 
     const { controller } = createSessionContentProvider(
       state,
+      ctx,
       { subscriptions: [] } as unknown as vscode.ExtensionContext,
     );
 
@@ -376,7 +393,7 @@ describe('createSessionContentProvider', () => {
   });
 
   it('does not inject checkpoint summaries into Session list item changes', async () => {
-    (state.sessionStore.listSessions as any).mockResolvedValue([
+    (ctx.sessionStore.listSessions as any).mockResolvedValue([
       { id: 'ses_checkpoint_summary', title: 'Checkpoint Summary', createdAt: '2026-05-28T04:00:00.000Z', backendName: 'opencode' },
     ]);
     vi.mocked(readCheckpoints).mockResolvedValue([
@@ -413,6 +430,7 @@ describe('createSessionContentProvider', () => {
 
     const { controller } = createSessionContentProvider(
       state,
+      ctx,
       { subscriptions: [] } as unknown as vscode.ExtensionContext,
     );
 
@@ -427,13 +445,14 @@ describe('createSessionContentProvider', () => {
   });
 
   it('derives a restored session title from first user message when backend title is empty', async () => {
-    state.backend.sessions.list = vi.fn(async () => ({ data: [] }));
+    ctx.backend.sessions.list = vi.fn(async () => ({ data: [] }));
     vi.mocked(readLegacySessionEvents).mockResolvedValue([
       makeTextEvent('Need help with session titles') as any,
     ]);
 
     const { provider } = createSessionContentProvider(
       state,
+      ctx,
       { subscriptions: [] } as unknown as vscode.ExtensionContext,
     );
 
@@ -444,10 +463,10 @@ describe('createSessionContentProvider', () => {
     );
     const restoredResourceKey = vscode.Uri.parse('acpilot.opencode:/ses_restore').toString();
 
-    expect(state.sessionStore.getTurnsPath).toHaveBeenCalledWith('ses_restore');
+    expect(ctx.sessionStore.getTurnsPath).toHaveBeenCalledWith('ses_restore');
     expect(session.title).toBe('Need help with session titles');
-    expect(state.sessions.get(restoredResourceKey)?.title).toBe('Need help with session titles');
-    expect(state.sessionStore.updateMeta).toHaveBeenCalledWith(
+    expect(ctx.sessions.get(restoredResourceKey)?.title).toBe('Need help with session titles');
+    expect(ctx.sessionStore.updateMeta).toHaveBeenCalledWith(
       'ses_restore',
       expect.objectContaining({
         title: 'Need help with session titles',
@@ -457,7 +476,7 @@ describe('createSessionContentProvider', () => {
   });
 
   it('falls back to legacy turn events when stream-part turns contain no parts', async () => {
-    state.backend.sessions.list = vi.fn(async () => ({ data: [] }));
+    ctx.backend.sessions.list = vi.fn(async () => ({ data: [] }));
     vi.mocked(readSessionTurnStreamParts).mockResolvedValue([
       {
         turnIndex: 0,
@@ -480,6 +499,7 @@ describe('createSessionContentProvider', () => {
 
     const { provider } = createSessionContentProvider(
       state,
+      ctx,
       { subscriptions: [] } as unknown as vscode.ExtensionContext,
     );
 
@@ -495,8 +515,8 @@ describe('createSessionContentProvider', () => {
   });
 
   it('restores multiple persisted turns instead of collapsing them into one response', async () => {
-    state.backend.sessions.list = vi.fn(async () => ({ data: [] }));
-    (state.backend.createBridge as any).mockImplementation(() => {
+    ctx.backend.sessions.list = vi.fn(async () => ({ data: [] }));
+    (ctx.backend.createBridge as any).mockImplementation(() => {
       let stream: { markdown(value: string): void } | undefined;
       const partKinds = new Map<string, string>();
       return {
@@ -542,6 +562,7 @@ describe('createSessionContentProvider', () => {
 
     const { provider } = createSessionContentProvider(
       state,
+      ctx,
       { subscriptions: [] } as unknown as vscode.ExtensionContext,
     );
 
@@ -565,7 +586,7 @@ describe('createSessionContentProvider', () => {
     fs.writeFileSync(file, 'after\n', 'utf-8');
     const checkpointUri = vscode.Uri.file(file).toString();
     const callId = 'tool-edit-1';
-    (state.backend.createBridge as any).mockImplementation(() => {
+    (ctx.backend.createBridge as any).mockImplementation(() => {
       let stream: { push(part: unknown): void } | undefined;
       return {
         setStream: vi.fn((next: unknown) => { stream = next as { push(part: unknown): void }; }),
@@ -608,7 +629,7 @@ describe('createSessionContentProvider', () => {
         end: { turnIndex: 0, timestamp: '2026-06-07T00:00:01.000Z' },
       },
     ]);
-    vi.mocked(state.sessionStore.readMeta).mockResolvedValue({ id: 'ses_restore' });
+    vi.mocked(ctx.sessionStore.readMeta).mockResolvedValue({ id: 'ses_restore' });
     vi.mocked(readCheckpoints).mockResolvedValue([
       {
         uri: checkpointUri,
@@ -633,6 +654,7 @@ describe('createSessionContentProvider', () => {
 
     const { provider } = createSessionContentProvider(
       state,
+      ctx,
       { subscriptions: [] } as unknown as vscode.ExtensionContext,
     );
 
@@ -658,7 +680,7 @@ describe('createSessionContentProvider', () => {
     fs.writeFileSync(file, 'after\n', 'utf-8');
     const checkpointUri = vscode.Uri.file(file).toString();
     const callId = 'tool-edit-record-1';
-    (state.backend.createBridge as any).mockImplementation(() => {
+    (ctx.backend.createBridge as any).mockImplementation(() => {
       let stream: { push(part: unknown): void } | undefined;
       return {
         setStream: vi.fn((next: unknown) => { stream = next as { push(part: unknown): void }; }),
@@ -716,7 +738,7 @@ describe('createSessionContentProvider', () => {
         timestamp: '2026-06-07T00:00:01.000Z',
       },
     ]);
-    vi.mocked(state.sessionStore.readMeta).mockResolvedValue({
+    vi.mocked(ctx.sessionStore.readMeta).mockResolvedValue({
       id: 'ses_restore',
       requestDetails: [
         {
@@ -729,6 +751,7 @@ describe('createSessionContentProvider', () => {
 
     const { provider } = createSessionContentProvider(
       state,
+      ctx,
       { subscriptions: [] } as unknown as vscode.ExtensionContext,
     );
 
@@ -751,7 +774,7 @@ describe('createSessionContentProvider', () => {
     fs.writeFileSync(file, 'after\n', 'utf-8');
     const checkpointUri = vscode.Uri.file(file).toString();
     const callId = 'tool-ssp-edit-record-1';
-    (state.backend.createBridge as any).mockImplementation(() => {
+    (ctx.backend.createBridge as any).mockImplementation(() => {
       let stream: { push(part: unknown): void } | undefined;
       return {
         setStream: vi.fn((next: unknown) => { stream = next as { push(part: unknown): void }; }),
@@ -853,11 +876,12 @@ describe('createSessionContentProvider', () => {
         timestamp: '2026-06-13T00:00:02.000Z',
       },
     ]);
-    vi.mocked(state.sessionStore.readMeta).mockResolvedValue({ id: 'ses_restore' });
+    vi.mocked(ctx.sessionStore.readMeta).mockResolvedValue({ id: 'ses_restore' });
     vi.mocked(readLegacySessionTurnEvents).mockClear();
 
     const { provider } = createSessionContentProvider(
       state,
+      ctx,
       { subscriptions: [] } as unknown as vscode.ExtensionContext,
     );
 
@@ -883,6 +907,7 @@ describe('createSessionContentProvider', () => {
 
     const { provider } = createSessionContentProvider(
       state,
+      ctx,
       { subscriptions: [] } as unknown as vscode.ExtensionContext,
     );
 
@@ -902,7 +927,7 @@ describe('createSessionContentProvider', () => {
     const uri = vscode.Uri.file(file);
     const callId = 'tool-1';
 
-    (state.backend.createBridge as any).mockImplementation(() => {
+    (ctx.backend.createBridge as any).mockImplementation(() => {
       let stream: { push(part: unknown): void } | undefined;
       return {
         setStream: vi.fn((next: unknown) => { stream = next as { push(part: unknown): void }; }),
@@ -961,7 +986,7 @@ describe('createSessionContentProvider', () => {
         undoStopId: 'undo-stop-tool-1',
       },
     ]);
-    (state.sessionStore.readMeta as any).mockResolvedValue({
+    (ctx.sessionStore.readMeta as any).mockResolvedValue({
       id: 'ses_restore',
       checkpointCursor: { acceptedThroughTurn: 0 },
       changeApprovalState: 'accepted',
@@ -969,6 +994,7 @@ describe('createSessionContentProvider', () => {
 
     const { provider } = createSessionContentProvider(
       state,
+      ctx,
       { subscriptions: [] } as unknown as vscode.ExtensionContext,
     );
 
@@ -983,7 +1009,7 @@ describe('createSessionContentProvider', () => {
 
     expectRestoredTextEditParts(getFirstResponseParts(session), 'undo-stop-tool-1');
     expect(fs.readFileSync(file, 'utf-8')).toBe('a\nB\nc\n');
-    expect(state.sessionStore.updateMeta).not.toHaveBeenCalledWith(
+    expect(ctx.sessionStore.updateMeta).not.toHaveBeenCalledWith(
       'ses_restore',
       expect.objectContaining({ changeApprovalState: 'pending' }),
     );
@@ -1035,7 +1061,7 @@ describe('createSessionContentProvider', () => {
         undoStopId: 'undo-stop-tool-1',
       },
     ]);
-    (state.sessionStore.readMeta as any).mockResolvedValue({
+    (ctx.sessionStore.readMeta as any).mockResolvedValue({
       id: 'ses_restore',
       checkpointCursor: { acceptedThroughTurn: 0 },
       changeApprovalState: 'pending',
@@ -1043,6 +1069,7 @@ describe('createSessionContentProvider', () => {
 
     const { provider } = createSessionContentProvider(
       state,
+      ctx,
       { subscriptions: [] } as unknown as vscode.ExtensionContext,
     );
 
@@ -1057,7 +1084,7 @@ describe('createSessionContentProvider', () => {
 
     expectRestoredTextEditParts(getFirstResponseParts(session), 'undo-stop-tool-1');
     expect(fs.readFileSync(file, 'utf-8')).toBe('a\nb\nc\n');
-    expect(state.sessionStore.updateMeta).not.toHaveBeenCalledWith(
+    expect(ctx.sessionStore.updateMeta).not.toHaveBeenCalledWith(
       'ses_restore',
       expect.objectContaining({
         checkpointCursor: expect.objectContaining({ replayedThroughTurn: 1 }),
@@ -1110,7 +1137,7 @@ describe('createSessionContentProvider', () => {
         timestamp: '2026-06-05T00:00:01.000Z',
       },
     ]);
-    (state.sessionStore.readMeta as any).mockResolvedValue({
+    (ctx.sessionStore.readMeta as any).mockResolvedValue({
       id: 'ses_restore',
       checkpointCursor: { acceptedThroughTurn: 0, replayedThroughTurn: 1 },
       changeApprovalState: 'pending',
@@ -1118,6 +1145,7 @@ describe('createSessionContentProvider', () => {
 
     const { provider } = createSessionContentProvider(
       state,
+      ctx,
       { subscriptions: [] } as unknown as vscode.ExtensionContext,
     );
 
@@ -1142,8 +1170,8 @@ describe('createSessionContentProvider', () => {
       createdAt: new Date('2026-06-05T00:00:00.000Z'),
     };
     const liveKey = 'acpilot.opencode:/untitled-live';
-    state.sessions.set(liveKey, liveState);
-    state.backend.sessions.get = vi.fn(async () => ({
+    ctx.sessions.set(liveKey, liveState);
+    ctx.backend.sessions.get = vi.fn(async () => ({
       data: { id: 'ses_live', title: 'Live Session', createdAt: liveState.createdAt },
     }));
     vi.mocked(readLegacySessionEvents).mockResolvedValue([
@@ -1169,7 +1197,7 @@ describe('createSessionContentProvider', () => {
         timestamp: '2026-06-05T00:00:01.000Z',
       },
     ]);
-    (state.sessionStore.readMeta as any).mockResolvedValue({
+    (ctx.sessionStore.readMeta as any).mockResolvedValue({
       id: 'ses_live',
       checkpointCursor: { acceptedThroughTurn: -1 },
       changeApprovalState: 'pending',
@@ -1177,6 +1205,7 @@ describe('createSessionContentProvider', () => {
 
     const { provider } = createSessionContentProvider(
       state,
+      ctx,
       { subscriptions: [] } as unknown as vscode.ExtensionContext,
     );
     const resource = vscode.Uri.parse('acpilot.opencode:/ses_live');
@@ -1187,9 +1216,9 @@ describe('createSessionContentProvider', () => {
     );
 
     expect(session.title).toBe('Live Session');
-    expect(state.sessions.get(resource.toString())).toBe(liveState);
+    expect(ctx.sessions.get(resource.toString())).toBe(liveState);
     expect(fs.readFileSync(file, 'utf-8')).toBe('a\nb\nc\n');
-    expect(state.sessionStore.updateMeta).toHaveBeenCalledWith(
+    expect(ctx.sessionStore.updateMeta).toHaveBeenCalledWith(
       'ses_live',
       expect.objectContaining({
         title: 'Live Session',
@@ -1204,7 +1233,7 @@ describe('createSessionContentProvider', () => {
   // =========================================================================
 
   it('derives title from history when backend returns placeholder title "New OpenCode Session"', async () => {
-    state.backend.sessions.get = vi.fn(async () => ({
+    ctx.backend.sessions.get = vi.fn(async () => ({
       data: { id: 'ses_placeholder', title: 'New OpenCode Session', createdAt: new Date('2026-05-28T03:00:00Z') },
     }));
     vi.mocked(readLegacySessionEvents).mockResolvedValue([
@@ -1213,6 +1242,7 @@ describe('createSessionContentProvider', () => {
 
     const { provider } = createSessionContentProvider(
       state,
+      ctx,
       { subscriptions: [] } as unknown as vscode.ExtensionContext,
     );
 
@@ -1226,7 +1256,7 @@ describe('createSessionContentProvider', () => {
   });
 
   it('derives title from history when backend returns placeholder "OpenCode Session xxx"', async () => {
-    state.backend.sessions.get = vi.fn(async () => ({
+    ctx.backend.sessions.get = vi.fn(async () => ({
       data: { id: 'ses_abc12345', title: 'OpenCode Session abc12345', createdAt: new Date('2026-05-28T03:00:00Z') },
     }));
     vi.mocked(readLegacySessionEvents).mockResolvedValue([
@@ -1235,6 +1265,7 @@ describe('createSessionContentProvider', () => {
 
     const { provider } = createSessionContentProvider(
       state,
+      ctx,
       { subscriptions: [] } as unknown as vscode.ExtensionContext,
     );
 
@@ -1248,12 +1279,12 @@ describe('createSessionContentProvider', () => {
   });
 
   it('prefers runtime non-placeholder title over placeholder when same sessionId has multiple entries', async () => {
-    (state.sessionStore.listSessions as any).mockResolvedValue([
+    (ctx.sessionStore.listSessions as any).mockResolvedValue([
       { id: 'ses_dup', title: 'Derived From Prompt', createdAt: '2026-05-28T01:00:00.000Z', backendName: 'opencode' },
     ]);
 
     // Original tab entry with derived title
-    state.sessions.set('acpilot.opencode:/untitled-1', {
+    ctx.sessions.set('acpilot.opencode:/untitled-1', {
       backendSessionId: 'ses_dup',
       turnMap: [],
       title: 'Derived From Prompt',
@@ -1261,7 +1292,7 @@ describe('createSessionContentProvider', () => {
     });
 
     // Session list click created a duplicate entry with placeholder title
-    state.sessions.set('acpilot.opencode:/ses_dup', {
+    ctx.sessions.set('acpilot.opencode:/ses_dup', {
       backendSessionId: 'ses_dup',
       turnMap: [],
       title: 'New OpenCode Session',
@@ -1270,6 +1301,7 @@ describe('createSessionContentProvider', () => {
 
     const { controller } = createSessionContentProvider(
       state,
+      ctx,
       { subscriptions: [] } as unknown as vscode.ExtensionContext,
     );
 
@@ -1284,11 +1316,11 @@ describe('createSessionContentProvider', () => {
   });
 
   it('merges runtime renamed titles over SessionStore placeholders', async () => {
-    (state.sessionStore.listSessions as any).mockResolvedValue([
+    (ctx.sessionStore.listSessions as any).mockResolvedValue([
       { id: 'ses_renamed', title: 'New OpenCode Session', createdAt: '2026-05-28T01:00:00.000Z', backendName: 'opencode' },
     ]);
 
-    state.sessions.set('acpilot.opencode:/untitled-rename', {
+    ctx.sessions.set('acpilot.opencode:/untitled-rename', {
       backendSessionId: 'ses_renamed',
       turnMap: [],
       title: 'Runtime Rename Title',
@@ -1297,6 +1329,7 @@ describe('createSessionContentProvider', () => {
 
     const { controller } = createSessionContentProvider(
       state,
+      ctx,
       { subscriptions: [] } as unknown as vscode.ExtensionContext,
     );
 
@@ -1312,7 +1345,7 @@ describe('createSessionContentProvider', () => {
 
   it('restoring existing session reuses non-placeholder title from another sessionMap entry', async () => {
     // Pre-populate sessionMap with the original entry that has the derived title
-    state.sessions.set('acpilot.opencode:/untitled-1', {
+    ctx.sessions.set('acpilot.opencode:/untitled-1', {
       backendSessionId: 'ses_existing',
       turnMap: [],
       title: 'My original prompt title',
@@ -1320,15 +1353,16 @@ describe('createSessionContentProvider', () => {
     });
 
     // Backend still has the placeholder title (never updated in backend)
-    state.backend.sessions.get = vi.fn(async () => ({
+    ctx.backend.sessions.get = vi.fn(async () => ({
       data: { id: 'ses_existing', title: 'New OpenCode Session', createdAt: new Date('2026-05-28T01:00:00Z') },
     }));
-    state.backend.sessions.messages = vi.fn(async () => ({
+    ctx.backend.sessions.messages = vi.fn(async () => ({
       data: { items: [] },
     }));
 
     const { provider } = createSessionContentProvider(
       state,
+      ctx,
       { subscriptions: [] } as unknown as vscode.ExtensionContext,
     );
 
@@ -1339,7 +1373,7 @@ describe('createSessionContentProvider', () => {
     );
 
     const newKey = vscode.Uri.parse('acpilot.opencode:/ses_existing').toString();
-    expect(state.sessions.get(newKey)?.title).toBe('My original prompt title');
+    expect(ctx.sessions.get(newKey)?.title).toBe('My original prompt title');
     expect(session.title).toBe('My original prompt title');
   });
 

@@ -1,7 +1,6 @@
 import * as vscode from 'vscode';
 import type { AcpAgent, AcpModel, AcpConfig, AcpProviderConfig, BackendSettingsDescriptor } from './acp/types';
-import './backends/opencode/index'; // side-effect: registers 'opencode' backend
-import { createBackend } from './acp/backend-registry';
+import { BUILTIN_BACKENDS } from './backends/registry';
 import { createParticipantHandler } from './participant/handler';
 import { createSessionContentProvider, ACP_SESSION_SCHEME } from './surfaces/vscode/experimental-session';
 import { hasRegisterChatSessionContentProvider } from './surfaces/vscode/capabilities';
@@ -13,7 +12,7 @@ import { AppEventBus } from './acp/app-event-bus';
 import { SelectionStore } from './acp/selection-store';
 import { SessionManager } from './acp/session-manager';
 import { SessionStore } from './acp/streaming/session-store';
-import type { ExtensionState } from './types';
+import type { ExtensionState, BackendContext } from './types';
 import { createAcpModels } from './acpmodels/index';
 import { AuthReader } from './acpmodels/auth-reader';
 
@@ -105,156 +104,181 @@ function getBackendDisplayName(backendName: string): string {
   return backendName.charAt(0).toUpperCase() + backendName.slice(1);
 }
 
-/** Refresh status bar items from the current state */
-async function refreshStatusBar(s: ExtensionState): Promise<void> {
+/** Refresh status bar items from the given backend context */
+async function refreshStatusBar(ctx: BackendContext, statusBar: StatusBarManager): Promise<void> {
   try {
-    const sel = s.selection.get();
+    const sel = ctx.selection.get();
     const agentName = sel.agent ?? '--';
     const modelName = sel.modelDisplayName ?? sel.model?.modelID ?? '--';
 
-    s.statusBar.update({
-      backendName: getBackendDisplayName(s.backend.name),
+    statusBar.update({
+      backendName: getBackendDisplayName(ctx.backend.name),
       agentName,
       modelName,
-      isBackendActive: s.backend.isRunning(),
+      isBackendActive: ctx.backend.isRunning(),
     });
   } catch {
     // non-critical
   }
 }
 
-// loadDefaultsFromConfig removed — logic moved to SelectionStore.resolveDefaults()
-
 export function activate(context: vscode.ExtensionContext) {
   const outputChannel = vscode.window.createOutputChannel('ACPilot');
   outputChannel.appendLine('[extension] ACPilot activating...');
 
-  const backend = createBackend('opencode');
   const statusBar = new StatusBarManager();
   const bus = new AppEventBus();
-  const selection = new SelectionStore(backend, bus);
-  const sessions = new SessionManager(backend, bus);
   const authReader = new AuthReader();
+  const workspacePath = getWorkspaceDirectory();
   const backendModelSupport = vscode.workspace.getConfiguration('acpilot').get('experimental.acpBackendModelSupport', true);
+
+  // -- Assemble per-backend contexts in a loop --------------------------------
+  const backends = new Map<string, BackendContext>();
+
+  for (const desc of BUILTIN_BACKENDS) {
+    if (desc.isEnabled && !desc.isEnabled()) {
+      outputChannel.appendLine(`[extension] Backend '${desc.id}' disabled — skipping`);
+      continue;
+    }
+
+    const backend = desc.factory();
+    const selection = new SelectionStore(backend, bus, desc.id);
+    const sessions = new SessionManager(backend, bus, desc.id);
+    const sessionStore = new SessionStore({ workspaceRoot: workspacePath ?? '', backendName: desc.id });
+
+    const ctx: BackendContext = {
+      id: desc.id,
+      scheme: desc.scheme,
+      vendors: desc.vendors,
+      backend,
+      selection,
+      sessions,
+      sessionStore,
+    };
+
+    // Hydrate persistent settings BEFORE backend starts so resolveDefaults
+    // sees the persisted values and won't overwrite them with config defaults.
+    const persisted = loadPersistedSettingsState(context, desc.id);
+    selection.hydrate(persisted);
+
+    // Start backend immediately on activation
+    backend.start(workspacePath).then(async (result) => {
+      if (result.error) {
+        outputChannel.appendLine(`[extension] Backend '${desc.id}' start failed: ${String(result.error)}`);
+        statusBar.updateError(backend.name);
+        return;
+      }
+      outputChannel.appendLine(`[extension] Backend '${desc.id}' started at ${result.data?.url}`);
+      // Load default agent/model from config and update status bar
+      await selection.resolveDefaults();
+      savePersistedSettingsState(context, desc.id, selection.get());
+
+      // Run ACPModels bidirectional sync (Copilot ↔ backend)
+      try {
+        await state!.acpModels.sync();
+      } catch (syncErr) {
+        outputChannel.appendLine(`[extension] ACPModels sync error: ${syncErr instanceof Error ? syncErr.message : String(syncErr)}`);
+      }
+
+      await refreshStatusBar(ctx, statusBar);
+
+      // Notify session provider that this backend is ready so it can refresh
+      // option groups and session list (avoids polling while offline).
+      bus.emit('backend-ready', { backendId: desc.id });
+    }).catch((err: unknown) => {
+      outputChannel.appendLine(
+        `[extension] Backend '${desc.id}' start error: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      statusBar.updateError(backend.name);
+    });
+
+    backends.set(desc.id, ctx);
+  }
+
+  // Build the shared ACPModels registry from all assembled backends.
   const acpModels = createAcpModels({
-    backends: new Map([['opencode', backend]]),
+    backends: new Map([...backends.entries()].map(([id, ctx]) => [id, ctx.backend])),
     authReader,
     logger: outputChannel,
     backendModelSupport,
   });
 
-  const workspacePath = getWorkspaceDirectory();
-
   state = {
-    backend,
+    backends,
     acpModels,
-    selection,
-    sessions,
-    sessionStore: new SessionStore({ workspaceRoot: workspacePath ?? '', backendName: 'opencode' }),
     bus,
     outputChannel,
     statusBar,
   };
 
-  // Hydrate persistent settings BEFORE backend starts so resolveDefaults
-  // sees the persisted values and won't overwrite them with config defaults.
-  const persisted = loadPersistedSettingsState(context);
-  selection.hydrate(persisted);
+  // The settings panel operates on a single "primary" backend (the first
+  // assembled one). Phase 4 will make the panel backend-aware; for now the
+  // primary backend (opencode) is the one whose config/agents/models drive
+  // the panel.
+  const primaryCtx = backends.values().next().value as BackendContext | undefined;
 
-  // Start backend immediately on activation
-  backend.start(workspacePath).then(async (result) => {
-    if (result.error) {
-      outputChannel.appendLine(`[extension] Backend start failed: ${String(result.error)}`);
-      statusBar.updateError(backend.name);
-      return;
-    }
-    outputChannel.appendLine(`[extension] Backend started at ${result.data?.url}`);
-    // Load default agent/model from config and update status bar
-    await selection.resolveDefaults();
-    // Persist whatever resolveDefaults resolved (e.g. backend defaults
-    // when there's no persisted override yet).
-    savePersistedSettingsState(context, selection.get());
-
-    // Run ACPModels bidirectional sync (Copilot ↔ OpenCode)
-    outputChannel.appendLine('[extension] Running ACPModels sync...');
-    try {
-      await state!.acpModels.sync();
-      outputChannel.appendLine('[extension] ACPModels sync complete');
-    } catch (syncErr) {
-      outputChannel.appendLine(`[extension] ACPModels sync error: ${syncErr instanceof Error ? syncErr.message : String(syncErr)}`);
-    }
-
-    // Notify session provider that backend is ready so it can refresh
-    // option groups and session list (avoids polling while offline).
-    state!.bus.emit('backend-ready', void 0);
-  }).catch((err: unknown) => {
-    outputChannel.appendLine(
-      `[extension] Backend start error: ${err instanceof Error ? err.message : String(err)}`,
-    );
-    statusBar.updateError(backend.name);
-  });
-
-  // Register the settings panel command
+  // -- Register the settings panel command ------------------------------------
   const openSettingsCommand = vscode.commands.registerCommand(
     'acpilot.openSettings',
     async () => {
+      if (!primaryCtx) {return;}
       const panel = SettingsPanel.createOrShow(context.extensionUri);
 
       // Wire up message handler
       panel.onDidRequestChange = async (message: SettingsMessage) => {
-        if (!state) {return;}
+        if (!state || !primaryCtx) {return;}
+        const s = state;
 
         try {
           switch (message.type) {
             case 'ready': {
-              // Webview is ready — push current data
-              await pushDataToPanel(state, panel);
+              await pushDataToPanel(s, primaryCtx, panel);
               break;
             }
             case 'refreshData': {
-              await pushDataToPanel(state, panel);
+              await pushDataToPanel(s, primaryCtx, panel);
               break;
             }
             case 'setAgent': {
-              await state.selection.setAgent(message.agentId);
-              savePersistedSettingsState(context, state.selection.get());
-              await refreshStatusBar(state);
-              await pushDataToPanel(state, panel);
+              await primaryCtx.selection.setAgent(message.agentId);
+              savePersistedSettingsState(context, primaryCtx.id, primaryCtx.selection.get());
+              await refreshStatusBar(primaryCtx, state.statusBar);
+              await pushDataToPanel(s, primaryCtx, panel);
               break;
             }
             case 'setModel': {
-              await state.selection.setModel(message.providerID, message.modelID);
-              savePersistedSettingsState(context, state.selection.get());
-              await refreshStatusBar(state);
-              await pushDataToPanel(state, panel);
+              await primaryCtx.selection.setModel(message.providerID, message.modelID);
+              savePersistedSettingsState(context, primaryCtx.id, primaryCtx.selection.get());
+              await refreshStatusBar(primaryCtx, state.statusBar);
+              await pushDataToPanel(s, primaryCtx, panel);
               break;
             }
             case 'setDefaultAgent': {
-              await state.backend.config.update({
+              await primaryCtx.backend.config.update({
                 default_agent: message.agent || undefined,
               });
-              await pushDataToPanel(state, panel);
+              await pushDataToPanel(s, primaryCtx, panel);
               break;
             }
             case 'setDefaultModel': {
-              await state.backend.config.update({
+              await primaryCtx.backend.config.update({
                 model: message.model || undefined,
               });
-              await pushDataToPanel(state, panel);
+              await pushDataToPanel(s, primaryCtx, panel);
               break;
             }
             case 'saveBackendSettings': {
-              if (state.backend.settingsProvider) {
-                await state.backend.settingsProvider.saveValues(message.values);
+              if (primaryCtx.backend.settingsProvider) {
+                await primaryCtx.backend.settingsProvider.saveValues(message.values);
               }
-              await pushDataToPanel(state, panel);
+              await pushDataToPanel(s, primaryCtx, panel);
               break;
             }
             case 'setGlobalSetting': {
               await vscode.workspace
                 .getConfiguration('acpilot')
                 .update(`experimental.${message.key}`, message.value, vscode.ConfigurationTarget.Global);
-              await pushDataToPanel(state, panel);
+              await pushDataToPanel(s, primaryCtx, panel);
               break;
             }
             case 'connectProvider': {
@@ -272,24 +296,24 @@ export function activate(context: vscode.ExtensionContext) {
               const configKey = message.providerId === 'openai-compatible'
                 ? (message.displayName?.toLowerCase().replace(/[^a-z0-9]/g, '-') || 'custom-' + Date.now())
                 : message.providerId;
-              await state.backend.config.update({
+              await primaryCtx.backend.config.update({
                 provider: { [configKey]: providerConfig },
               });
-              await pushDataToPanel(state, panel);
+              await pushDataToPanel(s, primaryCtx, panel);
               break;
             }
             case 'disconnectProvider': {
-              const currentConfig = await state.backend.config.get();
+              const currentConfig = await primaryCtx.backend.config.get();
               const currentProviders = { ...(currentConfig.data?.provider ?? {}) };
               delete currentProviders[message.configKey];
-              await state.backend.config.update({
+              await primaryCtx.backend.config.update({
                 provider: currentProviders,
               });
-              await pushDataToPanel(state, panel);
+              await pushDataToPanel(s, primaryCtx, panel);
               break;
             }
             case 'updateProvider': {
-              const currentCfg = await state.backend.config.get();
+              const currentCfg = await primaryCtx.backend.config.get();
               const existing = currentCfg.data?.provider?.[message.configKey];
               const updateConfig: AcpProviderConfig = {
                 options: {
@@ -300,10 +324,10 @@ export function activate(context: vscode.ExtensionContext) {
               if (existing?.id) { updateConfig.id = existing.id; }
               if (existing?.name) { updateConfig.name = existing.name; }
               if (existing?.api) { updateConfig.api = existing.api; }
-              await state.backend.config.update({
+              await primaryCtx.backend.config.update({
                 provider: { [message.configKey]: updateConfig },
               });
-              await pushDataToPanel(state, panel);
+              await pushDataToPanel(s, primaryCtx, panel);
               break;
             }
           }
@@ -315,52 +339,56 @@ export function activate(context: vscode.ExtensionContext) {
       };
 
       // Push initial data
-      if (!state) {return;}
-      await pushDataToPanel(state, panel);
+      await pushDataToPanel(state!, primaryCtx, panel);
     },
   );
 
-  const participant = vscode.chat.createChatParticipant(
-    'acpilot.opencode',
-    createParticipantHandler(state),
-  );
-  participant.iconPath = {
-    light: vscode.Uri.joinPath(context.extensionUri, 'resources', 'opencode-icon-light.svg'),
-    dark: vscode.Uri.joinPath(context.extensionUri, 'resources', 'opencode-icon-dark.svg'),
-  };
-
-  participant.onDidReceiveFeedback((feedback: vscode.ChatResultFeedback) => {
-    outputChannel.appendLine(
-      `[feedback] ${feedback.kind === vscode.ChatResultFeedbackKind.Helpful ? '👍' : '👎'}`,
-    );
-  });
-
-  if (hasRegisterChatSessionContentProvider()) {
-    const { provider, controller } = createSessionContentProvider(state, context);
-    const registration = vscode.chat.registerChatSessionContentProvider(
-      ACP_SESSION_SCHEME,
-      provider,
-      participant,
-      { supportsChangingSessionType: true },
+  // -- Register surfaces per backend (participant / session provider / LM) ----
+  for (const ctx of backends.values()) {
+    const participant = vscode.chat.createChatParticipant(
+      ctx.scheme,
+      createParticipantHandler(state!, ctx),
     );
 
-    context.subscriptions.push(registration);
-    if (controller) {
-      outputChannel.appendLine(`[extension] Session content provider registered (controller id=${controller.id}) — OpenCode appears in Session Target dropdown`);
-    } else {
-      outputChannel.appendLine('[extension] Session content provider registered (no controller — picker changes will NOT propagate) — OpenCode appears in Session Target dropdown');
+    if (ctx.id === 'opencode') {
+      participant.iconPath = {
+        light: vscode.Uri.joinPath(context.extensionUri, 'resources', 'opencode-icon-light.svg'),
+        dark: vscode.Uri.joinPath(context.extensionUri, 'resources', 'opencode-icon-dark.svg'),
+      };
     }
-  } else {
-    outputChannel.appendLine('[extension] chatSessionsProvider API unavailable — session target registration skipped');
+
+    participant.onDidReceiveFeedback((feedback: vscode.ChatResultFeedback) => {
+      outputChannel.appendLine(
+        `[feedback:${ctx.id}] ${feedback.kind === vscode.ChatResultFeedbackKind.Helpful ? '👍' : '👎'}`,
+      );
+    });
+
+    if (hasRegisterChatSessionContentProvider()) {
+      const { provider, controller } = createSessionContentProvider(state!, ctx, context);
+      const registration = vscode.chat.registerChatSessionContentProvider(
+        ctx.scheme,
+        provider,
+        participant,
+        { supportsChangingSessionType: true },
+      );
+
+      context.subscriptions.push(registration);
+      if (controller) {
+        outputChannel.appendLine(`[extension:${ctx.id}] Session content provider registered (controller id=${controller.id})`);
+      } else {
+        outputChannel.appendLine(`[extension:${ctx.id}] Session content provider registered (no controller)`);
+      }
+    }
+
+    const lmRegistration = registerLanguageModelChatProvider(state!, ctx);
+    if (lmRegistration) {
+      context.subscriptions.push(lmRegistration);
+    }
+
+    context.subscriptions.push(participant);
   }
 
-  // Register native VS Code language model provider (opencode vendor)
-  const lmRegistration = registerLanguageModelChatProvider(state);
-  if (lmRegistration) {
-    context.subscriptions.push(lmRegistration);
-  }
-
-  context.subscriptions.push(outputChannel, participant, statusBar, openSettingsCommand);
+  context.subscriptions.push(outputChannel, statusBar, openSettingsCommand, bus);
   outputChannel.appendLine('[extension] ACPilot activated');
 }
 
@@ -426,12 +454,12 @@ function readGlobalSettings(): GlobalSettingItem[] {
 }
 
 /** Push current backend data into the settings webview panel */
-async function pushDataToPanel(s: ExtensionState, panel: SettingsPanel): Promise<void> {
+async function pushDataToPanel(s: ExtensionState, ctx: BackendContext, panel: SettingsPanel): Promise<void> {
   try {
     const [agentsResp, modelsResp, configResp] = await Promise.all([
-      s.backend.config.agents().catch(() => ({ data: [] as AcpAgent[] })),
-      s.backend.config.models().catch(() => ({ data: [] as AcpModel[] })),
-      s.backend.config.get().catch(() => ({ data: undefined })),
+      ctx.backend.config.agents().catch(() => ({ data: [] as AcpAgent[] })),
+      ctx.backend.config.models().catch(() => ({ data: [] as AcpModel[] })),
+      ctx.backend.config.get().catch(() => ({ data: undefined })),
     ]);
 
     const agents = agentsResp.data ?? [];
@@ -440,16 +468,16 @@ async function pushDataToPanel(s: ExtensionState, panel: SettingsPanel): Promise
 
     // Get backend settings descriptor if provider exists
     let backendSettings: BackendSettingsDescriptor | undefined;
-    if (s.backend.settingsProvider) {
+    if (ctx.backend.settingsProvider) {
       try {
-        backendSettings = await s.backend.settingsProvider.getDescriptor(agents, models);
+        backendSettings = await ctx.backend.settingsProvider.getDescriptor(agents, models);
       } catch {
         // non-critical — backend settings UI will show empty state
       }
     }
 
     const data: SettingsData = {
-      backendName: getBackendDisplayName(s.backend.name),
+      backendName: getBackendDisplayName(ctx.backend.name),
       agents: agents.map((a: AcpAgent) => ({
         id: a.id,
         name: a.name,
@@ -467,9 +495,9 @@ async function pushDataToPanel(s: ExtensionState, panel: SettingsPanel): Promise
         providerId: m.provider,
         capabilities: m.capabilities,
       })),
-      currentAgent: s.selection.get().agent,
-      currentModel: s.selection.get().model,
-      currentModelDisplayName: s.selection.get().modelDisplayName,
+      currentAgent: ctx.selection.get().agent,
+      currentModel: ctx.selection.get().model,
+      currentModelDisplayName: ctx.selection.get().modelDisplayName,
       defaultAgent: config.default_agent,
       defaultModel: config.model,
       backendSettings,
@@ -491,12 +519,14 @@ async function pushDataToPanel(s: ExtensionState, panel: SettingsPanel): Promise
 export function deactivate() {
   if (state) {
     state.outputChannel.appendLine('[extension] Deactivating...');
-    if (state.backend.isRunning()) {
-      state.backend.stop().catch((err: unknown) => {
-        state!.outputChannel.appendLine(
-          `[extension] Stop error: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      });
+    for (const ctx of state.backends.values()) {
+      if (ctx.backend.isRunning()) {
+        ctx.backend.stop().catch((err: unknown) => {
+          state!.outputChannel.appendLine(
+            `[extension] Stop error (${ctx.id}): ${err instanceof Error ? err.message : String(err)}`,
+          );
+        });
+      }
     }
   }
 }

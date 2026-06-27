@@ -53,7 +53,7 @@ describe('state-persistence', () => {
   });
 
   it('returns empty object when no persisted state exists', () => {
-    expect(loadPersistedSettingsState(context)).toEqual({});
+    expect(loadPersistedSettingsState(context, 'opencode')).toEqual({});
   });
 
   it('saves and loads full selection state', () => {
@@ -63,9 +63,9 @@ describe('state-persistence', () => {
       modelDisplayName: 'Claude Sonnet 4',
     };
 
-    savePersistedSettingsState(context, state);
+    savePersistedSettingsState(context, 'opencode', state);
 
-    expect(loadPersistedSettingsState(context)).toEqual(state);
+    expect(loadPersistedSettingsState(context, 'opencode')).toEqual(state);
   });
 
   it('saves and loads partial selection state', () => {
@@ -73,9 +73,9 @@ describe('state-persistence', () => {
       model: { providerID: 'openai', modelID: 'gpt-4o' },
     };
 
-    savePersistedSettingsState(context, state);
+    savePersistedSettingsState(context, 'opencode', state);
 
-    expect(loadPersistedSettingsState(context)).toEqual({
+    expect(loadPersistedSettingsState(context, 'opencode')).toEqual({
       agent: undefined,
       model: { providerID: 'openai', modelID: 'gpt-4o' },
       modelDisplayName: undefined,
@@ -83,19 +83,19 @@ describe('state-persistence', () => {
   });
 
   it('overwrites prior persisted state on subsequent saves', () => {
-    savePersistedSettingsState(context, {
+    savePersistedSettingsState(context, 'opencode', {
       agent: 'old-agent',
       model: { providerID: 'openai', modelID: 'gpt-4' },
       modelDisplayName: 'GPT-4',
     });
 
-    savePersistedSettingsState(context, {
+    savePersistedSettingsState(context, 'opencode', {
       agent: 'new-agent',
       model: { providerID: 'google', modelID: 'gemini-2.5-pro' },
       modelDisplayName: 'Gemini 2.5 Pro',
     });
 
-    expect(loadPersistedSettingsState(context)).toEqual({
+    expect(loadPersistedSettingsState(context, 'opencode')).toEqual({
       agent: 'new-agent',
       model: { providerID: 'google', modelID: 'gemini-2.5-pro' },
       modelDisplayName: 'Gemini 2.5 Pro',

@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { writeFileSync, unlinkSync, existsSync } from 'fs';
 import { execSync, exec } from 'child_process';
-import type { ExtensionState } from '../types';
+import type { ExtensionState, BackendContext } from '../types';
 import type {
   ChatToolResourcesInvocationData,
   ChatTerminalToolInvocationData,
@@ -65,27 +65,28 @@ async function* readOpenCodeEvents(stream: AsyncIterable<unknown>): AsyncIterabl
 export async function routeCommand(
   command: string,
   state: ExtensionState,
+  ctx: BackendContext,
   stream: vscode.ChatResponseStream,
   _token: vscode.CancellationToken,
 ): Promise<vscode.ChatResult> {
   switch (command.toLowerCase()) {
     case 'new':
-      await handleNewCommand(state, stream);
+      await handleNewCommand(state, ctx, stream);
       break;
     case 'help':
       handleHelpCommand(stream);
       break;
     case 'model':
-      await handleModelCommand(state, stream);
+      await handleModelCommand(state, ctx, stream);
       break;
     case 'test-external-edit':
-      await handleTestExternalEditCommand(state, stream, _token);
+      await handleTestExternalEditCommand(state, ctx, stream, _token);
       break;
     case 'test-external-edit-real':
-      await handleTestExternalEditRealCommand(state, stream, _token);
+      await handleTestExternalEditRealCommand(state, ctx, stream, _token);
       break;
     case 'test-external-edit-e2e':
-      await handleTestExternalEditE2ECommand(state, stream, _token);
+      await handleTestExternalEditE2ECommand(state, ctx, stream, _token);
       break;
     case 'test-subagent-single-blocking':
       await handleTestSubagentSingleBlockingCommand(stream, _token);
@@ -103,7 +104,7 @@ export async function routeCommand(
       await handleTestFileReadStreamCommand(stream, _token);
       break;
     case 'test-stream-latency':
-      await handleTestStreamLatencyCommand(state, stream, _token);
+      await handleTestStreamLatencyCommand(state, ctx, stream, _token);
       break;
     case 'test-thinking':
       await handleTestThinkingCommand(stream, _token);
@@ -121,12 +122,13 @@ export async function routeCommand(
 
 async function handleNewCommand(
   state: ExtensionState,
+  ctx: BackendContext,
   stream: vscode.ChatResponseStream,
 ): Promise<void> {
-  const ready = await ensureServer(state, stream);
+  const ready = await ensureServer(state, ctx, stream);
   if (!ready) {return;}
   try {
-    const result = await state.backend.sessions.create();
+    const result = await ctx.backend.sessions.create();
     const sessionId = result.data?.id;
     if (!sessionId) {
       throw new Error('Session not created');
@@ -165,12 +167,13 @@ function handleHelpCommand(stream: vscode.ChatResponseStream): void {
 
 async function handleModelCommand(
   state: ExtensionState,
+  ctx: BackendContext,
   stream: vscode.ChatResponseStream,
 ): Promise<void> {
-  const ready = await ensureServer(state, stream);
+  const ready = await ensureServer(state, ctx, stream);
   if (!ready) {return;}
   try {
-    const modelsResp = await state.backend.config.models();
+    const modelsResp = await ctx.backend.config.models();
     const modelList = modelsResp.data ?? [];
     if (modelList.length > 0) {
       const lines: string[] = ['## Available Models', ''];
@@ -205,6 +208,7 @@ async function handleModelCommand(
  */
 async function handleTestExternalEditCommand(
   state: ExtensionState,
+  _ctx: BackendContext,
   stream: vscode.ChatResponseStream,
   token: vscode.CancellationToken,
 ): Promise<void> {
@@ -346,6 +350,7 @@ function waitForVscodeFileChange(uri: vscode.Uri, timeoutMs: number): Promise<bo
  */
 async function handleTestExternalEditRealCommand(
   state: ExtensionState,
+  _ctx: BackendContext,
   stream: vscode.ChatResponseStream,
   token: vscode.CancellationToken,
 ): Promise<void> {
@@ -587,6 +592,7 @@ async function handleTestExternalEditRealCommand(
 
 async function handleTestExternalEditE2ECommand(
   state: ExtensionState,
+  ctx: BackendContext,
   stream: vscode.ChatResponseStream,
   token: vscode.CancellationToken,
 ): Promise<void> {
@@ -599,7 +605,7 @@ async function handleTestExternalEditE2ECommand(
   // 1. Start server
   stream.markdown('🧪 **E2E Test: real OpenCode prompt → file edit → externalEdit**\n\n');
   stream.markdown('1️⃣ Starting OpenCode server...\n\n');
-  const ready = await ensureServer(state, stream);
+  const ready = await ensureServer(state, ctx, stream);
   if (!ready) {return;}
   const directory = workspaceFolders[0].uri.fsPath;
 
@@ -614,7 +620,7 @@ async function handleTestExternalEditE2ECommand(
   stream.markdown('3️⃣ Creating session...\n\n');
   let sessionId: string;
   try {
-      const sessionResp = await state.backend.sessions.create({ directory });
+      const sessionResp = await ctx.backend.sessions.create({ directory });
       sessionId = sessionResp.data?.id ?? '';
     if (!sessionId) {throw new Error('empty session id');}
     stream.markdown(`   Session: \`${sessionId}\`\n\n`);
@@ -638,8 +644,8 @@ async function handleTestExternalEditE2ECommand(
 
   let eventStream: import('../acp/backend').AcpEventStream;
   try {
-    await state.backend.events.ensureStarted();
-    eventStream = state.backend.events.openSessionStream(sessionId);
+    await ctx.backend.events.ensureStarted();
+    eventStream = ctx.backend.events.openSessionStream(sessionId);
   } catch (err) {
     stream.markdown(`❌ Failed to subscribe to events: ${err}\n\n`);
     try { unlinkSync(tmpPath); } catch { /* best effort */ }
@@ -648,7 +654,7 @@ async function handleTestExternalEditE2ECommand(
   }
 
   // Send prompt (fire and don't await)
-  const promptPromise = state.backend.sessions.prompt(sessionId, prompt, directory).catch((err: unknown) => {
+  const promptPromise = ctx.backend.sessions.prompt(sessionId, prompt, directory).catch((err: unknown) => {
     state.outputChannel.appendLine(`[e2e] Prompt error: ${err}`);
   });
 
@@ -691,7 +697,7 @@ async function handleTestExternalEditE2ECommand(
             (async () => {
               if (properties.sessionID && properties.id) {
                 try {
-                  await state.backend.permissions.reply(properties.sessionID, properties.id, 'once', directory);
+                  await ctx.backend.permissions.reply(properties.sessionID, properties.id, 'once', directory);
                   stream.markdown(`     ✅ Replied "once"\n`);
                 } catch (err) {
                   stream.markdown(`     ❌ Reply failed: ${err}\n`);
@@ -702,7 +708,7 @@ async function handleTestExternalEditE2ECommand(
         } else if (properties.sessionID && properties.id) {
           // Non-matching filepath — just reply "once"
           try {
-            await state.backend.permissions.reply(properties.sessionID, properties.id, 'once', directory);
+            await ctx.backend.permissions.reply(properties.sessionID, properties.id, 'once', directory);
             stream.markdown(`     ✅ Replied "once"\n`);
           } catch (err) {
             stream.markdown(`     ❌ Reply failed: ${err}\n`);
@@ -783,7 +789,7 @@ async function handleTestExternalEditE2ECommand(
   }
 
   // Cleanup
-  state.backend.events.closeSessionStream(sessionId);
+  ctx.backend.events.closeSessionStream(sessionId);
   try { if (existsSync(tmpPath)) { unlinkSync(tmpPath); } } catch { /* best effort */ }
   tracker.dispose();
 
@@ -1580,10 +1586,11 @@ interface DeltaTiming {
  */
 async function handleTestStreamLatencyCommand(
   state: ExtensionState,
+  ctx: BackendContext,
   stream: vscode.ChatResponseStream,
   token: vscode.CancellationToken,
 ): Promise<void> {
-  const ready = await ensureServer(state, stream);
+  const ready = await ensureServer(state, ctx, stream);
   if (!ready) {return;}
 
   // The prompt must trigger a long reasoning/thinking response.
@@ -1618,7 +1625,7 @@ async function handleTestStreamLatencyCommand(
     stream.progress('Creating session...');
 
     // 1. Create a new session
-    const sessionResult = await state.backend.sessions.create({
+    const sessionResult = await ctx.backend.sessions.create({
       title: 'stream-latency-test',
     });
     if (sessionResult.error || !sessionResult.data) {
@@ -1630,15 +1637,15 @@ async function handleTestStreamLatencyCommand(
 
     // 2. Subscribe to global events
     stream.progress('Subscribing to event stream...');
-    await state.backend.events.ensureStarted();
+    await ctx.backend.events.ensureStarted();
 
     // 3. Open per-session stream
-    const eventStream = state.backend.events.openSessionStream(sessionId);
+    const eventStream = ctx.backend.events.openSessionStream(sessionId);
 
     // 4. Fire the prompt (non-blocking)
     stream.progress('Sending thinking prompt...');
     const promptStart = perfNow();
-    const promptPromise = state.backend.sessions
+    const promptPromise = ctx.backend.sessions
       .prompt(sessionId, THINKING_PROMPT)
       .then((result: { error?: unknown; data?: unknown }) => {
         if (result.error) {
@@ -1728,7 +1735,7 @@ async function handleTestStreamLatencyCommand(
     await promptPromise;
 
     // Close the stream
-    state.backend.events.closeSessionStream(sessionId);
+    ctx.backend.events.closeSessionStream(sessionId);
 
     // 6. Compute and display statistics
     if (deltas.length === 0) {

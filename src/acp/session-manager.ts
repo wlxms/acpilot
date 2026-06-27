@@ -42,6 +42,7 @@ export class SessionManager {
   constructor(
     private readonly backend: AcpBackend,
     private readonly bus: AppEventBus,
+    private readonly backendId: string,
   ) {}
 
   // -- read ---------------------------------------------------------------
@@ -150,7 +151,7 @@ export class SessionManager {
         turnMap: recoveredState.turnMap ?? [],
       };
       this.sessionMap.set(vscodeSessionId, state);
-      this.bus.emit('session-list-changed', void 0);
+      this.bus.emit('session-list-changed', { backendId: this.backendId });
       return state.backendSessionId;
     }
 
@@ -167,7 +168,7 @@ export class SessionManager {
       createdAt: result.data.createdAt,
     };
     this.sessionMap.set(vscodeSessionId, state);
-    this.bus.emit('session-list-changed', void 0);
+    this.bus.emit('session-list-changed', { backendId: this.backendId });
     return state.backendSessionId;
   }
 
@@ -181,7 +182,7 @@ export class SessionManager {
     if (state) {
       this.sessionMap.set(toKey, state);
       this.sessionMap.delete(fromKey);
-      this.bus.emit('session-list-changed', void 0);
+      this.bus.emit('session-list-changed', { backendId: this.backendId });
     }
   }
 }

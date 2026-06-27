@@ -5,7 +5,7 @@ import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { createSessionContentProvider } from '../surfaces/vscode/experimental-session';
 import type { AcpBackend } from '../acp/backend';
-import type { ExtensionState } from '../types';
+import type { ExtensionState, BackendContext } from '../types';
 import { AppEventBus } from '../acp/app-event-bus';
 import { buildLine } from '../acp/serializable/serializer';
 import type { StreamPartRecord } from '../ssp/types';
@@ -27,11 +27,10 @@ function getFirstResponseParts(session: vscode.ChatSession): unknown[] {
   return (responseTurn as unknown as { responses: unknown[] }).responses;
 }
 
-function makeState(sessionDir: string): ExtensionState {
+function makeState(sessionDir: string): { state: ExtensionState; ctx: BackendContext } {
   const sessionStore = new Map<string, any>();
-  return {
-    backend: {
-      name: 'opencode',
+  const backend = {
+    name: 'opencode',
       start: vi.fn(async () => ({ data: { url: 'http://127.0.0.1:4096', status: 'running' as const } })),
       stop: vi.fn(async () => undefined),
       getStatus: vi.fn((): import('../acp/types').AcpServerStatus => 'running'),
@@ -88,29 +87,25 @@ function makeState(sessionDir: string): ExtensionState {
         getSessionTitle: vi.fn().mockReturnValue(null),
         getHadSubagentTasks: vi.fn().mockReturnValue(false),
       })) as unknown as AcpBackend['createBridge'],
-    },
-    outputChannel: vscode.window.createOutputChannel('test'),
+  } as unknown as AcpBackend;
+
+  const ctx: BackendContext = {
+    id: 'opencode',
+    scheme: 'acpilot.opencode',
+    vendors: ['opencode-cli', 'opencode-zen'],
+    backend,
     sessions: {
       get: vi.fn((key: string) => sessionStore.get(key)),
       has: vi.fn((key: string) => sessionStore.has(key)),
       set: vi.fn((key: string, value: unknown) => { sessionStore.set(key, value); }),
       values: vi.fn(() => sessionStore.values()),
       entries: vi.fn(() => sessionStore.entries()),
-    } as unknown as ExtensionState['sessions'],
-    statusBar: { update: vi.fn() } as unknown as ExtensionState['statusBar'],
+    } as unknown as BackendContext['sessions'],
     selection: {
       get: vi.fn(() => ({ agent: undefined, model: undefined, modelDisplayName: undefined })),
       setAgent: vi.fn(async () => {}),
       setModel: vi.fn(async () => {}),
-    } as unknown as ExtensionState['selection'],
-    bus: new AppEventBus(),
-    acpModels: {
-      sync: vi.fn(async () => {}),
-      resolve: vi.fn(() => ({ kind: 'not-found' as const })),
-      getModelsForCopilotRegistration: vi.fn(() => []),
-      refresh: vi.fn(async () => {}),
-      dispose: vi.fn(),
-    } as unknown as ExtensionState['acpModels'],
+    } as unknown as BackendContext['selection'],
     sessionStore: {
       listSessions: vi.fn().mockResolvedValue([]),
       getTurnsPath: vi.fn().mockReturnValue(path.join(sessionDir, 'turns.jsonl')),
@@ -120,7 +115,23 @@ function makeState(sessionDir: string): ExtensionState {
       updateMeta: vi.fn().mockResolvedValue(undefined),
       writeMeta: vi.fn().mockResolvedValue(undefined),
     } as any,
+  } as unknown as BackendContext;
+
+  const state = {
+    backends: new Map([['opencode', ctx]]),
+    outputChannel: vscode.window.createOutputChannel('test'),
+    statusBar: { update: vi.fn() } as unknown as ExtensionState['statusBar'],
+    bus: new AppEventBus(),
+    acpModels: {
+      sync: vi.fn(async () => {}),
+      resolve: vi.fn(() => ({ kind: 'not-found' as const })),
+      getModelsForCopilotRegistration: vi.fn(() => []),
+      refresh: vi.fn(async () => {}),
+      dispose: vi.fn(),
+    } as unknown as ExtensionState['acpModels'],
   } as unknown as ExtensionState;
+
+  return { state, ctx };
 }
 
 function writeJsonl(filePath: string, lines: string[]): void {
@@ -254,9 +265,10 @@ describe('SubSSS externalEdit restore', () => {
       (vscode.workspace as { workspaceFolders?: Array<{ uri: vscode.Uri; name: string; index: number }> }).workspaceFolders = [
         { uri: vscode.Uri.file(tmpDir), name: 'test', index: 0 },
       ];
-      const state = makeState(sessionDir);
+      const { state, ctx } = makeState(sessionDir);
       const { provider } = createSessionContentProvider(
         state,
+        ctx,
         { subscriptions: [] } as unknown as vscode.ExtensionContext,
       );
 
@@ -374,9 +386,10 @@ describe('SubSSS externalEdit restore', () => {
       (vscode.workspace as { workspaceFolders?: Array<{ uri: vscode.Uri; name: string; index: number }> }).workspaceFolders = [
         { uri: vscode.Uri.file(tmpDir), name: 'test', index: 0 },
       ];
-      const state = makeState(sessionDir);
+      const { state, ctx } = makeState(sessionDir);
       const { provider } = createSessionContentProvider(
         state,
+        ctx,
         { subscriptions: [] } as unknown as vscode.ExtensionContext,
       );
 
@@ -499,9 +512,10 @@ describe('SubSSS externalEdit restore', () => {
       (vscode.workspace as { workspaceFolders?: Array<{ uri: vscode.Uri; name: string; index: number }> }).workspaceFolders = [
         { uri: vscode.Uri.file(tmpDir), name: 'test', index: 0 },
       ];
-      const state = makeState(sessionDir);
+      const { state, ctx } = makeState(sessionDir);
       const { provider } = createSessionContentProvider(
         state,
+        ctx,
         { subscriptions: [] } as unknown as vscode.ExtensionContext,
       );
 

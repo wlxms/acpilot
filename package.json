@@ -57,6 +57,11 @@
         "vendor": "opencode-zen",
         "displayName": "OpenCode Zen",
         "managementCommand": "acpilot.openSettings"
+      },
+      {
+        "vendor": "acp",
+        "displayName": "ACP Agent",
+        "managementCommand": "acpilot.openSettings"
       }
     ],
     "configuration": {
@@ -96,6 +101,37 @@
             "Render tools immediately and buffer root reasoning or markdown until their part is complete."
           ],
           "description": "Controls how ACP stream parts are scheduled before rendering to VS Code chat."
+        },
+        "acpilot.backends.acp.mode": {
+          "type": "string",
+          "enum": ["local", "remote"],
+          "default": "remote",
+          "enumDescriptions": [
+            "Spawn a local ACP agent process and communicate over stdio (JSON-RPC).",
+            "Connect to a remote ACP agent over WebSocket."
+          ],
+          "description": "Connection mode for the standard ACP agent backend."
+        },
+        "acpilot.backends.acp.endpoint": {
+          "type": "string",
+          "default": "",
+          "description": "Remote ACP agent WebSocket URL (e.g. ws://host:4096). Required when mode is 'remote'; the acp participant is hidden while empty."
+        },
+        "acpilot.backends.acp.authToken": {
+          "type": "string",
+          "default": "",
+          "description": "Optional bearer token sent to the remote ACP agent (requires the `ws` npm package)."
+        },
+        "acpilot.backends.acp.command": {
+          "type": "string",
+          "default": "",
+          "description": "Command to spawn a local ACP agent (e.g. 'npx'). Required when mode is 'local'."
+        },
+        "acpilot.backends.acp.args": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Arguments passed to the local ACP agent command."
         }
       }
     },
@@ -176,6 +212,31 @@
             "description": "Test questionCarousel UI flow (single-select, multi-select, text input)"
           }
         ]
+      },
+      {
+        "type": "acpilot.acp",
+        "name": "acp",
+        "displayName": "ACP Agent",
+        "description": "Any standard Agent Client Protocol agent (JSON-RPC 2.0)",
+        "icon": "$(acpilot-a)",
+        "inputPlaceholder": "Ask the ACP agent...",
+        "canDelegate": true,
+        "requiresCustomModels": true,
+        "capabilities": {
+          "supportsFileAttachments": true,
+          "supportsToolAttachments": true,
+          "supportsImageAttachments": true
+        },
+        "commands": [
+          {
+            "name": "new",
+            "description": "Start a new conversation session"
+          },
+          {
+            "name": "help",
+            "description": "Show available commands"
+          }
+        ]
       }
     ]
   },
@@ -206,12 +267,14 @@
     "vitest": "^4.1.5"
   },
   "dependencies": {
+    "@agentclientprotocol/sdk": "^1.0.0",
     "@ai-sdk/anthropic": "^3.0.81",
     "@ai-sdk/google": "^3.0.80",
     "@ai-sdk/openai": "^3.0.67",
     "@ai-sdk/openai-compatible": "^2.0.48",
     "@opencode-ai/sdk": "^1.16.0",
     "ai": "^6.0.193",
-    "opencode-ai": "^1.16.0"
+    "opencode-ai": "^1.16.0",
+    "zod": "^3.25.0"
   }
 }

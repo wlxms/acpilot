@@ -13,6 +13,7 @@
  */
 
 import './opencode/index'; // side-effect: registers 'opencode' backend
+import './acp/index'; // side-effect: registers 'acp' backend
 import { createBackend } from '../backend/backend-registry';
 import type { Backend } from '../backend/backend';
 
@@ -36,10 +37,10 @@ export interface BuiltinBackendDescriptor {
 /**
  * The fixed set of built-in backends.
  *
- * NOTE: the 'acp' backend is declared here so the structure is in place, but
- * Phase 1 only assembles 'opencode'. The 'acp' entry is added once the ACP
- * backend implementation lands (Phase 5). Its presence here documents the
- * intended shape and keeps the loop generic.
+ * The 'acp' backend (standard Agent Client Protocol) is assembled only when a
+ * connection is configured (local command or remote endpoint) — `isEnabled`
+ * reads VS Code configuration and skips assembly when unset, so unconfigured
+ * users see no ACP participant.
  */
 export const BUILTIN_BACKENDS: BuiltinBackendDescriptor[] = [
   {
@@ -47,5 +48,24 @@ export const BUILTIN_BACKENDS: BuiltinBackendDescriptor[] = [
     scheme: 'acpilot.opencode',
     vendors: ['opencode-cli', 'opencode-zen'],
     factory: () => createBackend('opencode'),
+  },
+  {
+    id: 'acp',
+    scheme: 'acpilot.acp',
+    vendors: ['acp'],
+    factory: () => createBackend('acp'),
+    // Lazy-read to avoid a static import cycle into the config layer.
+    isEnabled: () => {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const vscode = require('vscode') as typeof import('vscode');
+        const config = vscode.workspace.getConfiguration('acpilot.backends.acp');
+        const mode = config.get<'local' | 'remote'>('mode', 'remote');
+        if (mode === 'remote') {return Boolean(config.get<string>('endpoint', ''));}
+        return Boolean(config.get<string>('command', ''));
+      } catch {
+        return false;
+      }
+    },
   },
 ];

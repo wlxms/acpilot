@@ -13,7 +13,6 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import type { ExtensionState, BackendContext } from '../../types';
-import type { AcpEvent } from '../../backend/types';
 import type {
   FileSnapshotRecord,
   SerializableRequestDetails,
@@ -43,14 +42,6 @@ import {
   type SubsessionRecordSet,
 } from '../../backend/streaming/deserialize';
 import {
-  readLegacySessionEvents,
-  readLegacySessionTurnEvents,
-  readSessionTurnStreamParts,
-  type LegacySessionTurnEvents,
-  type SessionTurnStreamParts,
-} from '../../backend/serializable/serializer';
-import {
-  projectStreamPartToAcpEvent,
   requestDetailsFromStreamParts,
 } from '../../backend/serializable/stream-parts';
 import type { StreamPartRecord } from '../../ssp/types';
@@ -447,100 +438,6 @@ export function createSessionContentProvider(
     return snapshots.filter(snapshot => snapshotTurnIndex(snapshot) > lastAccepted);
   }
 
-  function getToolCompleteReplaySnapshots(
-    snapshots: readonly FileSnapshotRecord[],
-    turnEvents: readonly LegacySessionTurnEvents<AcpEvent>[],
-  ): FileSnapshotRecord[] {
-    if (snapshots.length === 0 || turnEvents.length === 0) {
-      return [];
-    }
-
-    const snapshotsByCallId = new Map<string, FileSnapshotRecord[]>();
-    for (const snapshot of snapshots) {
-      if (!snapshot.toolCallId) {
-        continue;
-      }
-      const entries = snapshotsByCallId.get(snapshot.toolCallId) ?? [];
-      entries.push(snapshot);
-      snapshotsByCallId.set(snapshot.toolCallId, entries);
-    }
-
-    const replaySnapshots: FileSnapshotRecord[] = [];
-    const appendedCallIds = new Set<string>();
-    for (const turn of turnEvents) {
-      for (const event of turn.events) {
-        if (event.type !== 'part.updated' || event.part.type !== 'tool') {
-          continue;
-        }
-        const state = event.part.state as { status?: string };
-        if (state.status !== 'completed' && state.status !== 'error') {
-          continue;
-        }
-        if (!isRestoredEditToolName(event.part.toolName)) {
-          continue;
-        }
-        const callId = event.part.callId;
-        if (!callId || appendedCallIds.has(callId)) {
-          continue;
-        }
-        const entries = snapshotsByCallId.get(callId);
-        if (!entries?.length) {
-          continue;
-        }
-        appendedCallIds.add(callId);
-        replaySnapshots.push(...entries);
-      }
-    }
-
-    return replaySnapshots;
-  }
-
-  function getToolCompleteReplaySnapshotsForEvents(
-    snapshots: readonly FileSnapshotRecord[],
-    events: readonly AcpEvent[],
-  ): FileSnapshotRecord[] {
-    if (snapshots.length === 0 || events.length === 0) {
-      return [];
-    }
-
-    const snapshotsByCallId = new Map<string, FileSnapshotRecord[]>();
-    for (const snapshot of snapshots) {
-      if (!snapshot.toolCallId) {
-        continue;
-      }
-      const entries = snapshotsByCallId.get(snapshot.toolCallId) ?? [];
-      entries.push(snapshot);
-      snapshotsByCallId.set(snapshot.toolCallId, entries);
-    }
-
-    const replaySnapshots: FileSnapshotRecord[] = [];
-    const appendedCallIds = new Set<string>();
-    for (const event of events) {
-      if (event.type !== 'part.updated' || event.part.type !== 'tool') {
-        continue;
-      }
-      const state = event.part.state as { status?: string };
-      if (state.status !== 'completed' && state.status !== 'error') {
-        continue;
-      }
-      if (!isRestoredEditToolName(event.part.toolName)) {
-        continue;
-      }
-      const callId = event.part.callId;
-      if (!callId || appendedCallIds.has(callId)) {
-        continue;
-      }
-      const entries = snapshotsByCallId.get(callId);
-      if (!entries?.length) {
-        continue;
-      }
-      appendedCallIds.add(callId);
-      replaySnapshots.push(...entries);
-    }
-
-    return replaySnapshots;
-  }
-
   function getMergedRequestDetails(
     meta: SerializableSessionMeta | undefined,
     streamParts: readonly SerializableStreamPart[] | undefined,
@@ -713,24 +610,6 @@ export function createSessionContentProvider(
     }
     const excludedSet = new Set(excluded);
     return snapshots.filter(snapshot => !excludedSet.has(snapshot));
-  }
-
-  function getRestoreSnapshotsForToolCompleteEvent(
-    snapshots: readonly FileSnapshotRecord[],
-    event: AcpEvent,
-  ): FileSnapshotRecord[] {
-    if (event.type !== 'part.updated' || event.part.type !== 'tool') {
-      return [];
-    }
-    const state = event.part.state as { status?: string };
-    if (state.status !== 'completed' && state.status !== 'error') {
-      return [];
-    }
-    const part = event.part as { toolName?: string; callId?: string };
-    if (!isRestoredEditToolName(part.toolName) || !part.callId) {
-      return [];
-    }
-    return snapshots.filter(snapshot => snapshot.toolCallId === part.callId);
   }
 
   function isRestoredEditToolName(toolName: string | undefined): boolean {
@@ -1285,72 +1164,6 @@ export function createSessionContentProvider(
     return undefined;
   }
 
-  function getPromptFromTurnEvents(events: readonly AcpEvent[]): string | undefined {
-    for (const event of events) {
-      if (event.type === 'part.updated' && event.part.type === 'text') {
-        const text = (event.part as { text?: string }).text?.trim();
-        if (text) {
-          return text;
-        }
-      }
-    }
-    return undefined;
-  }
-
-  function dropFirstPromptEvent(events: readonly AcpEvent[], prompt: string): AcpEvent[] {
-    let dropped = false;
-    return events.filter((event) => {
-      if (!dropped && event.type === 'part.updated' && event.part.type === 'text') {
-        const text = (event.part as { text?: string }).text;
-        if (text === prompt) {
-          dropped = true;
-          return false;
-        }
-      }
-      return true;
-    });
-  }
-
-  function streamTurnToEventTurn(
-    turn: SessionTurnStreamParts<SerializableStreamPart>,
-  ): LegacySessionTurnEvents<AcpEvent> {
-    return {
-      turnIndex: turn.turnIndex,
-      start: turn.start,
-      events: turn.parts.map(projectStreamPartToAcpEvent).filter((event): event is AcpEvent => !!event),
-      end: turn.end,
-    };
-  }
-
-  async function readRestorableTurnEvents(
-    turnsPath: string,
-  ): Promise<{
-    turnEvents: LegacySessionTurnEvents<AcpEvent>[];
-    streamParts: SerializableStreamPart[];
-    source: 'stream-parts' | 'legacy-events' | 'empty';
-  }> {
-    const streamTurns = await readSessionTurnStreamParts<SerializableStreamPart>(turnsPath);
-    const hasStreamParts = streamTurns.some(turn => turn.parts.length > 0);
-    const eventTurns = streamTurns
-      .map(streamTurnToEventTurn)
-      .filter(turn => turn.events.length > 0 || turn.start || turn.end);
-    if (hasStreamParts && eventTurns.length > 0) {
-      return {
-        turnEvents: eventTurns,
-        streamParts: streamTurns.flatMap(turn => turn.parts),
-        source: 'stream-parts',
-      };
-    }
-
-    const legacyTurns = await readLegacySessionTurnEvents<AcpEvent>(turnsPath);
-    const hasLegacyEvents = legacyTurns.some(turn => turn.events.length > 0);
-    return {
-      turnEvents: legacyTurns,
-      streamParts: [],
-      source: hasLegacyEvents ? 'legacy-events' : 'empty',
-    };
-  }
-
   function getSessionStreamPath(sessionDir: string): string {
     return path.join(sessionDir, 'session.jsonl');
   }
@@ -1891,226 +1704,18 @@ export function createSessionContentProvider(
       return { history, snapshots, pendingReplaySnapshots, restoreReplaySnapshots };
     }
 
-    // 1. Read events and snapshots
-    const { turnEvents, streamParts, source: persistedSource } = await readRestorableTurnEvents(turnsPath);
-    const hasPersistedTurns = turnEvents.some(turn => turn.start);
-    const events = hasPersistedTurns
-      ? turnEvents.flatMap(turn => turn.events)
-      : await readLegacySessionEvents<AcpEvent>(turnsPath);
-    const snapshots = await readCheckpoints(sessionDir);
-    const partMetaIndex = await readMetaIndex(metaStreamPath);
-    const toolIdEditMap = getToolIdEditMap(meta, streamParts, undefined, partMetaIndex);
-    const checkpointApproval = getCheckpointApproval(snapshots, meta);
-    const restoreReplaySnapshots = hasPersistedTurns
-      ? getToolCompleteReplaySnapshots(snapshots, turnEvents)
-      : getToolCompleteReplaySnapshotsForEvents(snapshots, events);
-    const restorableMappedEditSnapshots = filterSnapshotsWithRestoredEditRecords(restoreReplaySnapshots, toolIdEditMap);
-    const restorableSnapshotEditCallIds = new Set(
-      restoreReplaySnapshots
-        .filter(snapshot => snapshot.phase === 'after' && !!snapshot.undoStopId && snapshot.toolCallId)
-        .map(snapshot => snapshot.toolCallId!),
-    );
-    const restorableSnapshotEditSnapshots = restoreReplaySnapshots.filter(snapshot =>
-      !!snapshot.toolCallId && restorableSnapshotEditCallIds.has(snapshot.toolCallId)
-    );
-    const restorableEditSnapshots = restorableMappedEditSnapshots.length > 0
-      ? restorableMappedEditSnapshots
-      : restorableSnapshotEditSnapshots;
-    const pendingReplaySnapshots = options?.replayPendingChanges === false
-      ? []
-      : excludeSnapshots(getRestoreReplaySnapshots(snapshots, meta), restorableEditSnapshots);
-    logRestorableEditSnapshotSummary(sessionId, restorableEditSnapshots, toolIdEditMap);
-
+    // No SSP stream-part records on disk. Phase 3's migration script converts
+    // all legacy event/rawAcpEvent lines to SSP, so reaching here means the
+    // session predates the SSP format and either was not migrated yet or is
+    // empty. The legacy event-based replay path (readRestorableTurnEvents /
+    // readLegacySessionEvents<AcpEvent> / AcpEvent-driven buildResponseTurn)
+    // has been removed — restore returns an empty history instead. Once the
+    // migration runs on activation (Phase 4d), these sessions become readable.
     logger.appendLine(
-      `[session-provider] fetchSessionHistory: projectedEvents=${events.length} snapshots=${snapshots.length} from ${turnsPath} ` +
-      `(source=${persistedSource}, acceptedThroughTurn=${checkpointApproval.acceptedThroughTurn}, ` +
-      `pending=${checkpointApproval.pendingSnapshots.length}, ` +
-      `restoreReplay=${restoreReplaySnapshots.length}, editRecords=${toolIdEditMap.size}, replayPending=${options?.replayPendingChanges !== false})`,
+      `[session-provider] fetchSessionHistory: no SSP stream-part records for session ${sessionId}; ` +
+      `returning empty history (legacy event replay removed in Phase 4b).`,
     );
-
-    const requestIdByTurnIndex = getRestoredRequestIdByTurnIndex(meta, streamParts, partMetaIndex);
-    const makeRequestTurn = (
-      prompt: string,
-      requestId: RestoredRequestId,
-      turnIndex: number,
-    ): vscode.ChatRequestTurn => {
-      logger.appendLine(
-        `[session-provider] Restored request id for ${sessionId}: ` +
-        `turn=${turnIndex} requestId=${requestId.id} source=${requestId.source}`,
-      );
-      const Ctor = vscode.ChatRequestTurn as unknown as new (
-        prompt: string,
-        command: string | undefined,
-        references: unknown[],
-        participant: string,
-        toolReferences: readonly unknown[],
-        editedFileEvents: readonly unknown[] | undefined,
-        id: string | undefined,
-      ) => vscode.ChatRequestTurn;
-      return new Ctor(
-        prompt,
-        undefined,
-        [],
-        ctx.scheme,
-        [],
-        undefined,
-        requestId.id,
-      );
-    };
-
-    const history: (vscode.ChatRequestTurn | vscode.ChatResponseTurn)[] = [];
-
-    const attachRestoreBridge = (
-      bridge: OpenCodeProtocolBridge,
-      collector: CollectorStream,
-      sss: SerializableSessionStream,
-    ): void => {
-      const compat = bridge as unknown as {
-        setSSS?: (next: unknown) => void;
-        setStream?: (next: unknown) => void;
-      };
-      if (typeof compat.setSSS === 'function') {
-        compat.setSSS(sss);
-        return;
-      }
-      compat.setStream?.(collector);
-    };
-
-    const runRestoreBridge = async (
-      bridge: OpenCodeProtocolBridge,
-      eventStreamForResponse: AsyncIterable<AcpEvent>,
-    ): Promise<void> => {
-      await bridge.run(eventStreamForResponse, token);
-    };
-
-    const buildResponseTurn = async (
-      turnEventsForResponse: readonly AcpEvent[],
-      snapshotsForResponse: readonly FileSnapshotRecord[],
-    ): Promise<vscode.ChatResponseTurn | undefined> => {
-      const collector = new CollectorStream();
-      // SSS without initialize(): no disk writes during replay
-      const sss = new SerializableSessionStream(
-        collector as unknown as vscode.ChatResponseStream,
-        { workspaceRoot: '', backendName: ctx.backend.name, sessionId, turnIndex: 0, requestId: '' },
-      );
-      const bridge = new OpenCodeProtocolBridge(ctx.backend, sessionId);
-      attachRestoreBridge(bridge, collector, sss);
-
-      async function* singleEvent(event: AcpEvent) {
-        yield event;
-      }
-
-      for (const event of turnEventsForResponse) {
-        if (token.isCancellationRequested) break;
-        await runRestoreBridge(bridge, singleEvent(event));
-        await sss.flush();
-        const eventRestoreSnapshots = getRestoreSnapshotsForToolCompleteEvent(snapshotsForResponse, event);
-        pushSnapshotsForRestoredEditTools(
-          sessionId,
-          eventRestoreSnapshots,
-          collector,
-          toolIdEditMap,
-        );
-      }
-
-      if (!token.isCancellationRequested) {
-        await sss.flush();
-      }
-
-      if (collector.parts.length === 0) {
-        return undefined;
-      }
-      return collector.buildTurn(getRestoredTurnMetadata(snapshotsForResponse, toolIdEditMap), ctx.scheme);
-    };
-
-    if (hasPersistedTurns) {
-      for (const turn of turnEvents) {
-        if (token.isCancellationRequested) break;
-
-        const start = turn.start as { prompt?: unknown } | undefined;
-        const prompt = typeof start?.prompt === 'string' ? start.prompt : getPromptFromTurnEvents(turn.events);
-        if (prompt) {
-          history.push(makeRequestTurn(prompt, getRestoredRequestId(turn.turnIndex, requestIdByTurnIndex), turn.turnIndex));
-        }
-
-        const responseEvents = prompt ? dropFirstPromptEvent(turn.events, prompt) : turn.events;
-        const responseTurn = await buildResponseTurn(responseEvents, getToolCompleteReplaySnapshotsForEvents(snapshots, responseEvents));
-        if (responseTurn) {
-          history.push(responseTurn);
-        }
-      }
-    } else {
-      // Legacy fallback: process events sequentially, flushing at session.idle
-      let collector = new CollectorStream();
-      let collectorRestoreSnapshots: FileSnapshotRecord[] = [];
-      let sss = new SerializableSessionStream(
-        collector as unknown as vscode.ChatResponseStream,
-        { workspaceRoot: '', backendName: ctx.backend.name, sessionId, turnIndex: 0, requestId: '' },
-      );
-      let bridge = new OpenCodeProtocolBridge(ctx.backend, sessionId);
-      attachRestoreBridge(bridge, collector, sss);
-
-      const flushAssistantTurn = (): void => {
-        if (collector.parts.length === 0) {
-          return;
-        }
-        history.push(collector.buildTurn(getRestoredTurnMetadata(collectorRestoreSnapshots, toolIdEditMap), ctx.scheme));
-        collector = new CollectorStream();
-        collectorRestoreSnapshots = [];
-        sss = new SerializableSessionStream(
-          collector as unknown as vscode.ChatResponseStream,
-          { workspaceRoot: '', backendName: ctx.backend.name, sessionId, turnIndex: 0, requestId: '' },
-        );
-        bridge = new OpenCodeProtocolBridge(ctx.backend, sessionId);
-        attachRestoreBridge(bridge, collector, sss);
-      };
-
-      let expectingUserMessage = true;
-      let legacyTurnIndex = 0;
-      for (const event of events) {
-        if (token.isCancellationRequested) break;
-
-        if (event.type === 'part.updated' && event.part.type === 'text' && expectingUserMessage) {
-          const textPart = event.part as { text?: string };
-          if (textPart.text && textPart.text.length > 0) {
-            history.push(makeRequestTurn(textPart.text, getRestoredRequestId(legacyTurnIndex, requestIdByTurnIndex), legacyTurnIndex));
-            expectingUserMessage = false;
-            continue;
-          }
-        }
-
-        if (event.type === 'session.idle') {
-          await sss.flush();
-          flushAssistantTurn();
-          expectingUserMessage = true;
-          legacyTurnIndex++;
-          continue;
-        }
-
-        async function* singleEvent() { yield event; }
-        await runRestoreBridge(bridge, singleEvent());
-        await sss.flush();
-        const eventRestoreSnapshots = getRestoreSnapshotsForToolCompleteEvent(snapshots, event);
-        pushSnapshotsForRestoredEditTools(
-          sessionId,
-          eventRestoreSnapshots,
-          collector,
-          toolIdEditMap,
-        );
-        collectorRestoreSnapshots.push(...eventRestoreSnapshots);
-      }
-
-      if (!token.isCancellationRequested) {
-        await sss.flush();
-      }
-      flushAssistantTurn();
-    }
-
-    logger.appendLine(
-      `[session-provider] Restored ${history.length} turns for session ${sessionId}`,
-    );
-
-    return { history, snapshots, pendingReplaySnapshots, restoreReplaySnapshots };
+    return { history: [], snapshots: [], pendingReplaySnapshots: [], restoreReplaySnapshots: [] };
   }
 
   // -- The Provider --------------------------------------------------------

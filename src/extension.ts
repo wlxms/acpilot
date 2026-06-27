@@ -15,6 +15,7 @@ import { SessionStore } from './backend/streaming/session-store';
 import type { ExtensionState, BackendContext } from './types';
 import { createAcpModels } from './backendmodels/index';
 import { AuthReader } from './backendmodels/auth-reader';
+import { runActivationMigration } from './backend/streaming/migrate';
 
 const KNOWN_PROVIDERS = [
   { id: 'openai', name: 'OpenAI', description: 'GPT-4o, GPT-4o-mini', requiresBaseURL: false, isOpenAICompatible: false, icon: '\ud83d\udfe2' },
@@ -131,6 +132,11 @@ export function activate(context: vscode.ExtensionContext) {
   const authReader = new AuthReader();
   const workspacePath = getWorkspaceDirectory();
   const backendModelSupport = vscode.workspace.getConfiguration('acpilot').get('experimental.acpBackendModelSupport', true);
+
+  // -- One-time on-disk migration: legacy event lines → SSP stream-parts -----
+  // Runs once per machine (globalState-guarded). Best-effort, non-blocking;
+  // failures retry next activation. See src/backend/streaming/migrate.ts.
+  void runActivationMigration(context, undefined, workspacePath);
 
   // -- Assemble per-backend contexts in a loop --------------------------------
   const backends = new Map<string, BackendContext>();

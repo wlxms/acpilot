@@ -1,5 +1,5 @@
 /**
- * OpenCode backend adapter - concrete AcpBackend implementation.
+ * OpenCode backend adapter - concrete Backend implementation.
  *
  * Maps every ACP operation to the OpenCode SDK, reusing
  * OpenCodeServerManager for lifecycle and GlobalEventBroker
@@ -9,30 +9,30 @@
 import { OpenCodeServerManager } from '../../opencode/server';
 import { GlobalEventBroker } from './event-broker';
 import type {
-  AcpBackend,
-  AcpBridge,
-  AcpSessionOperations,
-  AcpConfigOperations,
+  Backend,
+  BackendBridge,
+  BackendSessionOperations,
+  BackendConfigOperations,
   AcpEventOperations,
-  AcpPermissionOperations,
-  AcpQuestionOperations,
+  BackendPermissionOperations,
+  BackendQuestionOperations,
   AcpEventStream,
-  AcpAuthOperations,
-} from '../../acp/backend';
+  BackendAuthOperations,
+} from '../../backend/backend';
 import type {
-  AcpServerInfo,
-  AcpServerStatus,
-  AcpSessionInfo,
-  AcpSessionStatus,
-  AcpModel,
-  AcpAgent,
-  AcpConfig,
-  AcpFileAttachment,
-  AcpResult,
-  AcpPermissionResponse,
-  AcpMessageHistory,
-  AcpHistoryMessage,
-} from '../../acp/types';
+  BackendServerInfo,
+  BackendServerStatus,
+  BackendSessionInfo,
+  BackendSessionStatus,
+  BackendModel,
+  BackendAgent,
+  BackendConfig,
+  BackendFileAttachment,
+  BackendResult,
+  BackendPermissionResponse,
+  BackendMessageHistory,
+  BackendHistoryMessage,
+} from '../../backend/types';
 import type { OpenCodeStreamEvent } from './sdk-events';
 import type { OpenCodeClient, SdkAgentData } from './sdk-types';
 import { OpenCodeBridge } from './opencode-bridge';
@@ -42,7 +42,7 @@ import { OpenCodeSettingsProvider } from './settings';
 // Helpers
 // ===========================================================================
 
-function toAcpSessionInfo(data: { id?: string; title?: string; time?: { created?: number } }): AcpSessionInfo {
+function toAcpSessionInfo(data: { id?: string; title?: string; time?: { created?: number } }): BackendSessionInfo {
   return {
     id: data.id ?? '',
     title: data.title ?? '',
@@ -96,7 +96,7 @@ function formatResultError(value: unknown, fallback: string): string {
 // Adapter
 // ===========================================================================
 
-export class OpenCodeBackend implements AcpBackend<OpenCodeStreamEvent> {
+export class OpenCodeBackend implements Backend<OpenCodeStreamEvent> {
   readonly name = 'opencode';
 
   private readonly serverManager = new OpenCodeServerManager();
@@ -107,7 +107,7 @@ export class OpenCodeBackend implements AcpBackend<OpenCodeStreamEvent> {
   // Lifecycle
   // =======================================================================
 
-  async start(directory?: string): Promise<AcpResult<AcpServerInfo>> {
+  async start(directory?: string): Promise<BackendResult<BackendServerInfo>> {
     try {
       const url = await this.serverManager.start(directory);
       const rawClient = this.serverManager.getClient();
@@ -132,7 +132,7 @@ export class OpenCodeBackend implements AcpBackend<OpenCodeStreamEvent> {
     await this.serverManager.stop();
   }
 
-  getStatus(): AcpServerStatus {
+  getStatus(): BackendServerStatus {
     return this.serverManager.getStatus();
   }
 
@@ -145,7 +145,7 @@ export class OpenCodeBackend implements AcpBackend<OpenCodeStreamEvent> {
   }
 
   /** @inheritdoc */
-  createBridge(sessionId: string, directory?: string): AcpBridge<OpenCodeStreamEvent> {
+  createBridge(sessionId: string, directory?: string): BackendBridge<OpenCodeStreamEvent> {
     return new OpenCodeBridge(this, sessionId, directory);
   }
 
@@ -163,8 +163,8 @@ export class OpenCodeBackend implements AcpBackend<OpenCodeStreamEvent> {
   // Sessions
   // =======================================================================
 
-  readonly sessions: AcpSessionOperations = {
-    create: async (options?): Promise<AcpResult<AcpSessionInfo>> => {
+  readonly sessions: BackendSessionOperations = {
+    create: async (options?): Promise<BackendResult<BackendSessionInfo>> => {
       try {
         const result = await this.sdk.session.create({
           directory: options?.directory,
@@ -183,7 +183,7 @@ export class OpenCodeBackend implements AcpBackend<OpenCodeStreamEvent> {
       }
     },
 
-    get: async (id: string, directory?: string): Promise<AcpResult<AcpSessionInfo>> => {
+    get: async (id: string, directory?: string): Promise<BackendResult<BackendSessionInfo>> => {
       try {
         const result = await this.sdk.session.get({ sessionID: id, directory });
         const error = getResultError(result);
@@ -199,7 +199,7 @@ export class OpenCodeBackend implements AcpBackend<OpenCodeStreamEvent> {
       }
     },
 
-    update: async (id: string, options: { title?: string; directory?: string }): Promise<AcpResult<AcpSessionInfo>> => {
+    update: async (id: string, options: { title?: string; directory?: string }): Promise<BackendResult<BackendSessionInfo>> => {
       try {
         const result = await this.sdk.session.update({
           sessionID: id,
@@ -254,9 +254,9 @@ export class OpenCodeBackend implements AcpBackend<OpenCodeStreamEvent> {
       options?: {
         model?: { providerID: string; modelID: string };
         agent?: string;
-        attachments?: AcpFileAttachment[];
+        attachments?: BackendFileAttachment[];
       },
-    ): Promise<AcpResult<unknown>> => {
+    ): Promise<BackendResult<unknown>> => {
       try {
         const parts: unknown[] = [{ type: 'text', text }];
 
@@ -291,7 +291,7 @@ export class OpenCodeBackend implements AcpBackend<OpenCodeStreamEvent> {
       }
     },
 
-    revert: async (id: string, messageId: string, partId?: string, directory?: string): Promise<AcpResult<unknown>> => {
+    revert: async (id: string, messageId: string, partId?: string, directory?: string): Promise<BackendResult<unknown>> => {
       try {
         const result = await this.sdk.session.revert({
           sessionID: id,
@@ -309,7 +309,7 @@ export class OpenCodeBackend implements AcpBackend<OpenCodeStreamEvent> {
       }
     },
 
-    abort: async (id: string, directory?: string): Promise<AcpResult<boolean>> => {
+    abort: async (id: string, directory?: string): Promise<BackendResult<boolean>> => {
       try {
         const result = await this.sdk.session.abort({ sessionID: id, directory });
         const error = getResultError(result);
@@ -322,7 +322,7 @@ export class OpenCodeBackend implements AcpBackend<OpenCodeStreamEvent> {
       }
     },
 
-    list: async (directory?: string): Promise<AcpResult<AcpSessionInfo[]>> => {
+    list: async (directory?: string): Promise<BackendResult<BackendSessionInfo[]>> => {
       try {
         const result = await this.sdk.session.list({ directory });
         const error = getResultError(result);
@@ -349,7 +349,7 @@ export class OpenCodeBackend implements AcpBackend<OpenCodeStreamEvent> {
       return this.eventBroker.getParentSession(sessionId);
     },
 
-    messages: async (id: string, directory?: string): Promise<AcpResult<AcpMessageHistory>> => {
+    messages: async (id: string, directory?: string): Promise<BackendResult<BackendMessageHistory>> => {
       try {
         const result = await this.sdk.session.messages({ sessionID: id, directory });
         const error = getResultError(result);
@@ -358,7 +358,7 @@ export class OpenCodeBackend implements AcpBackend<OpenCodeStreamEvent> {
         }
 
         const items = result.data ?? [];
-        const mapped: AcpHistoryMessage[] = [];
+        const mapped: BackendHistoryMessage[] = [];
 
         for (const item of items) {
           if (item.info.role === 'user') {
@@ -412,8 +412,8 @@ export class OpenCodeBackend implements AcpBackend<OpenCodeStreamEvent> {
   // Config
   // =======================================================================
 
-  readonly config: AcpConfigOperations = {
-    models: async (directory?: string): Promise<AcpResult<AcpModel[]>> => {
+  readonly config: BackendConfigOperations = {
+    models: async (directory?: string): Promise<BackendResult<BackendModel[]>> => {
       try {
         const result = await this.sdk.config.providers({ directory });
         const error = getResultError(result);
@@ -421,7 +421,7 @@ export class OpenCodeBackend implements AcpBackend<OpenCodeStreamEvent> {
           return { error: extractErrorMessage(error, 'List models failed') };
         }
         const providers = result.data?.providers ?? [];
-        const models: AcpModel[] = [];
+        const models: BackendModel[] = [];
         for (const provider of providers) {
           for (const m of Object.values(provider.models ?? {})) {
             const rawM = m as unknown as Record<string, unknown>;
@@ -447,7 +447,7 @@ export class OpenCodeBackend implements AcpBackend<OpenCodeStreamEvent> {
       }
     },
 
-    agents: async (directory?: string): Promise<AcpResult<AcpAgent[]>> => {
+    agents: async (directory?: string): Promise<BackendResult<BackendAgent[]>> => {
       try {
         const result = await this.sdk.app.agents({
           directory,
@@ -456,14 +456,14 @@ export class OpenCodeBackend implements AcpBackend<OpenCodeStreamEvent> {
         if (error !== undefined) {
           return { error: extractErrorMessage(error, 'List agents failed') };
         }
-        const agents: AcpAgent[] = (result.data ?? []).map((a: SdkAgentData) => ({
+        const agents: BackendAgent[] = (result.data ?? []).map((a: SdkAgentData) => ({
           id: a.id ?? a.name ?? '',
           name: a.name ?? a.id,
           description: a.description,
           model: typeof a.model === 'object' && a.model !== null
             ? (a.model.modelID ?? String(a.model))
             : a.model,
-          mode: a.mode as AcpAgent['mode'],
+          mode: a.mode as BackendAgent['mode'],
           hidden: a.hidden,
         }));
         return { data: agents };
@@ -472,7 +472,7 @@ export class OpenCodeBackend implements AcpBackend<OpenCodeStreamEvent> {
       }
     },
 
-    get: async (directory?: string): Promise<AcpResult<AcpConfig>> => {
+    get: async (directory?: string): Promise<BackendResult<BackendConfig>> => {
       try {
         const configResult = await this.sdk.config.get({
           directory,
@@ -482,14 +482,14 @@ export class OpenCodeBackend implements AcpBackend<OpenCodeStreamEvent> {
           return { error: extractErrorMessage(error, 'Get config failed') };
         }
         const raw = configResult.data ?? {};
-        const config: AcpConfig = {
+        const config: BackendConfig = {
           model: raw.model,
           small_model: raw.small_model,
           default_agent: raw.default_agent,
           disabled_providers: raw.disabled_providers,
           enabled_providers: raw.enabled_providers,
-          agent: raw.agent as AcpConfig['agent'],
-          provider: raw.provider as AcpConfig['provider'],
+          agent: raw.agent as BackendConfig['agent'],
+          provider: raw.provider as BackendConfig['provider'],
         };
         return { data: config };
       } catch (err) {
@@ -497,7 +497,7 @@ export class OpenCodeBackend implements AcpBackend<OpenCodeStreamEvent> {
       }
     },
 
-    update: async (config: Partial<AcpConfig>, directory?: string): Promise<AcpResult<void>> => {
+    update: async (config: Partial<BackendConfig>, directory?: string): Promise<BackendResult<void>> => {
       try {
         const result = await this.sdk.config.update({
           directory,
@@ -513,7 +513,7 @@ export class OpenCodeBackend implements AcpBackend<OpenCodeStreamEvent> {
       }
     },
 
-    updateGlobal: async (config: Partial<AcpConfig>): Promise<AcpResult<void>> => {
+    updateGlobal: async (config: Partial<BackendConfig>): Promise<BackendResult<void>> => {
       try {
         const result = await this.sdk.global.config.update({ config });
         const error = getResultError(result);
@@ -562,11 +562,11 @@ export class OpenCodeBackend implements AcpBackend<OpenCodeStreamEvent> {
   // Permissions
   // =======================================================================
 
-  readonly permissions: AcpPermissionOperations = {
+  readonly permissions: BackendPermissionOperations = {
     reply: async (
       sessionId: string,
       permissionId: string,
-      response: AcpPermissionResponse,
+      response: BackendPermissionResponse,
       directory?: string,
     ): Promise<void> => {
       const result = await this.sdk.permission.reply({
@@ -584,13 +584,13 @@ export class OpenCodeBackend implements AcpBackend<OpenCodeStreamEvent> {
   // Questions
   // =======================================================================
 
-  readonly questions: AcpQuestionOperations = {
+  readonly questions: BackendQuestionOperations = {
     reply: async (
       sessionId: string,
       requestId: string,
       answers: Array<Array<string>>,
       directory?: string,
-    ): Promise<AcpResult<boolean>> => {
+    ): Promise<BackendResult<boolean>> => {
       try {
         const result = await this.sdk.question.reply({
           requestID: requestId,
@@ -610,7 +610,7 @@ export class OpenCodeBackend implements AcpBackend<OpenCodeStreamEvent> {
       sessionId: string,
       requestId: string,
       directory?: string,
-    ): Promise<AcpResult<boolean>> => {
+    ): Promise<BackendResult<boolean>> => {
       try {
         const result = await this.sdk.question.reject({
           requestID: requestId,
@@ -630,8 +630,8 @@ export class OpenCodeBackend implements AcpBackend<OpenCodeStreamEvent> {
   // Auth - delegates to v2 SDK auth.set / auth.remove
   // =======================================================================
 
-  readonly auth: AcpAuthOperations = {
-    setKey: async (providerID: string, key: string): Promise<AcpResult<void>> => {
+  readonly auth: BackendAuthOperations = {
+    setKey: async (providerID: string, key: string): Promise<BackendResult<void>> => {
       try {
         const result = await this.sdk.auth.set({
           providerID,
@@ -646,7 +646,7 @@ export class OpenCodeBackend implements AcpBackend<OpenCodeStreamEvent> {
       }
     },
 
-    removeKey: async (providerID: string): Promise<AcpResult<void>> => {
+    removeKey: async (providerID: string): Promise<BackendResult<void>> => {
       try {
         const result = await this.sdk.auth.remove({ providerID });
         if (result.error) {

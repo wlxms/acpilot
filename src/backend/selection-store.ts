@@ -8,10 +8,10 @@
  * work with any storage backend (GlobalState, localStorage, etc.).
  */
 
-import type { AcpBackend } from './backend';
+import type { Backend } from './backend';
 import type { AppEventBus } from './app-event-bus';
 import type { SelectionState } from './app-event-bus';
-import type { AcpAgent } from './types';
+import type { BackendAgent } from './types';
 
 // ===========================================================================
 // Persistence abstraction
@@ -50,7 +50,7 @@ export class SelectionStore {
   private state: SelectionState = {};
 
   constructor(
-    private readonly backend: AcpBackend,
+    private readonly backend: Backend,
     private readonly bus: AppEventBus,
     private readonly backendId: string,
     private readonly storage?: SelectionStorage,
@@ -211,6 +211,6 @@ export class SelectionStore {
   }
 }
 
-function isUserSelectableAgent(agent: AcpAgent): boolean {
+function isUserSelectableAgent(agent: BackendAgent): boolean {
   return !agent.hidden && agent.mode !== 'subagent';
 }

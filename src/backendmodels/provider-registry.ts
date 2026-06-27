@@ -5,16 +5,16 @@
  * @module
  */
 
-import type { AcpProviderMeta } from './types';
+import type { BackendProviderMeta } from './types';
 // eslint-disable-next-line @typescript-eslint/no-require-imports
-const config = require('./provider-config.json') as { providers: Record<string, AcpProviderMeta> };
+const config = require('./provider-config.json') as { providers: Record<string, BackendProviderMeta> };
 
 // ===========================================================================
 // Registry
 // ===========================================================================
 
 class ProviderRegistry {
-  private providers: Map<string, AcpProviderMeta> = new Map();
+  private providers: Map<string, BackendProviderMeta> = new Map();
   /** vendor → provider meta id index */
   private copilotVendorIndex: Map<string, string> = new Map();
 
@@ -33,12 +33,12 @@ class ProviderRegistry {
   }
 
   /** Look up a provider meta entry by its registry id */
-  get(id: string): AcpProviderMeta | undefined {
+  get(id: string): BackendProviderMeta | undefined {
     return this.providers.get(id);
   }
 
   /** Find a provider by a Copilot-side vendor name (or alias) */
-  findByCopilotVendor(vendor: string): AcpProviderMeta | undefined {
+  findByCopilotVendor(vendor: string): BackendProviderMeta | undefined {
     const metaId = this.copilotVendorIndex.get(vendor);
     return metaId ? this.providers.get(metaId) : undefined;
   }
@@ -49,7 +49,7 @@ class ProviderRegistry {
   }
 
   /** Iterate over all provider meta entries */
-  all(): IterableIterator<AcpProviderMeta> {
+  all(): IterableIterator<BackendProviderMeta> {
     return this.providers.values();
   }
 

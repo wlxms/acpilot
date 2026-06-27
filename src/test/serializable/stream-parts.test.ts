@@ -3,9 +3,9 @@ import {
   projectStreamPartToAcpEvent,
   requestDetailsFromStreamParts,
   SerializableStreamPartEventHandler,
-} from '../../acp/serializable/stream-parts';
-import type { AcpEvent } from '../../acp/types';
-import type { SerializableStreamPart } from '../../acp/serializable/types';
+} from '../../backend/serializable/stream-parts';
+import type { AcpEvent } from '../../backend/types';
+import type { SerializableStreamPart } from '../../backend/serializable/types';
 
 describe('SerializableStreamPartEventHandler', () => {
   it('maps the first prompt text event to userPrompt and projects it back', () => {

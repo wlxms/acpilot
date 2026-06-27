@@ -21,19 +21,19 @@ import type {
   AcpTextPart,
   AcpToolPart,
   AcpToolState,
-} from '../../acp/types';
-import type { AcpBridge } from '../../acp/backend';
+} from '../../backend/types';
+import type { BackendBridge } from '../../backend/backend';
 import type {
   OpenCodeEvent,
   OpenCodeStreamEvent,
   StreamPart,
   StreamToolState,
 } from './sdk-events';
-import type { SerializableSessionStream } from '../../acp/streaming/session-stream';
-import type { SubsessionStream } from '../../acp/streaming/subsession-stream';
-import type { SessionStreamNode } from '../../acp/streaming/session-stream-node';
+import type { SerializableSessionStream } from '../../backend/streaming/session-stream';
+import type { SubsessionStream } from '../../backend/streaming/subsession-stream';
+import type { SessionStreamNode } from '../../backend/streaming/session-stream-node';
 import type { SspStream } from '../../ssp/types';
-import type { SessionTitleSource } from '../../acp/serializable/types';
+import type { SessionTitleSource } from '../../backend/serializable/types';
 import { SubagentManager, formatSubagentProgress, type SubagentScope } from '../../ssp/impl/subagent';
 import { AssistantTextSSP } from '../../ssp/impl/assistant-text';
 import { ReasoningSSP } from '../../ssp/impl/reasoning';
@@ -49,7 +49,7 @@ import {
   type ChatSimpleToolResultData,
   type ChatToolInvocationPart,
 } from '../../types/vscode-proposed-additions';
-import type { AcpBackend } from '../../acp/backend';
+import type { Backend } from '../../backend/backend';
 import path from 'node:path';
 import * as vscode from 'vscode';
 
@@ -170,7 +170,7 @@ interface StreamNodeState {
   deltaText: Map<string, string>;
 }
 
-export class AcpProtocolBridge implements AcpBridge<AcpEvent> {
+export class OpenCodeProtocolBridge implements BackendBridge<AcpEvent> {
   private sss!: SerializableSessionStream;
   protected logger: BridgeLogger = { appendLine: () => {} };
   protected readonly sessionId: string;
@@ -196,7 +196,7 @@ export class AcpProtocolBridge implements AcpBridge<AcpEvent> {
   protected deferredIdleTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
-    private readonly backend: AcpBackend<unknown>,
+    private readonly backend: Backend<unknown>,
     sessionId: string,
     private readonly directory?: string,
     options?: { sessionId?: string },
@@ -931,10 +931,10 @@ export class AcpProtocolBridge implements AcpBridge<AcpEvent> {
   private startDeferredIdleTimer(): void {
     this.clearDeferredIdleTimer();
     this.deferredIdleTimer = setTimeout(() => {
-      this.logTag('idle', `deferred idle timeout (${AcpProtocolBridge.DEFERRED_IDLE_TIMEOUT_MS / 1000}s); stopping`);
+      this.logTag('idle', `deferred idle timeout (${OpenCodeProtocolBridge.DEFERRED_IDLE_TIMEOUT_MS / 1000}s); stopping`);
       this.deferredIdle = false;
       this.subagents.clear();
-    }, AcpProtocolBridge.DEFERRED_IDLE_TIMEOUT_MS);
+    }, OpenCodeProtocolBridge.DEFERRED_IDLE_TIMEOUT_MS);
   }
 
   private clearDeferredIdleTimer(): void {
@@ -1405,7 +1405,7 @@ export class AcpProtocolBridge implements AcpBridge<AcpEvent> {
   }
 }
 
-export class OpenCodeBridge extends AcpProtocolBridge implements AcpBridge<OpenCodeStreamEvent | AcpEvent> {
+export class OpenCodeBridge extends OpenCodeProtocolBridge implements BackendBridge<OpenCodeStreamEvent | AcpEvent> {
   async run(events: AsyncIterable<OpenCodeStreamEvent | AcpEvent>, token: { isCancellationRequested: boolean }): Promise<boolean> {
     async function* projected() {
       for await (const rawEvent of events) {

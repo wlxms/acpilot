@@ -4,8 +4,8 @@ import { existsSync, readFileSync } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
-import { applyPatchSafely, replaySnapshotsToWorkspace, summarizeSnapshotLineDiff } from '../../acp/checkpoint/replay';
-import type { FileSnapshotRecord } from '../../acp/serializable/types';
+import { applyPatchSafely, replaySnapshotsToWorkspace, summarizeSnapshotLineDiff } from '../../backend/checkpoint/replay';
+import type { FileSnapshotRecord } from '../../backend/serializable/types';
 
 describe('checkpoint replay', () => {
   it('summarizes restored snapshot line diffs for edit bubble diagnostics', () => {

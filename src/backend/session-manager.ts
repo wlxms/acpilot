@@ -8,7 +8,7 @@
  * the full rewind/recovery logic from handler.ts.
  */
 
-import type { AcpBackend } from './backend';
+import type { Backend } from './backend';
 import type { AppEventBus } from './app-event-bus';
 import type { TurnMapping } from '../types';
 
@@ -40,7 +40,7 @@ export class SessionManager {
   private sessionMap = new Map<string, SessionState>();
 
   constructor(
-    private readonly backend: AcpBackend,
+    private readonly backend: Backend,
     private readonly bus: AppEventBus,
     private readonly backendId: string,
   ) {}

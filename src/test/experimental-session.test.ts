@@ -4,20 +4,20 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { createSessionContentProvider } from '../surfaces/vscode/experimental-session';
-import { isUserSelectableAgent } from '../acp/types';
-import type { AcpAgent } from '../acp/types';
-import type { AcpBackend } from '../acp/backend';
+import { isUserSelectableAgent } from '../backend/types';
+import type { BackendAgent } from '../backend/types';
+import type { Backend } from '../backend/backend';
 import type { ExtensionState, BackendContext } from '../types';
-import { AppEventBus } from '../acp/app-event-bus';
-import { readLegacySessionEvents, readLegacySessionTurnEvents, readSessionTurnStreamParts } from '../acp/serializable/serializer';
-import { readCheckpoints } from '../acp/checkpoint/checkpoint-store';
+import { AppEventBus } from '../backend/app-event-bus';
+import { readLegacySessionEvents, readLegacySessionTurnEvents, readSessionTurnStreamParts } from '../backend/serializable/serializer';
+import { readCheckpoints } from '../backend/checkpoint/checkpoint-store';
 
-vi.mock('../acp/serializable/serializer', () => ({
+vi.mock('../backend/serializable/serializer', () => ({
   readLegacySessionEvents: vi.fn(),
   readLegacySessionTurnEvents: vi.fn(),
   readSessionTurnStreamParts: vi.fn(),
 }));
-vi.mock('../acp/checkpoint/checkpoint-store', () => ({
+vi.mock('../backend/checkpoint/checkpoint-store', () => ({
   readCheckpoints: vi.fn(),
 }));
 
@@ -83,11 +83,11 @@ describe('createSessionContentProvider', () => {
     vi.mocked(readSessionTurnStreamParts).mockResolvedValue([]);
     vi.mocked(readCheckpoints).mockResolvedValue([]);
 
-    const backend: AcpBackend = {
+    const backend: Backend = {
       name: 'opencode',
       start: vi.fn(async () => ({ data: { url: 'http://127.0.0.1:4096', status: 'running' as const } })),
       stop: vi.fn(async () => undefined),
-      getStatus: vi.fn((): import('../acp/types').AcpServerStatus => 'running'),
+      getStatus: vi.fn((): import('../backend/types').BackendServerStatus => 'running'),
       getUrl: vi.fn(() => 'http://127.0.0.1:4096'),
       isRunning: vi.fn(() => true),
       sessions: {
@@ -138,7 +138,7 @@ describe('createSessionContentProvider', () => {
         getUserMessageId: vi.fn().mockReturnValue(null),
         getSessionTitle: vi.fn().mockReturnValue(null),
         getHadSubagentTasks: vi.fn().mockReturnValue(false),
-      })) as unknown as AcpBackend['createBridge'],
+      })) as unknown as Backend['createBridge'],
     };
 
     ctx = {
@@ -1384,32 +1384,32 @@ describe('createSessionContentProvider', () => {
 
   describe('isUserSelectableAgent', () => {
     it('returns true for primary non-hidden agent', () => {
-      const agent: AcpAgent = { id: 'primary-agent', mode: 'primary' };
+      const agent: BackendAgent = { id: 'primary-agent', mode: 'primary' };
       expect(isUserSelectableAgent(agent)).toBe(true);
     });
 
     it('returns true for agent with mode all and not hidden', () => {
-      const agent: AcpAgent = { id: 'all-mode-agent', mode: 'all' };
+      const agent: BackendAgent = { id: 'all-mode-agent', mode: 'all' };
       expect(isUserSelectableAgent(agent)).toBe(true);
     });
 
     it('returns false for hidden agent', () => {
-      const agent: AcpAgent = { id: 'hidden-agent', hidden: true, mode: 'primary' };
+      const agent: BackendAgent = { id: 'hidden-agent', hidden: true, mode: 'primary' };
       expect(isUserSelectableAgent(agent)).toBe(false);
     });
 
     it('returns false for subagent-mode agent', () => {
-      const agent: AcpAgent = { id: 'subagent', mode: 'subagent' };
+      const agent: BackendAgent = { id: 'subagent', mode: 'subagent' };
       expect(isUserSelectableAgent(agent)).toBe(false);
     });
 
     it('returns false for hidden subagent-mode agent', () => {
-      const agent: AcpAgent = { id: 'hidden-subagent', hidden: true, mode: 'subagent' };
+      const agent: BackendAgent = { id: 'hidden-subagent', hidden: true, mode: 'subagent' };
       expect(isUserSelectableAgent(agent)).toBe(false);
     });
 
     it('excludes hidden agents from filtered list', () => {
-      const agents: AcpAgent[] = [
+      const agents: BackendAgent[] = [
         { id: 'agent-1', mode: 'primary' },
         { id: 'agent-2', hidden: true, mode: 'primary' },
         { id: 'agent-3', mode: 'all' },
@@ -1420,7 +1420,7 @@ describe('createSessionContentProvider', () => {
     });
 
     it('excludes subagent-mode agents from filtered list', () => {
-      const agents: AcpAgent[] = [
+      const agents: BackendAgent[] = [
         { id: 'primary-agent', mode: 'primary' },
         { id: 'sub-agent', mode: 'subagent' },
         { id: 'another-primary', mode: 'primary' },
@@ -1431,7 +1431,7 @@ describe('createSessionContentProvider', () => {
     });
 
     it('excludes both hidden and subagent agents together', () => {
-      const agents: AcpAgent[] = [
+      const agents: BackendAgent[] = [
         { id: 'good', mode: 'primary' },
         { id: 'hidden-primary', hidden: true, mode: 'primary' },
         { id: 'sub', mode: 'subagent' },

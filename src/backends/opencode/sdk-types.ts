@@ -6,7 +6,7 @@
  */
 
 import type { OpenCodeEventStream } from './sdk-events';
-import type { AcpSessionStatus } from '../../acp/types';
+import type { BackendSessionStatus } from '../../backend/types';
 
 // ===========================================================================
 // SDK response wrapper — mirrors the hey-api RequestResult flat shape
@@ -191,7 +191,7 @@ export interface OpenCodeClient {
     }): Promise<SdkResponse<Array<{ id?: string; parentID?: string }>>>;
     status(parameters?: {
       directory?: string;
-    }): Promise<SdkResponse<Record<string, AcpSessionStatus>>>;
+    }): Promise<SdkResponse<Record<string, BackendSessionStatus>>>;
     messages(parameters: {
       sessionID: string;
       directory?: string;

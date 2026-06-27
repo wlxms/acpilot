@@ -7,7 +7,7 @@
  * No external dependencies — purely a TypeScript generic event emitter.
  */
 
-import type { AcpSessionStatus } from './types';
+import type { BackendSessionStatus } from './types';
 
 // ===========================================================================
 // Shared selection-state type (also re-exported from selection-store.ts)
@@ -31,7 +31,7 @@ export interface AppEventMap {
   /** Fired when the user changes agent or model selection for a backend */
   'selection-changed': SelectionState & { backendId: string };
   /** Fired when a specific session's status transitions (idle → busy → retry → idle) */
-  'session-status-changed': { sessionId: string; status: AcpSessionStatus; backendId: string };
+  'session-status-changed': { sessionId: string; status: BackendSessionStatus; backendId: string };
 }
 
 // ===========================================================================

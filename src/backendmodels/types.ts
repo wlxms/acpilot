@@ -10,7 +10,7 @@
  */
 
 import type { LanguageModelChatInformation, LanguageModelChatCapabilities } from 'vscode';
-import type { AcpModel } from '../acp/types';
+import type { BackendModel } from '../backend/types';
 
 // ===========================================================================
 // Provider configuration (source of truth: provider-config.json)
@@ -26,7 +26,7 @@ export interface AcpProviderModelMeta {
 }
 
 /** Per-provider configuration entry (agnostic of any specific backend) */
-export interface AcpProviderMeta {
+export interface BackendProviderMeta {
   /** Unique identifier for this provider in the registry, e.g. "anthropic" */
   id: string;
   /** Human-readable display name */
@@ -83,7 +83,7 @@ export interface NormalizedModel {
 
 export type AcpAuthType = 'api' | 'oauth' | 'wellknown';
 
-export interface AcpAuthEntry {
+export interface BackendAuthEntry {
   type: AcpAuthType;
   key?: string;
   access?: string;
@@ -156,20 +156,20 @@ export interface CopilotModelRef {
 }
 
 // ===========================================================================
-// AcpBackend extension: auth operations (new contract)
+// Backend extension: auth operations (new contract)
 // ===========================================================================
 
-export interface AcpAuthOperations {
+export interface BackendAuthOperations {
   /** Persist an API key for a provider (writes to auth.json via SDK) */
   setKey(providerID: string, key: string): Promise<{ error?: unknown }>;
   /** Remove an API key for a provider */
   removeKey(providerID: string): Promise<{ error?: unknown }>;
   /** Read all stored auth entries */
-  getAll(): Promise<Record<string, AcpAuthEntry>>;
+  getAll(): Promise<Record<string, BackendAuthEntry>>;
 }
 
 // ===========================================================================
 // Re-export for convenience
 // ===========================================================================
 
-export type { AcpModel, LanguageModelChatInformation, LanguageModelChatCapabilities };
+export type { BackendModel, LanguageModelChatInformation, LanguageModelChatCapabilities };

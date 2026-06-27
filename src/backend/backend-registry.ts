@@ -7,9 +7,9 @@
  * @module
  */
 
-import type { AcpBackend } from './backend';
+import type { Backend } from './backend';
 
-type BackendFactory = () => AcpBackend;
+type BackendFactory = () => Backend;
 
 const registry = new Map<string, BackendFactory>();
 
@@ -29,7 +29,7 @@ export function registerBackend(id: string, factory: BackendFactory): void {
  * Falls back to the first registered backend if `id` is not found.
  * Throws if no backends are registered.
  */
-export function createBackend(id: string): AcpBackend {
+export function createBackend(id: string): Backend {
   const factory = registry.get(id);
   if (factory) {
     return factory();

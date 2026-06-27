@@ -1,12 +1,12 @@
 /**
- * ACP backend model reader — enumerates models from a given AcpBackend
+ * ACP backend model reader — enumerates models from a given Backend
  * and normalises them into the ACPModels internal representation.
  *
  * @module
  */
 
-import type { AcpBackend } from '../acp/backend';
-import type { AcpModel } from '../acp/types';
+import type { Backend } from '../backend/backend';
+import type { BackendModel } from '../backend/types';
 import type { NormalizedModel, BackendModelPresence } from './types';
 import type { LanguageModelChatCapabilities } from 'vscode';
 
@@ -21,13 +21,13 @@ import type { LanguageModelChatCapabilities } from 'vscode';
  * @param hasKeyFn     Callback that returns `true` if the given provider has an API key
  */
 export async function enumerateBackendModels(
-  backend: AcpBackend,
+  backend: Backend,
   hasKeyFn: (providerID: string) => boolean,
 ): Promise<NormalizedModel[]> {
   const result = await backend.config.models();
   if (result.error || !result.data) return [];
 
-  return (result.data as AcpModel[]).map((m) =>
+  return (result.data as BackendModel[]).map((m) =>
     toNormalizedModel(backend, m, hasKeyFn),
   );
 }
@@ -37,8 +37,8 @@ export async function enumerateBackendModels(
 // ===========================================================================
 
 function toNormalizedModel(
-  backend: AcpBackend,
-  acp: AcpModel,
+  backend: Backend,
+  acp: BackendModel,
   hasKeyFn: (providerID: string) => boolean,
 ): NormalizedModel {
   const providerID = acp.provider ?? 'default';

@@ -9,7 +9,7 @@
  */
 
 import * as vscode from 'vscode';
-import type { AcpBackend } from '../acp/backend';
+import type { Backend } from '../backend/backend';
 import { AuthReader } from './auth-reader';
 import { runSync, applyInjections } from './sync-engine';
 import { resolve as resolveModel } from './resolver';
@@ -37,7 +37,7 @@ export interface AcpModels {
 // ===========================================================================
 
 export interface CreateAcpModelsOptions {
-  backends: Map<string, AcpBackend>;
+  backends: Map<string, Backend>;
   authReader: AuthReader;
   logger: vscode.OutputChannel;
   /** When true, also register "opencode-zen" vendor for Copilot use */

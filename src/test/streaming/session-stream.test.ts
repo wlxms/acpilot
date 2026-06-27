@@ -8,10 +8,10 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import { promises as fs } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { SerializableSessionStream } from '../../acp/streaming/session-stream';
-import { materializeRecords, finalizeIncompleteStates } from '../../acp/streaming/deserialize';
-import { readAllStreamParts, readMetaIndex, createSSPFromRecord } from '../../acp/streaming/deserialize';
-import { readSubsessionRecords } from '../../acp/streaming/deserialize';
+import { SerializableSessionStream } from '../../backend/streaming/session-stream';
+import { materializeRecords, finalizeIncompleteStates } from '../../backend/streaming/deserialize';
+import { readAllStreamParts, readMetaIndex, createSSPFromRecord } from '../../backend/streaming/deserialize';
+import { readSubsessionRecords } from '../../backend/streaming/deserialize';
 import { AssistantTextSSP } from '../../ssp/impl/assistant-text';
 import { ReasoningSSP } from '../../ssp/impl/reasoning';
 import { ToolInvocationSSP } from '../../ssp/impl/tool-invocation';
@@ -24,7 +24,7 @@ import type {
   SspStream,
 } from '../../ssp/types';
 import { SerializableStreamPart } from '../../ssp/types';
-import type { FileSnapshotRecord } from '../../acp/serializable/types';
+import type { FileSnapshotRecord } from '../../backend/serializable/types';
 
 // ---------------------------------------------------------------------------
 // Helpers

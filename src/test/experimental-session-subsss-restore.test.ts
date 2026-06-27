@@ -4,12 +4,12 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { createSessionContentProvider } from '../surfaces/vscode/experimental-session';
-import type { AcpBackend } from '../acp/backend';
+import type { Backend } from '../backend/backend';
 import type { ExtensionState, BackendContext } from '../types';
-import { AppEventBus } from '../acp/app-event-bus';
-import { buildLine } from '../acp/serializable/serializer';
+import { AppEventBus } from '../backend/app-event-bus';
+import { buildLine } from '../backend/serializable/serializer';
 import type { StreamPartRecord } from '../ssp/types';
-import type { FileSnapshotRecord } from '../acp/serializable/types';
+import type { FileSnapshotRecord } from '../backend/serializable/types';
 
 function expectRestoredTextEditParts(pushed: readonly unknown[], editId: string | undefined) {
   const uriPart = pushed.find(part => part instanceof (vscode as any).ChatResponseCodeblockUriPart) as any;
@@ -33,7 +33,7 @@ function makeState(sessionDir: string): { state: ExtensionState; ctx: BackendCon
     name: 'opencode',
       start: vi.fn(async () => ({ data: { url: 'http://127.0.0.1:4096', status: 'running' as const } })),
       stop: vi.fn(async () => undefined),
-      getStatus: vi.fn((): import('../acp/types').AcpServerStatus => 'running'),
+      getStatus: vi.fn((): import('../backend/types').BackendServerStatus => 'running'),
       getUrl: vi.fn(() => 'http://127.0.0.1:4096'),
       isRunning: vi.fn(() => true),
       sessions: {
@@ -86,8 +86,8 @@ function makeState(sessionDir: string): { state: ExtensionState; ctx: BackendCon
         getUserMessageId: vi.fn().mockReturnValue(null),
         getSessionTitle: vi.fn().mockReturnValue(null),
         getHadSubagentTasks: vi.fn().mockReturnValue(false),
-      })) as unknown as AcpBackend['createBridge'],
-  } as unknown as AcpBackend;
+      })) as unknown as Backend['createBridge'],
+  } as unknown as Backend;
 
   const ctx: BackendContext = {
     id: 'opencode',

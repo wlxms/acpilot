@@ -642,7 +642,7 @@ async function handleTestExternalEditE2ECommand(
   const prompt = `Edit the file ${tmpPath}: replace "hello world" with "hello e2e test". Do not add any other text.`;
   state.outputChannel.appendLine(`[e2e] Prompt: ${prompt}`);
 
-  let eventStream: import('../acp/backend').AcpEventStream;
+  let eventStream: import('../backend/backend').AcpEventStream;
   try {
     await ctx.backend.events.ensureStarted();
     eventStream = ctx.backend.events.openSessionStream(sessionId);

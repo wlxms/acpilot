@@ -1,5 +1,5 @@
 import type * as vscode from 'vscode';
-import type { AcpBackend } from '../acp/backend';
+import type { Backend } from '../backend/backend';
 import type { StatusBarManager } from '../statusbar';
 
 /** Info about a conversation session extracted from SDK response */
@@ -25,13 +25,13 @@ export interface BackendContext {
   /** Language-model vendor ids this backend owns (e.g. ['opencode-cli','opencode-zen'] / ['acp']) */
   readonly vendors: readonly string[];
   /** The ACP-compatible backend instance */
-  readonly backend: AcpBackend;
+  readonly backend: Backend;
   /** Centralised agent/model selection state (per-backend, namespaced) */
-  selection: import('../acp/selection-store').SelectionStore;
+  selection: import('../backend/selection-store').SelectionStore;
   /** Centralised session mapping (per-backend) */
-  sessions: import('../acp/session-manager').SessionManager;
+  sessions: import('../backend/session-manager').SessionManager;
   /** Filesystem-backed persistent session store (path namespaced by id) */
-  sessionStore: import('../acp/streaming/session-store').SessionStore;
+  sessionStore: import('../backend/streaming/session-store').SessionStore;
 }
 
 /** Tracks the mapping between VSCode chat turns and backend message IDs */
@@ -49,7 +49,7 @@ export interface SessionState {
   turnMap: TurnMapping[];
   title?: string;
   createdAt?: Date;
-  titleSource?: import('../acp/serializable/types').SessionTitleSource;
+  titleSource?: import('../backend/serializable/types').SessionTitleSource;
   provisionalTitle?: boolean;
 }
 
@@ -72,11 +72,11 @@ export interface ExtensionState {
   /** All assembled backend contexts, keyed by backend id (e.g. 'opencode', 'acp') */
   backends: Map<string, BackendContext>;
   /** ACPModels bidirectional model registry (Copilot ↔ ACP backends) */
-  acpModels: import('../acpmodels/index').AcpModels;
+  acpModels: import('../backendmodels/index').AcpModels;
   /** Output channel for logging */
   outputChannel: vscode.OutputChannel;
   /** Status bar controller (shows backend / agent / model) */
   statusBar: StatusBarManager;
   /** Application-level typed event bus (channel-scoped by backendId) */
-  bus: import('../acp/app-event-bus').AppEventBus;
+  bus: import('../backend/app-event-bus').AppEventBus;
 }

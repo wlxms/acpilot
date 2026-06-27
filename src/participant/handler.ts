@@ -1,14 +1,14 @@
 import * as vscode from 'vscode';
 import { routeCommand } from './commands';
 import { isEmptyPrompt, ErrorMessages } from './errors';
-import { SerializableSessionStream } from '../acp/streaming/session-stream';
+import { SerializableSessionStream } from '../backend/streaming/session-stream';
 import { UserPromptSSP } from '../ssp/impl/user-prompt';
 import { applyProvisionalSessionTitle, applySessionTitle, isPlaceholderSessionTitle } from './session-title';
 
 import type { ExtensionState, TurnMapping, BackendContext } from '../types';
-import type { AcpChildSessionInfo, AcpSessionStatus, AcpResult, AcpModel, AcpAgent } from '../acp/types';
-import type { AcpEvent } from '../acp/types';
-import type { SessionTitleSource } from '../acp/serializable/types';
+import type { BackendChildSessionInfo, BackendSessionStatus, BackendResult, BackendModel, BackendAgent } from '../backend/types';
+import type { AcpEvent } from '../backend/types';
+import type { SessionTitleSource } from '../backend/serializable/types';
 import { collectOpenFileUris } from './checkpoint';
 import { extractAttachmentsFromReferences } from './references';
 
@@ -85,7 +85,7 @@ export async function resolvePromptModel(
   // Fetch the backend model catalogue for matching.
   // Errors are non-fatal - fall back to SelectionStore on failure.
   const modelsResult = await ctx.backend.config.models();
-  const backendModels: AcpModel[] = modelsResult.data ?? [];
+  const backendModels: BackendModel[] = modelsResult.data ?? [];
 
   if (backendModels.length === 0) {
     // No catalogue to match against - use SelectionStore
@@ -194,7 +194,7 @@ export async function resolvePromptAgent(
       return exactId.id;
     }
 
-    const byName = agents.filter((agent: AcpAgent) => agent.name?.trim() === selected);
+    const byName = agents.filter((agent: BackendAgent) => agent.name?.trim() === selected);
     if (byName.length === 1) {
       const resolved = byName[0].id;
       await ctx.selection.setAgent(resolved);
@@ -206,7 +206,7 @@ export async function resolvePromptAgent(
 
     const selectedLower = selected.toLowerCase();
     const byCaseInsensitiveName = agents.filter(
-      (agent: AcpAgent) => agent.name?.trim().toLowerCase() === selectedLower,
+      (agent: BackendAgent) => agent.name?.trim().toLowerCase() === selectedLower,
     );
     if (byCaseInsensitiveName.length === 1) {
       const resolved = byCaseInsensitiveName[0].id;
@@ -1008,8 +1008,8 @@ async function hasBusyDescendant(
   parentId: string,
   directory: string | undefined,
   visited: Set<string>,
-  statuses: Record<string, AcpSessionStatus>,
-  childrenFn: (id: string, dir?: string) => Promise<AcpResult<AcpChildSessionInfo[]>>,
+  statuses: Record<string, BackendSessionStatus>,
+  childrenFn: (id: string, dir?: string) => Promise<BackendResult<BackendChildSessionInfo[]>>,
 ): Promise<boolean> {
   if (visited.has(parentId)) {return false;}
   visited.add(parentId);

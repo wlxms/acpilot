@@ -10,7 +10,7 @@ import { describe, it, expect } from 'vitest';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { extractAttachmentsFromReferences } from './references';
-import type { AcpFileAttachment } from '../acp/types';
+import type { BackendFileAttachment } from '../backend/types';
 
 interface FakeRef {
   id: string;
@@ -114,7 +114,7 @@ describe('extractAttachmentsFromReferences', () => {
     ];
     const { attachments, paths } = extractAttachmentsFromReferences(refs, WORKSPACE);
     expect(attachments).toHaveLength(2);
-    const attachmentMimes = attachments.map((a: AcpFileAttachment) => a.mime).sort();
+    const attachmentMimes = attachments.map((a: BackendFileAttachment) => a.mime).sort();
     expect(attachmentMimes).toEqual(['image/jpeg', 'image/png']);
     expect(paths).toHaveLength(2);
     expect(paths.some((p) => p.endsWith(path.join('src', 'index.ts')))).toBe(true);

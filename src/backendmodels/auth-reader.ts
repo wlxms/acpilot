@@ -11,7 +11,7 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
-import type { AcpAuthEntry, AcpAuthType } from './types';
+import type { BackendAuthEntry, AcpAuthType } from './types';
 
 // ===========================================================================
 // Path resolution
@@ -31,10 +31,10 @@ export function resolveAuthPath(): string {
 // ===========================================================================
 
 export class AuthReader {
-  private cache: Record<string, AcpAuthEntry> = {};
+  private cache: Record<string, BackendAuthEntry> = {};
 
   /** Load the full auth.json content into memory */
-  async load(): Promise<Record<string, AcpAuthEntry>> {
+  async load(): Promise<Record<string, BackendAuthEntry>> {
     try {
       const raw = await fs.readFile(resolveAuthPath(), 'utf-8');
       const parsed: Record<string, unknown> = JSON.parse(raw);
@@ -81,7 +81,7 @@ export class AuthReader {
   }
 
   /** Return the full in-memory cache */
-  getAll(): Record<string, AcpAuthEntry> {
+  getAll(): Record<string, BackendAuthEntry> {
     return { ...this.cache };
   }
 }

@@ -13,8 +13,8 @@ import {
   writeSnapshot,
   readCheckpoints,
   getLastSnapshot,
-} from '../../acp/checkpoint/checkpoint-store';
-import type { FileSnapshotRecord } from '../../acp/serializable/types';
+} from '../../backend/checkpoint/checkpoint-store';
+import type { FileSnapshotRecord } from '../../backend/serializable/types';
 
 // ---------------------------------------------------------------------------
 // Helpers

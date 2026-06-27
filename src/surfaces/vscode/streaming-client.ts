@@ -12,14 +12,14 @@ import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 import { createAnthropic } from '@ai-sdk/anthropic';
 import { createOpenAI } from '@ai-sdk/openai';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
-import type { AcpProviderMeta } from '../../acpmodels/types';
+import type { BackendProviderMeta } from '../../backendmodels/types';
 
 // ===========================================================================
 // Types
 // ===========================================================================
 
 interface PerProviderCallOptions {
-  providerMeta: AcpProviderMeta;
+  providerMeta: BackendProviderMeta;
   apiKey: string;
   modelId: string;
   messages: readonly vscode.LanguageModelChatRequestMessage[];

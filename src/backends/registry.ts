@@ -13,8 +13,8 @@
  */
 
 import './opencode/index'; // side-effect: registers 'opencode' backend
-import { createBackend } from '../acp/backend-registry';
-import type { AcpBackend } from '../acp/backend';
+import { createBackend } from '../backend/backend-registry';
+import type { Backend } from '../backend/backend';
 
 export interface BuiltinBackendDescriptor {
   /** Stable backend id, matches the chatSessions type suffix (e.g. 'opencode', 'acp') */
@@ -24,7 +24,7 @@ export interface BuiltinBackendDescriptor {
   /** Language-model vendor ids this backend owns */
   readonly vendors: readonly string[];
   /** Factory that creates the backend instance from the registry */
-  readonly factory: () => AcpBackend;
+  readonly factory: () => Backend;
   /**
    * Whether this backend should be assembled given the current configuration.
    * Returns true by default; optional backends (e.g. remote ACP with no

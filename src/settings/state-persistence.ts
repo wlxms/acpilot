@@ -19,7 +19,7 @@
  */
 
 import * as vscode from 'vscode';
-import type { SelectionState } from '../acp/app-event-bus';
+import type { SelectionState } from '../backend/app-event-bus';
 import type { PersistedSettingsState } from '../types';
 
 /**

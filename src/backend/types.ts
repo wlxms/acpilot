@@ -9,18 +9,18 @@
 // Server lifecycle
 // ===========================================================================
 
-export type AcpServerStatus = 'stopped' | 'starting' | 'running' | 'error';
+export type BackendServerStatus = 'stopped' | 'starting' | 'running' | 'error';
 
-export interface AcpServerInfo {
+export interface BackendServerInfo {
   url: string | null;
-  status: AcpServerStatus;
+  status: BackendServerStatus;
 }
 
 // ===========================================================================
 // Models / providers
 // ===========================================================================
 
-export interface AcpModel {
+export interface BackendModel {
   id: string;
   name?: string;
   /** Provider ID (used for API calls) */
@@ -37,30 +37,30 @@ export interface AcpModel {
   maxOutputTokens?: number;
 }
 
-export interface AcpProvider {
+export interface BackendProvider {
   id: string;
   name: string;
-  models: AcpModel[];
+  models: BackendModel[];
 }
 
 // ===========================================================================
 // Sessions
 // ===========================================================================
 
-export interface AcpSessionInfo {
+export interface BackendSessionInfo {
   id: string;
   title: string;
   createdAt: Date;
 }
 
-export type AcpSessionStatus = { type: 'idle' } | { type: 'busy' } | { type: 'retry'; attempt: number; message: string; next: number };
+export type BackendSessionStatus = { type: 'idle' } | { type: 'busy' } | { type: 'retry'; attempt: number; message: string; next: number };
 
-export interface AcpChildSessionInfo {
+export interface BackendChildSessionInfo {
   id: string;
   parentID?: string;
 }
 
-export interface AcpTurnMapping {
+export interface BackendTurnMapping {
   turnIndex: number;
   messageId: string;
 }
@@ -99,7 +99,7 @@ export interface AcpToolState {
  * A file attachment included with a prompt (image, document, etc.).
  * Protocol-agnostic - each backend adapter maps this to its SDK type.
  */
-export interface AcpFileAttachment {
+export interface BackendFileAttachment {
   /** MIME type (e.g. "image/png", "text/plain", "application/pdf") */
   mime: string;
   /** Optional display filename */
@@ -274,7 +274,7 @@ export interface AcpServerLifecycleEvent {
 export interface AcpSessionStatusEvent {
   type: 'session.status';
   sessionId: string;
-  status: AcpSessionStatus;
+  status: BackendSessionStatus;
 }
 
 export type AcpEvent =
@@ -295,7 +295,7 @@ export type AcpEvent =
 // Result wrapper
 // ===========================================================================
 
-export interface AcpResult<T, E = string> {
+export interface BackendResult<T, E = string> {
   data?: T;
   error?: E;
 }
@@ -304,7 +304,7 @@ export interface AcpResult<T, E = string> {
 // Message history (for session history restoration)
 // ===========================================================================
 
-export interface AcpHistoryMessage {
+export interface BackendHistoryMessage {
   id: string;
   role: 'user' | 'assistant';
   /** Extracted text content (from parts for user, or joined text parts for assistant) */
@@ -314,21 +314,21 @@ export interface AcpHistoryMessage {
   metadata?: Record<string, unknown>;
 }
 
-export interface AcpMessageHistory {
-  items: AcpHistoryMessage[];
+export interface BackendMessageHistory {
+  items: BackendHistoryMessage[];
 }
 
 // ===========================================================================
 // Permission responses
 // ===========================================================================
 
-export type AcpPermissionResponse = 'once' | 'always' | 'reject';
+export type BackendPermissionResponse = 'once' | 'always' | 'reject';
 
 // ===========================================================================
 // Agents
 // ===========================================================================
 
-export interface AcpAgent {
+export interface BackendAgent {
   id: string;
   name?: string;
   description?: string;
@@ -342,7 +342,7 @@ export interface AcpAgent {
  * Excludes hidden agents and subagent-mode agents so users only see
  * agents they can intentionally invoke.
  */
-export function isUserSelectableAgent(agent: AcpAgent): boolean {
+export function isUserSelectableAgent(agent: BackendAgent): boolean {
   return !agent.hidden && agent.mode !== 'subagent';
 }
 
@@ -350,7 +350,7 @@ export function isUserSelectableAgent(agent: AcpAgent): boolean {
 // Configuration
 // ===========================================================================
 
-export interface AcpAgentConfig {
+export interface BackendAgentConfig {
   model?: string;
   variant?: string;
   temperature?: number;
@@ -365,7 +365,7 @@ export interface AcpAgentConfig {
   maxSteps?: number;
 }
 
-export interface AcpProviderConfig {
+export interface BackendProviderConfig {
   api?: string;
   name?: string;
   id?: string;
@@ -376,17 +376,17 @@ export interface AcpProviderConfig {
   models?: Record<string, { name?: string }>;
 }
 
-export interface AcpConfig {
+export interface BackendConfig {
   model?: string;
   small_model?: string;
   default_agent?: string;
   disabled_providers?: string[];
   enabled_providers?: string[];
-  agent?: Record<string, AcpAgentConfig>;
-  provider?: Record<string, AcpProviderConfig>;
+  agent?: Record<string, BackendAgentConfig>;
+  provider?: Record<string, BackendProviderConfig>;
 }
 
-export interface AcpModelSelection {
+export interface BackendModelSelection {
   providerID: string;
   modelID: string;
   variant?: string;

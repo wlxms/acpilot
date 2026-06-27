@@ -15,7 +15,7 @@
  * │  LanguageModelChatProvider (this module)         │
  * │  ┌────────────────────────────────────────────┐ │
  * │  │ provideLanguageModelChatInformation()      │ │
- * │  │ → maps AcpModel[] → LanguageModelChatInfo[]│ │
+ * │  │ → maps BackendModel[] → LanguageModelChatInfo[]│ │
  * │  └────────────────────────────────────────────┘ │
  * │  ┌────────────────────────────────────────────┐ │
  * │  │ provideLanguageModelChatResponse()         │ │
@@ -24,7 +24,7 @@
  * └─────────────────────────────────────────────────┘
  *     │
  *     ▼
- * state.backend (AcpBackend)
+ * state.backend (Backend)
  * ```
  *
  * @module
@@ -33,8 +33,8 @@
 import * as vscode from 'vscode';
 import type { ExtensionState, BackendContext } from '../../types';
 import { streamViaProvider } from './streaming-client';
-import { providerRegistry } from '../../acpmodels/provider-registry';
-import { AuthReader } from '../../acpmodels/auth-reader';
+import { providerRegistry } from '../../backendmodels/provider-registry';
+import { AuthReader } from '../../backendmodels/auth-reader';
 
 // ---------------------------------------------------------------------------
 // Extended model info carrying backend metadata

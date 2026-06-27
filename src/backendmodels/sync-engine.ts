@@ -8,7 +8,7 @@
  */
 
 import * as vscode from 'vscode';
-import type { AcpBackend } from '../acp/backend';
+import type { Backend } from '../backend/backend';
 import { enumerateCopilotModels } from './copilot-reader';
 import { enumerateBackendModels } from './backend-reader';
 import { providerRegistry } from './provider-registry';
@@ -27,7 +27,7 @@ import type {
 
 export interface SyncEngineOptions {
   /** Active ACP backends (keyed by backend ID) */
-  backends: Map<string, AcpBackend>;
+  backends: Map<string, Backend>;
   /** Auth.json reader (shared) */
   authReader: AuthReader;
   /** Output logger */
@@ -86,7 +86,7 @@ export async function runSync(opts: SyncEngineOptions): Promise<SyncResult> {
  */
 export async function applyInjections(
   injections: ProviderInjection[],
-  backends: Map<string, AcpBackend>,
+  backends: Map<string, Backend>,
   logger: vscode.OutputChannel,
 ): Promise<void> {
   for (const inj of injections) {

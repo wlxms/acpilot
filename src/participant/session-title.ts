@@ -1,5 +1,5 @@
 import type { ExtensionState, BackendContext } from '../types';
-import type { SessionTitleSource } from '../acp/serializable/types';
+import type { SessionTitleSource } from '../backend/serializable/types';
 
 export interface ApplySessionTitleOptions {
   /** Real backend session id. */

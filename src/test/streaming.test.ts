@@ -4,22 +4,22 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { OpenCodeBridge } from '../backends/opencode/opencode-bridge';
-import { SerializableSessionStream } from '../acp/streaming/session-stream';
+import { SerializableSessionStream } from '../backend/streaming/session-stream';
 import { UserPromptSSP } from '../ssp/impl/user-prompt';
 import {
   readAllSnapshots,
   readAllStreamParts,
   readMetaIndex,
   readSubsessionRecords,
-} from '../acp/streaming/deserialize';
+} from '../backend/streaming/deserialize';
 import type {
   AcpEvent,
   AcpPartDeltaEvent,
   AcpSessionIdleEvent,
   AcpSessionDiffEvent,
   AcpPermissionRequestEvent,
-} from '../acp/types';
-import type { SessionStreamSchedulingMode } from '../acp/streaming/session-stream-node';
+} from '../backend/types';
+import type { SessionStreamSchedulingMode } from '../backend/streaming/session-stream-node';
 
 // ---------------------------------------------------------------------------
 // Mock backend for bridge constructor

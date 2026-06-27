@@ -4,7 +4,7 @@ import {
   loadPersistedSettingsState,
   savePersistedSettingsState,
 } from '../settings/state-persistence';
-import type { SelectionState } from '../acp/app-event-bus';
+import type { SelectionState } from '../backend/app-event-bus';
 
 class TestMemento implements vscode.Memento {
   private store = new Map<string, unknown>();

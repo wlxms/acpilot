@@ -26,8 +26,8 @@ import {
   readSessionStreamParts,
   readSessionTurnStreamParts,
   readSessionSnapshots,
-} from '../../acp/serializable/serializer';
-import type { FileSnapshotRecord, SerializableStreamPart } from '../../acp/serializable/types';
+} from '../../backend/serializable/serializer';
+import type { FileSnapshotRecord, SerializableStreamPart } from '../../backend/serializable/types';
 
 // ===========================================================================
 // Helpers

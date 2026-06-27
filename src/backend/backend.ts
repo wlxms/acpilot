@@ -8,22 +8,22 @@
 import type { CancellationToken } from 'vscode';
 
 import type {
-  AcpChildSessionInfo,
-  AcpSessionInfo,
-  AcpSessionStatus,
-  AcpAgent,
-  AcpConfig,
-  AcpFileAttachment,
-  AcpResult,
-  AcpModel,
-  AcpPermissionResponse,
-  AcpServerInfo,
-  AcpServerStatus,
-  AcpMessageHistory,
+  BackendChildSessionInfo,
+  BackendSessionInfo,
+  BackendSessionStatus,
+  BackendAgent,
+  BackendConfig,
+  BackendFileAttachment,
+  BackendResult,
+  BackendModel,
+  BackendPermissionResponse,
+  BackendServerInfo,
+  BackendServerStatus,
+  BackendMessageHistory,
   BackendSettingsDescriptor,
 } from './types';
 
-import type { FileSnapshotRecord, SessionTitleSource } from '../acp/serializable/types';
+import type { FileSnapshotRecord, SessionTitleSource } from '../backend/serializable/types';
 
 // ===========================================================================
 // Event stream
@@ -37,22 +37,22 @@ export interface AcpEventStream<TEvent = unknown> {
 // Session operations
 // ===========================================================================
 
-export interface AcpSessionOperations {
+export interface BackendSessionOperations {
   create(options?: {
     parentId?: string;
     title?: string;
     directory?: string;
-  }): Promise<AcpResult<AcpSessionInfo>>;
+  }): Promise<BackendResult<BackendSessionInfo>>;
 
   get(
     id: string,
     directory?: string,
-  ): Promise<AcpResult<AcpSessionInfo>>;
+  ): Promise<BackendResult<BackendSessionInfo>>;
 
   update(
     id: string,
     options: { title?: string; directory?: string },
-  ): Promise<AcpResult<AcpSessionInfo>>;
+  ): Promise<BackendResult<BackendSessionInfo>>;
 
   prompt(
     id: string,
@@ -62,29 +62,29 @@ export interface AcpSessionOperations {
       model?: { providerID: string; modelID: string };
       agent?: string;
       /** File attachments (images, documents) to include with the prompt */
-      attachments?: AcpFileAttachment[];
+      attachments?: BackendFileAttachment[];
     },
-  ): Promise<AcpResult<unknown>>;
+  ): Promise<BackendResult<unknown>>;
 
   revert(
     id: string,
     messageId: string,
     partId?: string,
     directory?: string,
-  ): Promise<AcpResult<unknown>>;
+  ): Promise<BackendResult<unknown>>;
 
   abort(
     id: string,
     directory?: string,
-  ): Promise<AcpResult<boolean>>;
+  ): Promise<BackendResult<boolean>>;
 
-  list(directory?: string): Promise<AcpResult<AcpSessionInfo[]>>;
+  list(directory?: string): Promise<BackendResult<BackendSessionInfo[]>>;
 
   /** Get child sessions of a given parent session */
-  children(id: string, directory?: string): Promise<AcpResult<AcpChildSessionInfo[]>>;
+  children(id: string, directory?: string): Promise<BackendResult<BackendChildSessionInfo[]>>;
 
   /** Get status of all sessions: { [sessionId]: SessionStatus } */
-  status(directory?: string): Promise<AcpResult<Record<string, AcpSessionStatus>>>;
+  status(directory?: string): Promise<BackendResult<Record<string, BackendSessionStatus>>>;
 
   // -- Hierarchy navigation (sub-agent session tree) ---------------------
 
@@ -101,27 +101,27 @@ export interface AcpSessionOperations {
    * Get message history for a session.
    * Returns user/assistant message pairs with text content extracted from parts.
    */
-  messages(id: string, directory?: string): Promise<AcpResult<AcpMessageHistory>>;
+  messages(id: string, directory?: string): Promise<BackendResult<BackendMessageHistory>>;
 }
 
 // ===========================================================================
 // Config operations
 // ===========================================================================
 
-export interface AcpConfigOperations {
-  models(directory?: string): Promise<AcpResult<AcpModel[]>>;
+export interface BackendConfigOperations {
+  models(directory?: string): Promise<BackendResult<BackendModel[]>>;
 
   /** List available agents */
-  agents(directory?: string): Promise<AcpResult<AcpAgent[]>>;
+  agents(directory?: string): Promise<BackendResult<BackendAgent[]>>;
 
   /** Get full configuration */
-  get(directory?: string): Promise<AcpResult<AcpConfig>>;
+  get(directory?: string): Promise<BackendResult<BackendConfig>>;
 
   /** Update configuration (partial merge) */
-  update(config: Partial<AcpConfig>, directory?: string): Promise<AcpResult<void>>;
+  update(config: Partial<BackendConfig>, directory?: string): Promise<BackendResult<void>>;
 
   /** Update global configuration (persists to disk, no restart needed) */
-  updateGlobal(config: Partial<AcpConfig>): Promise<AcpResult<void>>;
+  updateGlobal(config: Partial<BackendConfig>): Promise<BackendResult<void>>;
 }
 
 // ===========================================================================
@@ -146,11 +146,11 @@ export interface AcpEventOperations<TEvent = unknown> {
 // Permission operations
 // ===========================================================================
 
-export interface AcpPermissionOperations {
+export interface BackendPermissionOperations {
   reply(
     sessionId: string,
     permissionId: string,
-    response: AcpPermissionResponse,
+    response: BackendPermissionResponse,
     directory?: string,
   ): Promise<void>;
 }
@@ -159,21 +159,21 @@ export interface AcpPermissionOperations {
 // Question operations
 // ===========================================================================
 
-export interface AcpQuestionOperations {
+export interface BackendQuestionOperations {
   /** Reply to a question.asked request with user answers */
   reply(
     sessionId: string,
     requestId: string,
     answers: Array<Array<string>>,
     directory?: string,
-  ): Promise<AcpResult<boolean>>;
+  ): Promise<BackendResult<boolean>>;
 
   /** Reject a question.asked request */
   reject(
     sessionId: string,
     requestId: string,
     directory?: string,
-  ): Promise<AcpResult<boolean>>;
+  ): Promise<BackendResult<boolean>>;
 }
 
 // ===========================================================================
@@ -182,7 +182,7 @@ export interface AcpQuestionOperations {
 
 export interface BackendSettingsProvider {
   /** Build the settings descriptor for the current backend state */
-  getDescriptor(agents: AcpAgent[], models: AcpModel[]): Promise<BackendSettingsDescriptor>;
+  getDescriptor(agents: BackendAgent[], models: BackendModel[]): Promise<BackendSettingsDescriptor>;
   /** Persist backend-specific settings values */
   saveValues(values: Record<string, unknown>): Promise<void>;
 }
@@ -192,15 +192,15 @@ export interface BackendSettingsProvider {
 // ===========================================================================
 
 /** Auth key operations shared across all ACP backends */
-export interface AcpAuthOperations {
+export interface BackendAuthOperations {
   /** Persist an API key for a provider (writes to backend auth storage) */
-  setKey(providerID: string, key: string): Promise<AcpResult<void>>;
+  setKey(providerID: string, key: string): Promise<BackendResult<void>>;
   /** Remove an API key for a provider */
-  removeKey(providerID: string): Promise<AcpResult<void>>;
+  removeKey(providerID: string): Promise<BackendResult<void>>;
 }
 
 // ===========================================================================
-// AcpBridge - backend-specific event interpreter
+// BackendBridge - backend-specific event interpreter
 // ===========================================================================
 
 /** A bridge that interprets backend stream events and translates them to
@@ -209,8 +209,8 @@ export interface AcpAuthOperations {
  *  The bridge does NOT touch the VS Code stream directly; SSS owns it.
  *  The bridge only calls sss.push(ssp) / sss.update(id, data).
  *
- *  Each backend provides its own implementation via {@link AcpBackend.createBridge}. */
-export interface AcpBridge<TEvent = unknown> {
+ *  Each backend provides its own implementation via {@link Backend.createBridge}. */
+export interface BackendBridge<TEvent = unknown> {
   /** Inject the SerializableSessionStream (which owns the VS Code stream) */
   setSSS(sss: unknown): void;
   /** Run the full event loop and translate events to push/update calls */
@@ -229,33 +229,33 @@ export interface AcpBridge<TEvent = unknown> {
 // Complete backend contract
 // ===========================================================================
 
-export interface AcpBackend<TEvent = unknown> {
+export interface Backend<TEvent = unknown> {
   /** Human-readable backend name */
   readonly name: string;
 
   // -- lifecycle -------------------------------------------------------
 
-  start(directory?: string): Promise<AcpResult<AcpServerInfo>>;
+  start(directory?: string): Promise<BackendResult<BackendServerInfo>>;
   stop(): Promise<void>;
-  getStatus(): AcpServerStatus;
+  getStatus(): BackendServerStatus;
   getUrl(): string | null;
   isRunning(): boolean;
 
   // -- sub-operations --------------------------------------------------
 
-  sessions: AcpSessionOperations;
-  config: AcpConfigOperations;
+  sessions: BackendSessionOperations;
+  config: BackendConfigOperations;
   events: AcpEventOperations<TEvent>;
-  permissions: AcpPermissionOperations;
-  questions: AcpQuestionOperations;
+  permissions: BackendPermissionOperations;
+  questions: BackendQuestionOperations;
 
   /** Create a streaming bridge for interpreting events from this backend.
    *  The bridge handles both live rendering and session restore (replay).
    *  @param sessionId - the session to bridge events for
    *  @param directory - optional workspace directory */
-  createBridge(sessionId: string, directory?: string): AcpBridge<TEvent>;
+  createBridge(sessionId: string, directory?: string): BackendBridge<TEvent>;
 
-  auth: AcpAuthOperations;
+  auth: BackendAuthOperations;
 
   // -- pluggable settings UI -------------------------------------------
 

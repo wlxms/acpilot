@@ -13,15 +13,15 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import type { ExtensionState, BackendContext } from '../../types';
-import type { AcpEvent } from '../../acp/types';
+import type { AcpEvent } from '../../backend/types';
 import type {
   FileSnapshotRecord,
   SerializableRequestDetails,
   SerializableSessionMeta,
   SerializableStreamPart,
-} from '../../acp/serializable/types';
+} from '../../backend/serializable/types';
 import { createParticipantHandler } from '../../participant/handler';
-import { isUserSelectableAgent } from '../../acp/types';
+import { isUserSelectableAgent } from '../../backend/types';
 
 
 import {
@@ -30,8 +30,8 @@ import {
   hasToolUI,
 } from './capabilities';
 
-import { CollectorStream } from '../../acp/streaming/collector-stream';
-import { SerializableSessionStream } from '../../acp/streaming/session-stream';
+import { CollectorStream } from '../../backend/streaming/collector-stream';
+import { SerializableSessionStream } from '../../backend/streaming/session-stream';
 import {
   createSSPFromRecord,
   finalizeIncompleteStates,
@@ -41,25 +41,25 @@ import {
   readMetaIndex,
   readSubsessionRecords,
   type SubsessionRecordSet,
-} from '../../acp/streaming/deserialize';
+} from '../../backend/streaming/deserialize';
 import {
   readLegacySessionEvents,
   readLegacySessionTurnEvents,
   readSessionTurnStreamParts,
   type LegacySessionTurnEvents,
   type SessionTurnStreamParts,
-} from '../../acp/serializable/serializer';
+} from '../../backend/serializable/serializer';
 import {
   projectStreamPartToAcpEvent,
   requestDetailsFromStreamParts,
-} from '../../acp/serializable/stream-parts';
+} from '../../backend/serializable/stream-parts';
 import type { StreamPartRecord } from '../../ssp/types';
-import { readCheckpoints } from '../../acp/checkpoint/checkpoint-store';
-import { getCheckpointApproval, snapshotTurnIndex } from '../../acp/checkpoint/approval-state';
-import { pushSnapshotTextEditParts, replaySnapshotsToWorkspace } from '../../acp/checkpoint/replay';
+import { readCheckpoints } from '../../backend/checkpoint/checkpoint-store';
+import { getCheckpointApproval, snapshotTurnIndex } from '../../backend/checkpoint/approval-state';
+import { pushSnapshotTextEditParts, replaySnapshotsToWorkspace } from '../../backend/checkpoint/replay';
 import { applySessionTitle } from '../../participant/session-title';
-import type { SessionTitleSource } from '../../acp/serializable/types';
-import { AcpProtocolBridge } from '../../backends/opencode/opencode-bridge';
+import type { SessionTitleSource } from '../../backend/serializable/types';
+import { OpenCodeProtocolBridge } from '../../backends/opencode/opencode-bridge';
 
 // ---------------------------------------------------------------------------
 // Internal types for session content restoration
@@ -1961,7 +1961,7 @@ export function createSessionContentProvider(
     const history: (vscode.ChatRequestTurn | vscode.ChatResponseTurn)[] = [];
 
     const attachRestoreBridge = (
-      bridge: AcpProtocolBridge,
+      bridge: OpenCodeProtocolBridge,
       collector: CollectorStream,
       sss: SerializableSessionStream,
     ): void => {
@@ -1977,7 +1977,7 @@ export function createSessionContentProvider(
     };
 
     const runRestoreBridge = async (
-      bridge: AcpProtocolBridge,
+      bridge: OpenCodeProtocolBridge,
       eventStreamForResponse: AsyncIterable<AcpEvent>,
     ): Promise<void> => {
       await bridge.run(eventStreamForResponse, token);
@@ -1993,7 +1993,7 @@ export function createSessionContentProvider(
         collector as unknown as vscode.ChatResponseStream,
         { workspaceRoot: '', backendName: ctx.backend.name, sessionId, turnIndex: 0, requestId: '' },
       );
-      const bridge = new AcpProtocolBridge(ctx.backend, sessionId);
+      const bridge = new OpenCodeProtocolBridge(ctx.backend, sessionId);
       attachRestoreBridge(bridge, collector, sss);
 
       async function* singleEvent(event: AcpEvent) {
@@ -2047,7 +2047,7 @@ export function createSessionContentProvider(
         collector as unknown as vscode.ChatResponseStream,
         { workspaceRoot: '', backendName: ctx.backend.name, sessionId, turnIndex: 0, requestId: '' },
       );
-      let bridge = new AcpProtocolBridge(ctx.backend, sessionId);
+      let bridge = new OpenCodeProtocolBridge(ctx.backend, sessionId);
       attachRestoreBridge(bridge, collector, sss);
 
       const flushAssistantTurn = (): void => {
@@ -2061,7 +2061,7 @@ export function createSessionContentProvider(
           collector as unknown as vscode.ChatResponseStream,
           { workspaceRoot: '', backendName: ctx.backend.name, sessionId, turnIndex: 0, requestId: '' },
         );
-        bridge = new AcpProtocolBridge(ctx.backend, sessionId);
+        bridge = new OpenCodeProtocolBridge(ctx.backend, sessionId);
         attachRestoreBridge(bridge, collector, sss);
       };
 

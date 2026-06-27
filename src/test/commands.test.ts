@@ -1,10 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import * as vscode from 'vscode';
-import type { AcpBackend } from '../acp/backend';
-import type { AcpServerStatus } from '../acp/types';
+import type { Backend } from '../backend/backend';
+import type { BackendServerStatus } from '../backend/types';
 import type { ExtensionState, BackendContext } from '../types';
 import { routeCommand } from '../participant/commands';
-import { AppEventBus } from '../acp/app-event-bus';
+import { AppEventBus } from '../backend/app-event-bus';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -48,20 +48,20 @@ describe('routeCommand', () => {
   let ctx: BackendContext;
   let stream: vscode.ChatResponseStream;
   let token: vscode.CancellationToken;
-  let backendStatus: AcpServerStatus;
+  let backendStatus: BackendServerStatus;
 
   beforeEach(() => {
     vi.resetAllMocks();
     backendStatus = 'stopped';
     const sessionStore = new Map<string, unknown>();
-    const backend: AcpBackend = {
+    const backend: Backend = {
       name: 'opencode',
       start: vi.fn(async () => {
         backendStatus = 'running';
         return { data: { url: 'http://127.0.0.1:51777', status: 'running' as const } };
       }),
       stop: vi.fn(async () => undefined),
-      getStatus: vi.fn((): AcpServerStatus => backendStatus),
+      getStatus: vi.fn((): BackendServerStatus => backendStatus),
       getUrl: vi.fn(() => null),
       isRunning: vi.fn(() => backendStatus === 'running'),
       sessions: {
@@ -112,7 +112,7 @@ describe('routeCommand', () => {
         getUserMessageId: vi.fn().mockReturnValue(null),
         getSessionTitle: vi.fn().mockReturnValue(null),
         getHadSubagentTasks: vi.fn().mockReturnValue(false),
-      })) as unknown as AcpBackend['createBridge'],
+      })) as unknown as Backend['createBridge'],
     };
     const outputChannel = {
       name: 'test',

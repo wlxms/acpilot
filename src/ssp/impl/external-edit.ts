@@ -29,7 +29,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { SerializableStreamPart, IMutableStreamPart, IAsyncMetadataProvider } from '../types';
 import type { SspStream } from '../types';
 import type { ExternalEditStreamPartPayload, SerializableStreamPartMeta } from '../types';
-import type { FileSnapshotRecord } from '../../acp/serializable/types';
+import type { FileSnapshotRecord } from '../../backend/serializable/types';
 
 // ---------------------------------------------------------------------------
 // Callbacks (injected by Bridge — backend-specific logic lives here)

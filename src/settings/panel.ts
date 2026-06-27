@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import type { BackendSettingsDescriptor } from '../acp/types';
+import type { BackendSettingsDescriptor } from '../backend/types';
 
 export interface GlobalSettingItem {
   key: string;

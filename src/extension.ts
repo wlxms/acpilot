@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import type { AcpAgent, AcpModel, AcpConfig, AcpProviderConfig, BackendSettingsDescriptor } from './acp/types';
+import type { BackendAgent, BackendModel, BackendConfig, BackendProviderConfig, BackendSettingsDescriptor } from './backend/types';
 import { BUILTIN_BACKENDS } from './backends/registry';
 import { createParticipantHandler } from './participant/handler';
 import { createSessionContentProvider, ACP_SESSION_SCHEME } from './surfaces/vscode/experimental-session';
@@ -8,13 +8,13 @@ import { registerLanguageModelChatProvider } from './surfaces/vscode/language-mo
 import { StatusBarManager } from './statusbar';
 import { SettingsPanel, type SettingsMessage, type SettingsData, type GlobalSettingItem } from './settings/panel';
 import { loadPersistedSettingsState, savePersistedSettingsState } from './settings/state-persistence';
-import { AppEventBus } from './acp/app-event-bus';
-import { SelectionStore } from './acp/selection-store';
-import { SessionManager } from './acp/session-manager';
-import { SessionStore } from './acp/streaming/session-store';
+import { AppEventBus } from './backend/app-event-bus';
+import { SelectionStore } from './backend/selection-store';
+import { SessionManager } from './backend/session-manager';
+import { SessionStore } from './backend/streaming/session-store';
 import type { ExtensionState, BackendContext } from './types';
-import { createAcpModels } from './acpmodels/index';
-import { AuthReader } from './acpmodels/auth-reader';
+import { createAcpModels } from './backendmodels/index';
+import { AuthReader } from './backendmodels/auth-reader';
 
 const KNOWN_PROVIDERS = [
   { id: 'openai', name: 'OpenAI', description: 'GPT-4o, GPT-4o-mini', requiresBaseURL: false, isOpenAICompatible: false, icon: '\ud83d\udfe2' },
@@ -284,7 +284,7 @@ export function activate(context: vscode.ExtensionContext) {
             case 'connectProvider': {
               const known = KNOWN_PROVIDERS.find(p => p.id === message.providerId);
               const apiType = message.providerId === 'openai-compatible' ? 'openai' : message.providerId;
-              const providerConfig: AcpProviderConfig = {
+              const providerConfig: BackendProviderConfig = {
                 api: apiType,
                 id: message.providerId,
                 name: message.displayName || known?.name || message.providerId,
@@ -315,7 +315,7 @@ export function activate(context: vscode.ExtensionContext) {
             case 'updateProvider': {
               const currentCfg = await primaryCtx.backend.config.get();
               const existing = currentCfg.data?.provider?.[message.configKey];
-              const updateConfig: AcpProviderConfig = {
+              const updateConfig: BackendProviderConfig = {
                 options: {
                   apiKey: message.apiKey,
                   ...(message.baseURL ? { baseURL: message.baseURL } : {}),
@@ -398,8 +398,8 @@ function maskApiKey(key: string): string {
 }
 
 function computeConnectedProviders(
-  config: { provider?: Record<string, AcpProviderConfig> },
-  models: AcpModel[],
+  config: { provider?: Record<string, BackendProviderConfig> },
+  models: BackendModel[],
 ): SettingsData['connectedProviders'] {
   const result: SettingsData['connectedProviders'] = [];
   const seen = new Set<string>();
@@ -457,8 +457,8 @@ function readGlobalSettings(): GlobalSettingItem[] {
 async function pushDataToPanel(s: ExtensionState, ctx: BackendContext, panel: SettingsPanel): Promise<void> {
   try {
     const [agentsResp, modelsResp, configResp] = await Promise.all([
-      ctx.backend.config.agents().catch(() => ({ data: [] as AcpAgent[] })),
-      ctx.backend.config.models().catch(() => ({ data: [] as AcpModel[] })),
+      ctx.backend.config.agents().catch(() => ({ data: [] as BackendAgent[] })),
+      ctx.backend.config.models().catch(() => ({ data: [] as BackendModel[] })),
       ctx.backend.config.get().catch(() => ({ data: undefined })),
     ]);
 
@@ -478,7 +478,7 @@ async function pushDataToPanel(s: ExtensionState, ctx: BackendContext, panel: Se
 
     const data: SettingsData = {
       backendName: getBackendDisplayName(ctx.backend.name),
-      agents: agents.map((a: AcpAgent) => ({
+      agents: agents.map((a: BackendAgent) => ({
         id: a.id,
         name: a.name,
         description: a.description,
@@ -488,7 +488,7 @@ async function pushDataToPanel(s: ExtensionState, ctx: BackendContext, panel: Se
         mode: a.mode,
         hidden: a.hidden,
       })),
-      models: models.map((m: AcpModel) => ({
+      models: models.map((m: BackendModel) => ({
         id: m.id,
         name: m.name,
         provider: m.providerName ?? m.provider,

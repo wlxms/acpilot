@@ -2,7 +2,7 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import type { AcpBackend } from '../acp/backend';
+import type { Backend } from '../backend/backend';
 
 // ---------------------------------------------------------------------------
 // Mocks 閳?must be before all imports
@@ -42,9 +42,9 @@ const mockSdkClient = {
 import * as vscode from 'vscode';
 import { createParticipantHandler } from '../participant/handler';
 import type { OpenCodeEvent } from '../backends/opencode/sdk-events';
-import type { AcpServerStatus } from '../acp/types';
+import type { BackendServerStatus } from '../backend/types';
 import type { ExtensionState, SessionState, BackendContext } from '../types';
-import { AppEventBus } from '../acp/app-event-bus';
+import { AppEventBus } from '../backend/app-event-bus';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -83,7 +83,7 @@ describe('createParticipantHandler', () => {
   let ctx: BackendContext & { sessionMap: Map<string, SessionState> };
   let stream: vscode.ChatResponseStream;
   let token: vscode.CancellationToken;
-  let backendStatus: AcpServerStatus;
+  let backendStatus: BackendServerStatus;
   let workspaceRoot: string;
 
   beforeEach(() => {
@@ -93,7 +93,7 @@ describe('createParticipantHandler', () => {
     const sessionStore = new Map<string, SessionState>();
     vi.spyOn(vscode.lm, 'selectChatModels').mockResolvedValue([]);
 
-    const backend: AcpBackend = {
+    const backend: Backend = {
       name: 'opencode',
       start: vi.fn(async () => {
         backendStatus = 'running';
@@ -208,7 +208,7 @@ describe('createParticipantHandler', () => {
         getUserMessageId: vi.fn().mockReturnValue(null),
         getSessionTitle: vi.fn().mockReturnValue(null),
         getHadSubagentTasks: vi.fn().mockReturnValue(false),
-      })) as unknown as AcpBackend['createBridge'],
+      })) as unknown as Backend['createBridge'],
     };
 
     const outputChannel = {
@@ -526,7 +526,7 @@ describe('createParticipantHandler', () => {
       getUserMessageId: vi.fn().mockReturnValue('msg-live'),
       getSessionTitle: vi.fn().mockReturnValue(null),
       getHadSubagentTasks: vi.fn().mockReturnValue(false),
-    } as unknown as ReturnType<AcpBackend['createBridge']>);
+    } as unknown as ReturnType<Backend['createBridge']>);
 
     mockSdkClient.global.event.mockResolvedValue({
       stream: emptyEventStream(),
@@ -1206,7 +1206,7 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
       getSessionTitle: vi.fn().mockReturnValue('OAuth Middleware'),
       getSessionTitleSource: vi.fn().mockReturnValue('copilot-style'),
       getHadSubagentTasks: vi.fn().mockReturnValue(false),
-    } as unknown as ReturnType<AcpBackend['createBridge']>);
+    } as unknown as ReturnType<Backend['createBridge']>);
 
     mockSdkClient.global.event.mockResolvedValue({
       stream: emptyEventStream(),
@@ -1278,7 +1278,7 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
       getSessionTitle: vi.fn().mockReturnValue('OAuth Middleware'),
       getSessionTitleSource: vi.fn().mockReturnValue('copilot-style'),
       getHadSubagentTasks: vi.fn().mockReturnValue(false),
-    } as unknown as ReturnType<AcpBackend['createBridge']>);
+    } as unknown as ReturnType<Backend['createBridge']>);
 
     mockSdkClient.global.event.mockResolvedValue({
       stream: emptyEventStream(),
@@ -1325,7 +1325,7 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
       getSessionTitle: vi.fn().mockReturnValue('OAuth Middleware'),
       getSessionTitleSource: vi.fn().mockReturnValue('copilot-style'),
       getHadSubagentTasks: vi.fn().mockReturnValue(false),
-    } as unknown as ReturnType<AcpBackend['createBridge']>);
+    } as unknown as ReturnType<Backend['createBridge']>);
 
     mockSdkClient.global.event.mockResolvedValue({
       stream: emptyEventStream(),
@@ -1383,7 +1383,7 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
       getUserMessageId: vi.fn().mockReturnValue('user-title-backend-gen'),
       getSessionTitle: vi.fn().mockReturnValue(null),
       getHadSubagentTasks: vi.fn().mockReturnValue(false),
-    } as unknown as ReturnType<AcpBackend['createBridge']>);
+    } as unknown as ReturnType<Backend['createBridge']>);
 
     mockSdkClient.global.event.mockResolvedValue({
       stream: emptyEventStream(),
@@ -1442,7 +1442,7 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
       getUserMessageId: vi.fn().mockReturnValue('user-title-provisional'),
       getSessionTitle: vi.fn().mockReturnValue(provisionalTitle),
       getHadSubagentTasks: vi.fn().mockReturnValue(false),
-    } as unknown as ReturnType<AcpBackend['createBridge']>);
+    } as unknown as ReturnType<Backend['createBridge']>);
 
     const result = await handler(
       createRequest({ prompt: provisionalTitle, sessionId: 'chat-title-provisional' }),
@@ -1509,7 +1509,7 @@ import { resolvePromptAgent, resolvePromptModel } from '../participant/handler';
 describe('resolvePromptModel', () => {
   let state: ExtensionState;
   let ctx: BackendContext;
-  let backend: AcpBackend;
+  let backend: Backend;
 
   beforeEach(() => {
     vi.resetAllMocks();
@@ -1518,7 +1518,7 @@ describe('resolvePromptModel', () => {
       config: {
         models: vi.fn(async () => ({ data: [] })),
       },
-    } as unknown as AcpBackend;
+    } as unknown as Backend;
 
     const selection = {
       get: vi.fn(() => ({ agent: undefined, model: { providerID: 'openai', modelID: 'gpt-4' } })),
@@ -1643,7 +1643,7 @@ describe('resolvePromptModel', () => {
 describe('resolvePromptAgent', () => {
   let state: ExtensionState;
   let ctx: BackendContext;
-  let backend: AcpBackend;
+  let backend: Backend;
 
   beforeEach(() => {
     vi.resetAllMocks();
@@ -1657,7 +1657,7 @@ describe('resolvePromptAgent', () => {
           ],
         })),
       },
-    } as unknown as AcpBackend;
+    } as unknown as Backend;
 
     const selection = {
       get: vi.fn(() => ({ agent: 'Sisyphus - Ultraworker' })),

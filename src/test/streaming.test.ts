@@ -3,7 +3,7 @@ import { promises as fs } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
-import { OpenCodeBridge } from '../backends/opencode/opencode-bridge';
+import { OpenCodeProtocolBridge } from '../backends/opencode/opencode-bridge';
 import { SerializableSessionStream } from '../backend/streaming/session-stream';
 import { UserPromptSSP } from '../ssp/impl/user-prompt';
 import {
@@ -94,7 +94,7 @@ function getTestSessionDir(workspaceRoot: string): string {
 
 /** Compatibility helper: creates SSS with mock stream + runs events through bridge */
 async function runBridge(
-  bridge: OpenCodeBridge,
+  bridge: OpenCodeProtocolBridge,
   events: { stream: AsyncIterable<AcpEvent> },
   stream: MockStream,
   token: vscode.CancellationToken,
@@ -181,10 +181,10 @@ function fullTurnEvents(opts: { tools?: AcpEvent[]; aiDeltas?: string[] }): AcpE
 // ---------------------------------------------------------------------------
 
 describe('OpenCodeBridge', () => {
-  let bridge: OpenCodeBridge;
+  let bridge: OpenCodeProtocolBridge;
 
   beforeEach(() => {
-    bridge = new OpenCodeBridge(mockBackend(), 'test-session');
+    bridge = new OpenCodeProtocolBridge(mockBackend(), 'test-session');
   });
 
   it('generates and persists a VS Code LM title when backend title echoes the first prompt', async () => {
@@ -1723,7 +1723,7 @@ describe('OpenCodeBridge', () => {
         partId: 'user-full-chain',
       }));
 
-      const fullBridge = new OpenCodeBridge(
+      const fullBridge = new OpenCodeProtocolBridge(
         mockBackend({ permissions }),
         'ses_root_full_chain',
         tmpDir,
@@ -2348,7 +2348,7 @@ describe('OpenCodeBridge', () => {
 
   it('should stop on session.idle matching target session', async () => {
     const stream = mockStream();
-    const scopedBridge = new OpenCodeBridge(mockBackend(), 'ses_a', undefined, { sessionId: 'ses_a' });
+    const scopedBridge = new OpenCodeProtocolBridge(mockBackend(), 'ses_a', undefined, { sessionId: 'ses_a' });
     const events = eventStream([
       { type: 'part.updated', part: { type: 'text', text: '', messageId: 'msg_a1', id: 'prt_ai1' } },
       deltaEvent('Yes'),
@@ -2362,7 +2362,7 @@ describe('OpenCodeBridge', () => {
 
   it('should ignore session.idle from a different session when target session is set', async () => {
     const stream = mockStream();
-    const scopedBridge = new OpenCodeBridge(mockBackend(), 'ses_target', undefined, { sessionId: 'ses_target' });
+    const scopedBridge = new OpenCodeProtocolBridge(mockBackend(), 'ses_target', undefined, { sessionId: 'ses_target' });
     const events = eventStream([
       {
         type: 'part.updated',
@@ -2472,7 +2472,7 @@ describe('OpenCodeBridge', () => {
     });
 
     function permissionBridge(directory?: string, questions?: { reply: ReturnType<typeof vi.fn>; reject?: ReturnType<typeof vi.fn> }) {
-      return new OpenCodeBridge(mockBackend({ permissions: mockPermissions, questions }), 'ses_target', directory);
+      return new OpenCodeProtocolBridge(mockBackend({ permissions: mockPermissions, questions }), 'ses_target', directory);
     }
 
     function firstExternalEditTarget(stream: MockStream): vscode.Uri[] {

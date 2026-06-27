@@ -29,6 +29,15 @@ import type {
   StreamPart,
   StreamToolState,
 } from './sdk-events';
+
+/**
+ * Internal event shape the bridge consumes after projecting raw OpenCode
+ * events. This is a bridge-private concern: raw OpenCode events are the only
+ * input (rawEvent → projection here → SSS). The shared AcpEvent type is kept
+ * only because downstream serialization still references some sub-shapes; it
+ * is no longer the persistence format (SSP is).
+ */
+type OpenCodeBridgeEvent = AcpEvent;
 import type { SerializableSessionStream } from '../../backend/streaming/session-stream';
 import type { SubsessionStream } from '../../backend/streaming/subsession-stream';
 import type { SessionStreamNode } from '../../backend/streaming/session-stream-node';
@@ -170,7 +179,7 @@ interface StreamNodeState {
   deltaText: Map<string, string>;
 }
 
-export class OpenCodeProtocolBridge implements BackendBridge<AcpEvent> {
+export class OpenCodeBridge implements BackendBridge<OpenCodeStreamEvent> {
   private sss!: SerializableSessionStream;
   protected logger: BridgeLogger = { appendLine: () => {} };
   protected readonly sessionId: string;
@@ -218,10 +227,36 @@ export class OpenCodeProtocolBridge implements BackendBridge<AcpEvent> {
   private logTag(tag: string, msg: string): void { this.log(`[${tag}] ${msg}`); }
 
   // ---------------------------------------------------------------------------
-  // Event loop
+  // Event loop — consumes raw OpenCode events directly.
+  //
+  // The bridge projects each raw OpenCodeStreamEvent into the internal
+  // OpenCodeBridgeEvent (AcpEvent) shape inline, then dispatches to handlers.
+  // Projection is a bridge-private concern; there is no shared intermediate
+  // event layer across backends.
   // ---------------------------------------------------------------------------
 
-  async run(events: AsyncIterable<AcpEvent>, token: { isCancellationRequested: boolean }): Promise<boolean> {
+  async run(events: AsyncIterable<OpenCodeStreamEvent>, token: { isCancellationRequested: boolean }): Promise<boolean> {
+    try {
+      for await (const rawEvent of events) {
+        if (token.isCancellationRequested) break;
+        const projected = projectOpenCodeStreamEvent(rawEvent);
+        for (const event of projected) {
+          if (await this.handleEvent(event)) break;
+        }
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Connection lost';
+      this.log(`bridge error: ${msg}`);
+    }
+    return !token.isCancellationRequested;
+  }
+
+  /**
+   * Consume an already-projected AcpEvent stream (no raw-event projection).
+   * Used only by the deprecated {@link OpenCodeProtocolBridge} restore path
+   * (Phase 4b will remove it). Live turns use {@link run} with raw events.
+   */
+  async runWithProjected(events: AsyncIterable<AcpEvent>, token: { isCancellationRequested: boolean }): Promise<boolean> {
     try {
       for await (const event of events) {
         if (token.isCancellationRequested) break;
@@ -931,10 +966,10 @@ export class OpenCodeProtocolBridge implements BackendBridge<AcpEvent> {
   private startDeferredIdleTimer(): void {
     this.clearDeferredIdleTimer();
     this.deferredIdleTimer = setTimeout(() => {
-      this.logTag('idle', `deferred idle timeout (${OpenCodeProtocolBridge.DEFERRED_IDLE_TIMEOUT_MS / 1000}s); stopping`);
+      this.logTag('idle', `deferred idle timeout (${OpenCodeBridge.DEFERRED_IDLE_TIMEOUT_MS / 1000}s); stopping`);
       this.deferredIdle = false;
       this.subagents.clear();
-    }, OpenCodeProtocolBridge.DEFERRED_IDLE_TIMEOUT_MS);
+    }, OpenCodeBridge.DEFERRED_IDLE_TIMEOUT_MS);
   }
 
   private clearDeferredIdleTimer(): void {
@@ -1405,20 +1440,29 @@ export class OpenCodeProtocolBridge implements BackendBridge<AcpEvent> {
   }
 }
 
-export class OpenCodeBridge extends OpenCodeProtocolBridge implements BackendBridge<OpenCodeStreamEvent | AcpEvent> {
-  async run(events: AsyncIterable<OpenCodeStreamEvent | AcpEvent>, token: { isCancellationRequested: boolean }): Promise<boolean> {
-    async function* projected() {
-      for await (const rawEvent of events) {
-        const acpEvents = isAcpEvent(rawEvent)
-          ? [rawEvent]
-          : projectOpenCodeStreamEvent(rawEvent);
-        for (const event of acpEvents) {
-          yield event;
-        }
-      }
-    }
+/**
+ * @deprecated Legacy restore-only bridge that consumes already-projected
+ * AcpEvent streams (used by the session-history replay path in
+ * experimental-session.ts). Retained until Phase 4b removes that path and
+ * unifies replay on SSP records. New code must use {@link OpenCodeBridge}
+ * which consumes raw OpenCodeStreamEvents directly.
+ */
+export class OpenCodeProtocolBridge implements BackendBridge<AcpEvent> {
+  private readonly inner: OpenCodeBridge;
 
-    return super.run(projected(), token);
+  constructor(backend: Backend<unknown>, sessionId: string, directory?: string, options?: { sessionId?: string }) {
+    this.inner = new OpenCodeBridge(backend, sessionId, directory, options);
+  }
+
+  setSSS(sss: unknown): void { this.inner.setSSS(sss); }
+  setLogger(logger: BridgeLogger): void { this.inner.setLogger(logger); }
+  getUserMessageId(): string | null { return this.inner.getUserMessageId(); }
+  getSessionTitle(): string | null { return this.inner.getSessionTitle(); }
+  getSessionTitleSource(): import('../../backend/serializable/types').SessionTitleSource | null { return this.inner.getSessionTitleSource(); }
+  getHadSubagentTasks(): boolean { return this.inner.getHadSubagentTasks(); }
+
+  async run(events: AsyncIterable<AcpEvent>, token: { isCancellationRequested: boolean }): Promise<boolean> {
+    return this.inner.runWithProjected(events, token);
   }
 }
 
@@ -1552,32 +1596,6 @@ function projectOpenCodeStreamEvent(rawEvent: OpenCodeStreamEvent): AcpEvent[] {
       }];
     default:
       return [];
-  }
-}
-
-function isAcpEvent(event: OpenCodeStreamEvent | AcpEvent): event is AcpEvent {
-  if ('payload' in event) return false;
-  if ('properties' in event) return false;
-  switch (event.type) {
-    case 'part.updated':
-    case 'part.delta':
-    case 'permission.asked':
-    case 'permission.replied':
-    case 'question.asked':
-    case 'question.replied':
-    case 'question.rejected':
-    case 'session.created':
-    case 'session.updated':
-    case 'session.deleted':
-    case 'session.error':
-    case 'session.idle':
-    case 'session.diff':
-    case 'session.status':
-    case 'server.connected':
-    case 'server.heartbeat':
-      return true;
-    default:
-      return false;
   }
 }
 

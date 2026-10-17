@@ -1746,4 +1746,3 @@ function formatOpenCodeError(value: unknown): string | undefined {
     return String(value);
   }
 }
-

@@ -25,16 +25,26 @@ export type SettingsMessage =
   | { type: 'createAcpTarget'; name?: string; endpoint: string; authToken?: string }
   | { type: 'updateAcpTarget'; targetId: string; name?: string; endpoint: string; authToken?: string }
   | { type: 'deleteAcpTarget'; targetId: string }
+  | { type: 'createDshTarget'; name?: string; command: string; args: string[]; launchCwd: string; installDirectory?: string; packageSpec?: string }
+  | { type: 'updateDshTarget'; targetId: string; name?: string; command: string; args: string[]; launchCwd: string; installDirectory?: string; packageSpec?: string }
+  | { type: 'deleteDshTarget'; targetId: string }
+  | { type: 'installDsh'; targetId?: string; name?: string; command: string; args: string[]; launchCwd: string; installDirectory: string; packageSpec?: string }
+  | { type: 'updateDsh'; targetId?: string; name?: string; command: string; args: string[]; launchCwd: string; installDirectory: string; packageSpec?: string }
   | { type: 'connectProvider'; providerId: string; apiKey: string; baseURL?: string; displayName?: string }
   | { type: 'disconnectProvider'; configKey: string }
   | { type: 'updateProvider'; configKey: string; apiKey: string; baseURL?: string };
 
 export interface BackendTargetItem {
   id: string;
-  kind: 'builtin' | 'acp';
+  kind: 'builtin' | 'acp' | 'dsh';
   name: string;
   description: string;
   endpoint?: string;
+  command?: string;
+  args?: string[];
+  launchCwd?: string;
+  installDirectory?: string;
+  packageSpec?: string;
   active: boolean;
   editable: boolean;
 }
@@ -77,6 +87,16 @@ export interface SettingsData {
   backendTargets?: BackendTargetItem[];
   /** Selected settings target; ACP sessions use the selected ACP target when kind='acp'. */
   activeBackendTargetId?: string;
+  /** DSH command configuration shown even before a target has been saved. */
+  dshTarget?: {
+    id?: string;
+    name: string;
+    command: string;
+    args: string[];
+    launchCwd: string;
+    installDirectory: string;
+    packageSpec: string;
+  };
 }
 
 export class SettingsPanel {
@@ -132,7 +152,12 @@ export class SettingsPanel {
   private handleMessage(message: SettingsMessage): void {
     this.messageQueue = this.messageQueue
       .then(async () => this.onDidRequestChange?.(message))
-      .then(() => undefined, () => undefined);
+      .then(() => undefined, (error: unknown) => {
+        void this.panel.webview.postMessage({
+          type: 'error',
+          message: error instanceof Error ? error.message : String(error),
+        });
+      });
   }
 
   private dispose(): void {
@@ -553,7 +578,9 @@ export class SettingsPanel {
     .modal { width: min(540px, calc(100vw - 32px)); background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 18px; }
     .modal h3 { margin: 0 0 8px; font-size: 14px; font-weight: 600; }
     .modal .desc { color: var(--muted); font-size: 12px; margin-bottom: 10px; }
-    .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+    .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
+     textarea { width: 100%; resize: vertical; font: inherit; color: var(--input-fg); background: var(--input-bg); border: 1px solid var(--input-border); padding: 6px 8px; border-radius: 3px; }
+     .dsh-status { margin-top: 10px; color: var(--muted); min-height: 18px; }
   </style>
 </head>
 <body>
@@ -563,6 +590,7 @@ export class SettingsPanel {
       <div class="toc-header">Settings</div>
       <div class="toc-item active" data-nav="global">Global</div>
       <div class="toc-item" data-nav="opencode">OpenCode</div>
+       <div class="toc-item" data-nav="dsh">DeepSeek Harness</div>
       <div class="toc-spacer"></div>
       <div class="toc-separator"></div>
       <button id="btn-acp-backend-add" class="toc-add-btn">+ ACP Backend</button>
@@ -649,6 +677,52 @@ export class SettingsPanel {
           <div class="empty-state">Loading backend settings...</div>
         </div>
       </section>
+
+      <!-- ═══ DeepSeek Harness nav content ═══ -->
+      <section id="nav-dsh" class="settings-body-inner hidden">
+        <div class="group-title">DeepSeek Harness Runtime</div>
+        <div class="card">
+          <div class="desc">ACPilot launches the DSH command you configure here. The launch directory is the DSH process directory; the workspace directory is still sent separately in ACP session/new.</div>
+          <input type="hidden" id="dsh-target-id">
+          <div class="setting-item">
+            <div class="setting-label">Target name</div>
+            <div class="setting-desc">Display name in the backend target picker</div>
+            <div class="setting-control"><input type="text" id="dsh-target-name" placeholder="DeepSeek Harness"></div>
+          </div>
+          <div class="setting-item">
+            <div class="setting-label">DSH command</div>
+            <div class="setting-desc">Your own dsh executable, script, or wrapper command</div>
+            <div class="setting-control"><input type="text" id="dsh-command" placeholder="dsh"></div>
+          </div>
+          <div class="setting-item">
+            <div class="setting-label">Arguments</div>
+            <div class="setting-desc">One argument per line. The official ACP profile is --profile acp.</div>
+            <div class="setting-control"><textarea id="dsh-args" rows="3" placeholder="--profile&#10;acp"></textarea></div>
+          </div>
+          <div class="setting-item">
+            <div class="setting-label">DSH launch directory</div>
+            <div class="setting-desc">Working directory used to start your DSH server</div>
+            <div class="setting-control"><input type="text" id="dsh-launch-cwd" placeholder="C:\\path\\to\\your\\dsh"></div>
+          </div>
+          <div class="setting-item">
+            <div class="setting-label">Install directory</div>
+            <div class="setting-desc">Directory used by the Install and Update buttons</div>
+            <div class="setting-control"><input type="text" id="dsh-install-directory" placeholder="C:\\path\\to\\acpilot-dsh"></div>
+          </div>
+          <div class="setting-item">
+            <div class="setting-label">Package spec</div>
+            <div class="setting-desc">npm package or version used by Install and Update</div>
+            <div class="setting-control"><input type="text" id="dsh-package-spec" placeholder="@deepseek-ai/dsh@latest"></div>
+          </div>
+          <div class="modal-actions">
+            <button id="btn-dsh-delete" class="button-secondary hidden" style="color:#f48771; border-color:#f48771;">Delete target</button>
+            <button id="btn-dsh-save" class="button-secondary">Save target</button>
+            <button id="btn-dsh-install">Install DSH</button>
+            <button id="btn-dsh-update">Update DSH</button>
+          </div>
+          <div id="dsh-status" class="dsh-status"></div>
+        </div>
+      </section>
     </main>
   </div>
 
@@ -714,6 +788,7 @@ export class SettingsPanel {
       <div id="backend-target-list" class="target-list"></div>
       <div class="modal-actions">
         <button id="btn-open-acp-target-form" class="button-secondary">Add ACP Target</button>
+        <button id="btn-open-dsh-target-form" class="button-secondary">Add DSH Target</button>
         <button id="btn-close-backend-chooser" class="button-secondary">Close</button>
       </div>
     </div>
@@ -761,7 +836,7 @@ export class SettingsPanel {
         document.querySelectorAll('.toc-item').forEach(t => t.classList.remove('active'));
         item.classList.add('active');
         document.getElementById('nav-global').classList.toggle('hidden', nav !== 'global');
-        document.getElementById('nav-opencode').classList.toggle('hidden', nav !== 'opencode');
+        showNav(nav);
       });
     });
 
@@ -797,6 +872,13 @@ export class SettingsPanel {
     document.getElementById('btn-open-acp-target-form').addEventListener('click', () => {
       openAcpTargetModal();
     });
+    document.getElementById('btn-open-dsh-target-form').addEventListener('click', () => {
+      openDshSettings();
+    });
+    document.getElementById('btn-dsh-save').addEventListener('click', saveDshSettings);
+    document.getElementById('btn-dsh-delete').addEventListener('click', deleteDshSettings);
+    document.getElementById('btn-dsh-install').addEventListener('click', () => installDshFromSettings('installDsh'));
+    document.getElementById('btn-dsh-update').addEventListener('click', () => installDshFromSettings('updateDsh'));
     document.getElementById('btn-cancel-acp-target').addEventListener('click', () => {
       closeAcpTargetModal();
     });
@@ -846,6 +928,8 @@ export class SettingsPanel {
         renderData(msg.data);
         renderProviders();
         renderGlobalSettings(msg.data.globalSettings);
+      } else if (msg.type === 'error') {
+        setDshStatus(msg.message || 'Request failed');
       }
     });
 
@@ -857,7 +941,9 @@ export class SettingsPanel {
       if (meta) {
         meta.textContent = active?.kind === 'acp'
           ? (active.endpoint || active.description || 'ACP remote target')
-          : (active?.description || 'Current backend target');
+          : active?.kind === 'dsh'
+            ? (active.launchCwd || active.command || active.description || 'DSH target')
+            : (active?.description || 'Current backend target');
       }
 
       const list = document.getElementById('backend-target-list');
@@ -901,7 +987,11 @@ export class SettingsPanel {
           editBtn.textContent = 'Edit';
           editBtn.addEventListener('click', (event) => {
             event.stopPropagation();
-            openAcpTargetModal(target);
+            if (target.kind === 'dsh') {
+              openDshSettings(target);
+            } else {
+              openAcpTargetModal(target);
+            }
           });
           actions.appendChild(editBtn);
         }
@@ -911,9 +1001,102 @@ export class SettingsPanel {
       });
     }
 
+    function showNav(nav) {
+      document.querySelectorAll('.toc-item').forEach(item => item.classList.toggle('active', item.dataset.nav === nav));
+      document.querySelectorAll('.settings-body-inner').forEach(section => section.classList.toggle('hidden', section.id !== 'nav-' + nav));
+    }
+
     function selectBackendTarget(targetId) {
       vscode.postMessage({ type: 'setBackendTarget', targetId });
       document.getElementById('backend-chooser-modal').classList.add('hidden');
+      showNav(targetId.startsWith('dsh:') || targetId === 'builtin:dsh' ? 'dsh' : targetId.startsWith('builtin:opencode') ? 'opencode' : 'global');
+    }
+
+    function fillDshSettings(target) {
+      const value = target || currentData?.dshTarget || {};
+      const targetId = value.id?.replace(/^dsh:/, '') || value.id || '';
+      document.getElementById('dsh-target-id').value = targetId;
+      document.getElementById('btn-dsh-delete').classList.toggle('hidden', !targetId);
+      document.getElementById('dsh-target-name').value = value.name || 'DeepSeek Harness';
+      document.getElementById('dsh-command').value = value.command || 'dsh';
+      document.getElementById('dsh-args').value = (value.args || ['--profile', 'acp']).join('\n');
+      document.getElementById('dsh-launch-cwd').value = value.launchCwd || '';
+      document.getElementById('dsh-install-directory').value = value.installDirectory || '';
+      document.getElementById('dsh-package-spec').value = value.packageSpec || '@deepseek-ai/dsh@latest';
+    }
+
+    function openDshSettings(target) {
+      document.getElementById('backend-chooser-modal').classList.add('hidden');
+      if (target) {
+        fillDshSettings(target);
+      } else {
+        const defaults = { ...(currentData?.dshTarget || {}), id: undefined };
+        fillDshSettings(defaults);
+      }
+      showNav('dsh');
+    }
+
+    function readDshSettings() {
+      return {
+        targetId: document.getElementById('dsh-target-id').value.trim() || undefined,
+        name: document.getElementById('dsh-target-name').value.trim() || undefined,
+        command: document.getElementById('dsh-command').value.trim(),
+        args: document.getElementById('dsh-args').value.split(/\r?\n/).map(value => value.trim()).filter(Boolean),
+        launchCwd: document.getElementById('dsh-launch-cwd').value.trim(),
+        installDirectory: document.getElementById('dsh-install-directory').value.trim(),
+        packageSpec: document.getElementById('dsh-package-spec').value.trim() || undefined,
+      };
+    }
+
+    function saveDshSettings() {
+      const value = readDshSettings();
+      if (!value.command || !value.launchCwd) {
+        alert('DSH command and launch directory are required');
+        return;
+      }
+      vscode.postMessage({
+        type: value.targetId ? 'updateDshTarget' : 'createDshTarget',
+        ...(value.targetId ? { targetId: value.targetId } : {}),
+        name: value.name,
+        command: value.command,
+        args: value.args,
+        launchCwd: value.launchCwd,
+        installDirectory: value.installDirectory || undefined,
+        packageSpec: value.packageSpec,
+      });
+      setDshStatus('Saving DSH target...');
+    }
+
+    function deleteDshSettings() {
+      const targetId = document.getElementById('dsh-target-id').value.trim();
+      if (!targetId || !confirm('Delete this DSH target?')) return;
+      vscode.postMessage({ type: 'deleteDshTarget', targetId });
+      fillDshSettings({});
+      setDshStatus('Deleting DSH target...');
+    }
+
+    function installDshFromSettings(operation) {
+      const value = readDshSettings();
+      if (!value.installDirectory || !value.launchCwd) {
+        alert('Install directory and launch directory are required');
+        return;
+      }
+      vscode.postMessage({
+        type: operation,
+        targetId: value.targetId,
+        name: value.name,
+        command: value.command || 'dsh',
+        args: value.args,
+        launchCwd: value.launchCwd,
+        installDirectory: value.installDirectory,
+        packageSpec: value.packageSpec,
+      });
+      setDshStatus(operation === 'installDsh' ? 'Installing DSH...' : 'Updating DSH...');
+    }
+
+    function setDshStatus(message) {
+      const status = document.getElementById('dsh-status');
+      if (status) status.textContent = message || '';
     }
 
     function openAcpTargetModal(target) {
@@ -958,6 +1141,14 @@ export class SettingsPanel {
         authToken: authToken || undefined,
       });
       closeAcpTargetModal();
+    }
+
+    function renderDshSettings(data) {
+      if (!data?.dshTarget) return;
+      const activeElement = document.activeElement;
+      const dshIds = ['dsh-target-id', 'dsh-target-name', 'dsh-command', 'dsh-args', 'dsh-launch-cwd', 'dsh-install-directory', 'dsh-package-spec'];
+      if (activeElement && dshIds.includes(activeElement.id)) return;
+      fillDshSettings(data.dshTarget);
     }
 
     function renderData(data) {
@@ -1067,6 +1258,7 @@ export class SettingsPanel {
 
       // Render backend-specific settings from descriptor (OpenCode nav)
       renderBackendSettings(data.backendSettings, data);
+      renderDshSettings(data);
     }
 
     // =========================================================================

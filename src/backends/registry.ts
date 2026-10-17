@@ -15,6 +15,7 @@
 import './opencode/index'; // side-effect: registers 'opencode' backend
 import './acp/index'; // side-effect: registers 'acp' backend
 import './reasonix/index'; // side-effect: registers 'reasonix' backend
+import './dsh/index'; // side-effect: registers 'dsh' backend
 import { createBackend } from '../backend/backend-registry';
 import type { Backend } from '../backend/backend';
 
@@ -87,6 +88,13 @@ export const BUILTIN_BACKENDS: BuiltinBackendDescriptor[] = [
     scheme: 'acpilot.acp',
     vendor: 'acp',
     factory: () => createBackend('acp'),
+  },
+  {
+    id: 'dsh',
+    displayName: 'DeepSeek Harness',
+    scheme: 'acpilot.dsh',
+    vendor: 'dsh',
+    factory: () => createBackend('dsh'),
   },
   {
     id: 'reasonix',

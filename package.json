@@ -59,6 +59,11 @@
         "managementCommand": "acpilot.openSettings"
       },
       {
+        "vendor": "dsh",
+        "displayName": "DeepSeek Harness",
+        "managementCommand": "acpilot.openSettings"
+      },
+      {
         "vendor": "reasonix",
         "displayName": "Reasonix",
         "managementCommand": "acpilot.openSettings"
@@ -206,6 +211,35 @@
           {
             "name": "help",
             "description": "Show available commands"
+          }
+        ]
+      },
+      {
+        "type": "acpilot.dsh",
+        "name": "dsh",
+        "displayName": "DeepSeek Harness",
+        "description": "AI coding agent powered by DeepSeek Harness",
+        "icon": "$(acpilot-a)",
+        "inputPlaceholder": "Ask DeepSeek Harness anything...",
+        "canDelegate": true,
+        "requiresCustomModels": true,
+        "capabilities": {
+          "supportsFileAttachments": true,
+          "supportsToolAttachments": true,
+          "supportsImageAttachments": true
+        },
+        "commands": [
+          {
+            "name": "new",
+            "description": "Start a new conversation session"
+          },
+          {
+            "name": "help",
+            "description": "Show available commands"
+          },
+          {
+            "name": "model",
+            "description": "Show or change the current model"
           }
         ]
       },

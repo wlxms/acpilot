@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { join } from "node:path";
 import type {
   BackendAgent,
   BackendModel,
@@ -11,6 +12,19 @@ import {
   BUILTIN_BACKENDS,
 } from "./backends/registry";
 import { createReasonixBackendOptions } from "./backends/reasonix";
+import {
+  createDshBridgeLaunchNonce,
+  parseDshBridgeReadyLine,
+} from "./backends/dsh/bridge-protocol";
+import {
+  DEFAULT_DSH_COMMAND,
+  DEFAULT_DSH_PACKAGE_SPEC,
+} from "./backends/dsh/target";
+import {
+  commandAfterDshInstall,
+  defaultDshArgs,
+  installDsh,
+} from "./backends/dsh/installer";
 import { createSessionContentProvider } from "./surfaces/vscode/experimental-session";
 import { createStableHandler } from "./surfaces/vscode/stable-participant";
 import { hasRegisterChatSessionContentProvider } from "./surfaces/vscode/capabilities";
@@ -25,13 +39,18 @@ import {
 } from "./settings/panel";
 import {
   getActiveAcpTarget,
+  getActiveDshTarget,
   getActiveAcpTargetWithAuth,
   loadAcpTargetState,
+  loadDshTargetState,
   loadPersistedSettingsState,
   removeAcpTarget,
+  removeDshTarget,
   savePersistedSettingsState,
   setActiveAcpTarget,
+  setActiveDshTarget,
   upsertAcpTarget,
+  upsertDshTarget,
 } from "./settings/state-persistence";
 import { AppEventBus } from "./backend/app-event-bus";
 import { SelectionStore } from "./backend/selection-store";
@@ -44,6 +63,7 @@ import {
 import type { ExtensionState, BackendContext } from "./types";
 import { createCopilotModelCatalog } from "./surfaces/vscode/model-catalog";
 import type { AcpBackendOptions } from "./backends/acp";
+import type { DshTargetInput } from "./backends/dsh/target";
 import { startRuntimeTestControlServer } from "./test-control/server";
 import { createRuntimeTestApi } from "./test-control/runtime-api";
 import { beginBackendRuntimeTransition } from "./runtime/backend-transition";
@@ -367,12 +387,41 @@ async function resolveSelectedAcpBackendOptions(
   };
 }
 
+async function resolveSelectedDshBackendOptions(
+  context: vscode.ExtensionContext,
+): Promise<AcpBackendOptions | undefined> {
+  const target = getActiveDshTarget(context);
+  if (!target) {
+    return undefined;
+  }
+  const nonce = createDshBridgeLaunchNonce();
+  return {
+    local: {
+      command: target.command,
+      args: target.args,
+      cwd: target.launchCwd,
+      // The bridge is optional. A user's normal `dsh --profile acp` process
+      // speaks ACP directly; an installed ACPilot bridge can use this nonce to
+      // publish its readiness marker for future protocol extensions.
+      env: { ACPILOT_DSH_BRIDGE_NONCE: nonce },
+      stderr: 'pipe',
+      shell: process.platform === 'win32',
+      onStderrLine: (line) => {
+        // Consume only the ACPilot bridge marker as a recognized extension
+        // signal. Ordinary DSH diagnostics remain out-of-band and are ignored.
+        void parseDshBridgeReadyLine(line, nonce);
+      },
+    },
+  };
+}
+
 function getBackendTargets(
   s: ExtensionState,
   context: vscode.ExtensionContext,
   activeId: string,
 ): BackendTargetItem[] {
   const targetState = loadAcpTargetState(context);
+  const dshTargetState = loadDshTargetState(context);
   return [
     ...[...s.backends.values()]
       .filter((ctx) => ctx.id !== "acp")
@@ -380,7 +429,9 @@ function getBackendTargets(
         id: `builtin:${ctx.id}`,
         kind: "builtin" as const,
         name: getContextDisplayName(ctx),
-        description: `${getContextDisplayName(ctx)} backend`,
+        description: ctx.id === "dsh"
+          ? "Configure a user-owned DeepSeek Harness command"
+          : `${getContextDisplayName(ctx)} backend`,
         active: activeId === `builtin:${ctx.id}`,
         editable: false,
       })),
@@ -393,6 +444,19 @@ function getBackendTargets(
       active: activeId === `acp:${target.id}`,
       editable: true,
     })),
+    ...dshTargetState.targets.map((target) => ({
+      id: `dsh:${target.id}`,
+      kind: "dsh" as const,
+      name: target.name,
+      description: `${target.command} (${target.launchCwd})`,
+      command: target.command,
+      args: target.args,
+      launchCwd: target.launchCwd,
+      installDirectory: target.installDirectory,
+      packageSpec: target.packageSpec,
+      active: activeId === `dsh:${target.id}`,
+      editable: true,
+    })),
   ];
 }
 
@@ -400,8 +464,8 @@ function getSettingsBackendContext(
   s: ExtensionState,
   targetId: string,
 ): BackendContext | undefined {
-  const backendId = targetId.startsWith("acp:")
-    ? "acp"
+  const backendId = targetId.startsWith("acp:") || targetId.startsWith("dsh:")
+    ? targetId.split(":", 1)[0]
     : targetId.replace(/^builtin:/, "");
   return s.backends.get(backendId);
 }
@@ -412,6 +476,38 @@ function getAcpInstanceKey(context: vscode.ExtensionContext): string {
     return createBackendInstanceKey("acp", target.id);
   }
   return createBackendInstanceKey("acp", "unconfigured");
+}
+
+function getDshInstanceKey(context: vscode.ExtensionContext): string {
+  const target = getActiveDshTarget(context);
+  if (target) {
+    return createBackendInstanceKey("dsh", target.id);
+  }
+  return createBackendInstanceKey("dsh", "unconfigured");
+}
+
+function getDshSettingsTarget(
+  context: vscode.ExtensionContext,
+  workspacePath: string | undefined,
+) {
+  const installDirectory = context.globalStorageUri
+    ? vscode.Uri.joinPath(context.globalStorageUri, "dsh").fsPath
+    : join(workspacePath ?? process.cwd(), ".acpilot-dsh");
+  const active = getActiveDshTarget(context);
+  if (active) {
+    return {
+      ...active,
+      installDirectory: active.installDirectory ?? installDirectory,
+    };
+  }
+  return {
+    name: "DeepSeek Harness",
+    command: DEFAULT_DSH_COMMAND,
+    args: defaultDshArgs(),
+    launchCwd: workspacePath ?? process.cwd(),
+    installDirectory,
+    packageSpec: DEFAULT_DSH_PACKAGE_SPEC,
+  };
 }
 
 function createContextRuntime(
@@ -662,6 +758,156 @@ async function doRestartAcpBackendForTarget(
   }
 }
 
+let dshRestartQueue: Promise<void> = Promise.resolve();
+
+interface DshRuntimeTransition {
+  readonly context: BackendContext;
+  readonly generation: number;
+}
+
+function invalidateDshBackendRuntime(
+  s: ExtensionState,
+): DshRuntimeTransition | undefined {
+  if (!isCurrentState(s)) {
+    return undefined;
+  }
+  const dshCtx = s.backends.get("dsh");
+  if (!dshCtx) {
+    return undefined;
+  }
+  const generation = beginBackendRuntimeTransition(dshCtx, s.bus);
+  s.modelCatalog.clearBackend(dshCtx.id);
+  s.bus.emit("models-changed", { backendId: dshCtx.id });
+  return { context: dshCtx, generation };
+}
+
+async function mutateDshTarget<T>(
+  s: ExtensionState,
+  context: vscode.ExtensionContext,
+  workspacePath: string | undefined,
+  mutation: () => Promise<T>,
+): Promise<T> {
+  const transition = invalidateDshBackendRuntime(s);
+  let result: T;
+  try {
+    result = await mutation();
+  } catch (error) {
+    if (transition) {
+      try {
+        await restartDshBackendForTarget(s, context, workspacePath, transition);
+      } catch (recoveryError) {
+        s.outputChannel.appendLine(
+          `[settings] DSH target recovery failed: ${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}`,
+        );
+      }
+    }
+    throw error;
+  }
+  if (transition) {
+    await restartDshBackendForTarget(s, context, workspacePath, transition);
+  }
+  return result;
+}
+
+function restartDshBackendForTarget(
+  s: ExtensionState,
+  context: vscode.ExtensionContext,
+  workspacePath: string | undefined,
+  transition?: DshRuntimeTransition,
+): Promise<void> {
+  if (!isCurrentState(s)) {
+    return Promise.resolve();
+  }
+  const dshCtx = s.backends.get("dsh");
+  if (!dshCtx) {
+    return Promise.resolve();
+  }
+  const activeTransition = transition?.context === dshCtx
+    ? transition
+    : invalidateDshBackendRuntime(s);
+  if (!activeTransition) {
+    return Promise.resolve();
+  }
+  const restart = dshRestartQueue.then(() =>
+    doRestartDshBackendForTarget(s, context, workspacePath, activeTransition.generation),
+  );
+  dshRestartQueue = restart.catch(() => {});
+  return restart;
+}
+
+async function doRestartDshBackendForTarget(
+  s: ExtensionState,
+  context: vscode.ExtensionContext,
+  workspacePath: string | undefined,
+  transitionGeneration: number,
+): Promise<void> {
+  if (!isCurrentState(s)) {
+    return;
+  }
+  const dshCtx = s.backends.get("dsh");
+  if (!dshCtx) {
+    return;
+  }
+  const isCurrentTransition = (): boolean =>
+    isCurrentState(s) && dshCtx.runtimeGeneration === transitionGeneration;
+  if (!isCurrentTransition()) {
+    return;
+  }
+  try {
+    const selected = getActiveDshTarget(context);
+    const instanceKey = selected
+      ? createBackendInstanceKey("dsh", selected.id)
+      : createBackendInstanceKey("dsh", "unconfigured");
+    if (isDynamicAcpBackend(dshCtx.backend)) {
+      dshCtx.backend.setOptionsProvider(() => resolveSelectedDshBackendOptions(context));
+    }
+    if (dshCtx.backend.isRunning() || dshCtx.backend.getStatus() === "starting") {
+      await dshCtx.backend.stop();
+    }
+    if (!isCurrentTransition()) {
+      return;
+    }
+    resetContextRuntime(dshCtx, context, workspacePath, instanceKey, s.bus);
+    if (!selected) {
+      s.statusBar.updateError(dshCtx.id, getContextDisplayName(dshCtx));
+      s.bus.emit("backend-ready", { backendId: dshCtx.id });
+      return;
+    }
+    const result = await dshCtx.backend.start(workspacePath);
+    if (!isCurrentTransition()) {
+      if (!result.error) {
+        await dshCtx.backend.stop();
+      }
+      return;
+    }
+    if (result.error) {
+      s.outputChannel.appendLine(
+        `[settings] DSH target start failed: ${String(result.error)}`,
+      );
+      s.statusBar.updateError(dshCtx.id, getContextDisplayName(dshCtx));
+      return;
+    }
+    await dshCtx.selection.resolveDefaults();
+    if (!isCurrentTransition()) {
+      return;
+    }
+    await s.modelCatalog.refresh(workspacePath);
+    if (!isCurrentTransition()) {
+      s.modelCatalog.clearBackend(dshCtx.id);
+      s.bus.emit("models-changed", { backendId: dshCtx.id });
+      return;
+    }
+    await refreshStatusBar(dshCtx, s.statusBar);
+    if (isCurrentTransition()) {
+      s.bus.emit("backend-ready", { backendId: dshCtx.id });
+    }
+  } finally {
+    if (isCurrentState(s) && dshCtx.runtimeGeneration === transitionGeneration) {
+      dshCtx.acceptingRequests = true;
+    }
+  }
+}
+
 /** Refresh status bar items from the given backend context */
 async function refreshStatusBar(
   ctx: BackendContext,
@@ -741,6 +987,9 @@ export function activate(context: vscode.ExtensionContext) {
         resolveSelectedAcpBackendOptions(context),
       );
     }
+    if (desc.id === "dsh" && isDynamicAcpBackend(backend)) {
+      backend.setOptionsProvider(() => resolveSelectedDshBackendOptions(context));
+    }
     if (desc.id === "reasonix" && isDynamicAcpBackend(backend)) {
       backend.setOptionsProvider(() => {
         const config = vscode.workspace.getConfiguration("acpilot.backends.reasonix");
@@ -750,8 +999,11 @@ export function activate(context: vscode.ExtensionContext) {
         });
       });
     }
-    const instanceKey =
-      desc.id === "acp" ? getAcpInstanceKey(context) : desc.id;
+    const instanceKey = desc.id === "acp"
+      ? getAcpInstanceKey(context)
+      : desc.id === "dsh"
+        ? getDshInstanceKey(context)
+        : desc.id;
     const runtime = createContextRuntime(
       backend,
       bus,
@@ -775,7 +1027,8 @@ export function activate(context: vscode.ExtensionContext) {
 
     const shouldAutoStart =
       desc.autoStart !== false &&
-      !(desc.id === "acp" && !getActiveAcpTarget(context));
+      !(desc.id === "acp" && !getActiveAcpTarget(context)) &&
+      !(desc.id === "dsh" && !getActiveDshTarget(context));
     if (!shouldAutoStart) {
       outputChannel.appendLine(
         `[extension] Backend '${desc.id}' registered (lazy start)`,
@@ -959,6 +1212,14 @@ export function activate(context: vscode.ExtensionContext) {
                   workspacePath,
                   () => setActiveAcpTarget(context, targetId),
                 );
+              } else if (message.targetId.startsWith("dsh:")) {
+                const targetId = message.targetId.slice(4);
+                await mutateDshTarget(
+                  s,
+                  context,
+                  workspacePath,
+                  () => setActiveDshTarget(context, targetId),
+                );
               }
               selectedTargetId = message.targetId;
               const nextCtx = getSettingsBackendContext(s, selectedTargetId);
@@ -1071,6 +1332,117 @@ export function activate(context: vscode.ExtensionContext) {
               }
               break;
             }
+            case "createDshTarget": {
+              const createdTarget = await mutateDshTarget(
+                s,
+                context,
+                workspacePath,
+                () => upsertDshTarget(
+                  context,
+                  {
+                    name: message.name,
+                    command: message.command,
+                    args: message.args,
+                    launchCwd: message.launchCwd,
+                    installDirectory: message.installDirectory,
+                    packageSpec: message.packageSpec,
+                  },
+                  { makeActive: true },
+                ),
+              );
+              selectedTargetId = `dsh:${createdTarget.id}`;
+              const nextCtx = getSettingsBackendContext(s, selectedTargetId);
+              if (nextCtx) {
+                s.statusBar.setActiveBackend(nextCtx.id);
+                await pushDataToPanel(s, nextCtx, panel, context, selectedTargetId);
+              }
+              break;
+            }
+            case "updateDshTarget": {
+              const before = loadDshTargetState(context);
+              const input: DshTargetInput = {
+                id: message.targetId,
+                name: message.name,
+                command: message.command,
+                args: message.args,
+                launchCwd: message.launchCwd,
+                installDirectory: message.installDirectory,
+                packageSpec: message.packageSpec,
+              };
+              if (before.activeTargetId === message.targetId) {
+                await mutateDshTarget(
+                  s,
+                  context,
+                  workspacePath,
+                  () => upsertDshTarget(context, input, { makeActive: true }).then(() => undefined),
+                );
+              } else {
+                await upsertDshTarget(context, input, { makeActive: false });
+              }
+              await pushDataToPanel(s, selectedCtx, panel, context, selectedTargetId);
+              break;
+            }
+            case "deleteDshTarget": {
+              const before = loadDshTargetState(context);
+              let nextTargetState;
+              if (before.activeTargetId === message.targetId) {
+                nextTargetState = await mutateDshTarget(
+                  s,
+                  context,
+                  workspacePath,
+                  () => removeDshTarget(context, message.targetId),
+                );
+              } else {
+                nextTargetState = await removeDshTarget(context, message.targetId);
+              }
+              if (selectedTargetId === `dsh:${message.targetId}`) {
+                selectedTargetId = nextTargetState.activeTargetId
+                  ? `dsh:${nextTargetState.activeTargetId}`
+                  : `builtin:dsh`;
+              }
+              const nextCtx = getSettingsBackendContext(s, selectedTargetId);
+              if (nextCtx) {
+                await pushDataToPanel(s, nextCtx, panel, context, selectedTargetId);
+              }
+              break;
+            }
+            case "installDsh":
+            case "updateDsh": {
+              const installed = await installDsh({
+                installDirectory: message.installDirectory,
+                packageSpec: message.packageSpec,
+              });
+              const args = message.args.length > 0 ? message.args : defaultDshArgs();
+              const input: DshTargetInput = {
+                id: message.targetId,
+                name: message.name,
+                command: commandAfterDshInstall(
+                  message.command,
+                  installed.executable,
+                  message.targetId,
+                ),
+                args,
+                launchCwd: message.launchCwd,
+                installDirectory: installed.installDirectory,
+                packageSpec: installed.packageSpec,
+              };
+              const target = await mutateDshTarget(
+                s,
+                context,
+                workspacePath,
+                () => upsertDshTarget(context, input, { makeActive: true }),
+              );
+              selectedTargetId = `dsh:${target.id}`;
+              const nextCtx = getSettingsBackendContext(s, selectedTargetId);
+              if (nextCtx) {
+                s.statusBar.setActiveBackend(nextCtx.id);
+                await pushDataToPanel(s, nextCtx, panel, context, selectedTargetId);
+              }
+              void vscode.window.showInformationMessage(
+                message.type === "installDsh" ? "DeepSeek Harness installed." : "DeepSeek Harness updated.",
+              );
+              break;
+            }
             case "connectProvider": {
               const known = KNOWN_PROVIDERS.find(
                 (p) => p.id === message.providerId,
@@ -1159,6 +1531,7 @@ export function activate(context: vscode.ExtensionContext) {
           outputChannel.appendLine(
             `[settings] Error handling message: ${err instanceof Error ? err.message : String(err)}`,
           );
+          throw err;
         }
       };
 
@@ -1516,6 +1889,7 @@ async function pushDataToPanel(
       globalSettings: readGlobalSettings(),
       backendTargets,
       activeBackendTargetId,
+      dshTarget: getDshSettingsTarget(context, getWorkspaceDirectory()),
     };
 
     s.outputChannel.appendLine(

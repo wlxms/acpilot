@@ -1,9 +1,9 @@
 /**
  * SSP (Serializable Stream Part) — types, base class, and serialization contracts.
  *
- * SSP is independent of ACP. It lives in src/ssp/ because it is conceptually
- * close to VSCode and the extension itself. The ACP backend's Bridge creates
- * and "pushes" SSPs — SSP does NOT import from ACP.
+ * SSP is independent of any backend protocol. It lives in src/ssp/ because it is
+ * conceptually close to VSCode and the extension itself. Backend pipelines
+ * create and push SSPs; SSP does not import from backend adapters.
  *
  * Architecture (v2):
  * - Append-only SSPs: AssistantTextSSP, ReasoningSSP, UserPromptSSP
@@ -18,11 +18,12 @@
  * 2. SerializableStreamPart — the abstract base class (runtime entity)
  * 3. IMutableStreamPart — interface for parts that support update()
  * 4. IMetadataProvider — interface for parts that contribute to meta.jsonl
- * 5. Payload interfaces for each SSP kind
- * 6. SspStream — the rendering target interface
+ * 5. ISnapshotProvider — interface for parts that emit file snapshots
+ * 6. Payload interfaces for each SSP kind
+ * 7. SspStream — the rendering target interface
  */
 
-// NO IMPORTS FROM ACP — SSP is fully independent.
+// No imports from backend adapters - SSP is fully independent.
 
 // ===========================================================================
 // Serialization contract (JSONL record shape)
@@ -33,7 +34,7 @@ export interface SerializableStreamPartMeta {
   requestId: string;
   sequence: number;
   createdAt: string;
-  source: 'acp-event' | 'synthetic' | 'restore' | 'unknown';
+  source: SerializableStreamPartSource;
   sourceType?: string;
   sourcePartId?: string;
   toolCallId?: string;
@@ -47,12 +48,16 @@ export interface SerializableStreamPartMeta {
   subAgentPath?: string[];
 }
 
+export type SerializableStreamPartSource =
+  | 'backend-event'
+  | 'synthetic'
+  | 'restore'
+  | 'unknown';
+
 export type SerializableStreamPartKind =
   | 'userPrompt'
   | 'assistantText'
-  | 'assistantTextDelta'
   | 'reasoning'
-  | 'reasoningDelta'
   | 'toolInvocation'
   | 'question'
   | 'sessionLifecycle'
@@ -60,8 +65,32 @@ export type SerializableStreamPartKind =
   | 'interactionRequest'
   | 'interactionResponse'
   | 'externalEdit'
-  | 'externalEditMetadata'
-  | 'rawAcpEvent';
+  | 'opaqueEvent';
+
+export interface FileSnapshotRecord {
+  uri: string;
+  content: string;
+  phase?: 'before' | 'after';
+  turnIndex?: number;
+  editIndex: number;
+  toolCallId: string;
+  timestamp: string;
+  missing?: boolean;
+  undoStopId?: string;
+  scope?: FileSnapshotScope;
+}
+
+export interface FileSnapshotScope {
+  v: 1;
+  sessionId?: string;
+  requestId?: string;
+  streamNode: 'root' | 'subsession';
+  subAgentInvocationId?: string;
+  parentSubAgentInvocationId?: string;
+  subAgentPath?: string[];
+  turnIndex?: number;
+  toolCallId: string;
+}
 
 /**
  * The plain-data shape of a serialized stream part in JSONL.
@@ -82,13 +111,13 @@ export interface StreamPartRecord<
 // Payload interfaces (owned by SSP)
 // ===========================================================================
 
-export interface RawAcpEventStreamPartPayload<TEvent = unknown> {
+export interface OpaqueEventStreamPartPayload<TEvent = unknown> {
   event: TEvent;
 }
 
-export type RawAcpEventStreamPart<TEvent = unknown> = StreamPartRecord<
-  'rawAcpEvent',
-  RawAcpEventStreamPartPayload<TEvent>
+export type OpaqueEventStreamPart<TEvent = unknown> = StreamPartRecord<
+  'opaqueEvent',
+  OpaqueEventStreamPartPayload<TEvent>
 >;
 
 export interface UserPromptStreamPartPayload {
@@ -109,13 +138,6 @@ export interface AssistantTextStreamPartPayload {
   metadata?: Record<string, unknown>;
 }
 
-export interface AssistantTextDeltaStreamPartPayload {
-  partId: string;
-  delta: string;
-  field?: string;
-  sessionId?: string;
-}
-
 export interface ReasoningStreamPartPayload {
   partId: string;
   text: string;
@@ -124,15 +146,6 @@ export interface ReasoningStreamPartPayload {
   thinkingId?: string;
   metadata?: Record<string, unknown>;
   isComplete?: boolean;
-}
-
-export interface ReasoningDeltaStreamPartPayload {
-  partId: string;
-  delta: string;
-  field?: string;
-  sessionId?: string;
-  thinkingId?: string;
-  metadata?: Record<string, unknown>;
 }
 
 export interface SerializableToolState {
@@ -216,9 +229,7 @@ export interface ExternalEditStreamPartPayload {
 export type KnownSerializableStreamPart =
   | StreamPartRecord<'userPrompt', UserPromptStreamPartPayload>
   | StreamPartRecord<'assistantText', AssistantTextStreamPartPayload>
-  | StreamPartRecord<'assistantTextDelta', AssistantTextDeltaStreamPartPayload>
   | StreamPartRecord<'reasoning', ReasoningStreamPartPayload>
-  | StreamPartRecord<'reasoningDelta', ReasoningDeltaStreamPartPayload>
   | StreamPartRecord<'toolInvocation', ToolInvocationStreamPartPayload>
   | StreamPartRecord<'question', QuestionStreamPartPayload>
   | StreamPartRecord<'sessionLifecycle', SessionLifecycleStreamPartPayload>
@@ -226,8 +237,7 @@ export type KnownSerializableStreamPart =
   | StreamPartRecord<'interactionRequest', InteractionRequestStreamPartPayload>
   | StreamPartRecord<'interactionResponse', InteractionResponseStreamPartPayload>
   | StreamPartRecord<'externalEdit', ExternalEditStreamPartPayload>
-  | StreamPartRecord<'externalEditMetadata', ExternalEditStreamPartPayload>
-  | RawAcpEventStreamPart;
+  | OpaqueEventStreamPart;
 
 // ===========================================================================
 // Duck-typed value interfaces (avoid direct vscode global type dependencies)
@@ -286,7 +296,7 @@ export abstract class SerializableStreamPart<
       requestId: meta?.requestId ?? '',
       sequence: meta?.sequence ?? 0,
       createdAt: meta?.createdAt ?? new Date().toISOString(),
-      source: meta?.source ?? 'acp-event',
+      source: meta?.source ?? 'backend-event',
       sourceType: meta?.sourceType,
       sourcePartId: meta?.sourcePartId,
       toolCallId: meta?.toolCallId,
@@ -338,7 +348,7 @@ export abstract class SerializableStreamPart<
   }
 
   protected emitStateChange(): void {
-    for (const cb of this.listeners) cb(this);
+    for (const cb of this.listeners) {cb(this);}
   }
 
   private generateId(): string {
@@ -419,11 +429,26 @@ export interface IAsyncMetadataProvider extends IMetadataProvider {
   whenMetadataSettled(): Promise<void>;
 }
 
+// ===========================================================================
+// ISnapshotProvider — parts that emit file snapshots to session JSONL
+// ===========================================================================
+
+export interface ISnapshotProvider {
+  onSnapshot(cb: (snapshot: FileSnapshotRecord) => void): () => void;
+}
+
 /** Type guard: returns true if the part implements IMetadataProvider */
 export function isMetadataProvider(
   part: ISerializableStreamPart,
 ): part is ISerializableStreamPart & IMetadataProvider {
   return typeof (part as unknown as IMetadataProvider).getMetadata === 'function';
+}
+
+/** Type guard: returns true if the part emits file snapshots */
+export function isSnapshotProvider(
+  part: ISerializableStreamPart,
+): part is ISerializableStreamPart & ISnapshotProvider {
+  return typeof (part as unknown as ISnapshotProvider).onSnapshot === 'function';
 }
 
 export function isAsyncMetadataProvider(

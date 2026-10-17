@@ -1,4 +1,7 @@
-// Generate WOFF font from OpenCode SVG for VS Code extension codicon
+// Generate WOFF codicon font from SVG sources for the VS Code extension.
+// Glyphs (filename → codepoint):
+//   opencode.svg   → U+E001 — OpenCode bracket logomark
+//   acpilot-a.svg  → U+E002 — Agent Client Protocol (ACP) official logomark (status bar)
 // Uses fantasticon with Windows glob workaround
 
 const path = require('path');
@@ -32,7 +35,7 @@ generateFonts({
   name: 'opencode-icon',
   fontTypes: [FontAssetType.WOFF],
   normalize: true,
-  codepoints: { opencode: 0xE001 },
+  codepoints: { opencode: 0xE001, 'acpilot-a': 0xE002 },
 })
   .then(() => {
     // Remove fantasticon's extra generated files (css, html, json, ts)
@@ -42,7 +45,7 @@ generateFonts({
     }
     console.log('✅ Font generated successfully!');
     console.log(`   WOFF: ${path.join(dir, 'opencode-icon.woff')}`);
-    console.log(`   Codepoint: U+E001`);
+    console.log(`   Codepoints: opencode=U+E001, acpilot-a=U+E002`);
   })
   .catch((e) => {
     console.error('❌ Error:', e.message);

@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
-import { writeFileSync, unlinkSync, existsSync } from 'fs';
+import { writeFileSync, unlinkSync, existsSync, readFileSync } from 'fs';
 import { execSync, exec } from 'child_process';
-import type { ExtensionState } from '../types';
+import type { ExtensionState, BackendContext } from '../types';
 import type {
   ChatToolResourcesInvocationData,
   ChatTerminalToolInvocationData,
@@ -17,38 +17,83 @@ import type {
   OpenCodeEvent,
   OpenCodeStreamEvent,
   PermissionAskedEvent,
-  SessionDiffEvent,
 } from '../backends/opencode/sdk-events';
+import type { BackendEventStream } from '../backend/backend';
+
+/**
+ * These diagnostics inspect OpenCode's private SSE event shape directly.
+ * They are intentionally kept out of the generic backend command surface;
+ * adding a protocol capability for test-only commands would leak VS Code
+ * interaction concerns back into the Agent backend contract.
+ */
+const OPENCODE_DIAGNOSTIC_COMMANDS = new Set([
+  'test-external-edit-e2e',
+  'test-stream-latency',
+]);
+
+function requireOpenCodeDiagnostic(
+  command: string,
+  ctx: BackendContext,
+  stream: vscode.ChatResponseStream,
+): boolean {
+  if (ctx.id === 'opencode' || !OPENCODE_DIAGNOSTIC_COMMANDS.has(command)) {return true;}
+  stream.markdown(
+    `/${command} is only available for the OpenCode backend. ` +
+    `Use a chat target backed by OpenCode to run this diagnostic.\n`,
+  );
+  return false;
+}
+
+export function diagnosticPermissionResponse(
+  matchesTarget: boolean,
+  allowChoice: string | undefined,
+): 'once' | 'reject' {
+  return matchesTarget && allowChoice === 'Allow Once' ? 'once' : 'reject';
+}
 
 // Minimal inline tracker for diagnostic commands (replaces deleted ExternalEditTracker)
 class DiagnosticEditTracker {
-  private _edits = new Map<string, { resolve: () => void; onDidComplete: Thenable<string> }>();
+  private _edits = new Map<string, {
+    resolve: () => void;
+    complete: () => void;
+    onDidComplete: Thenable<string>;
+  }>();
   hasEdit(key: string) { return this._edits.has(key); }
   isTrackingAny(_uris: unknown[]) { return this._edits.size > 0; }
   trackEdit(key: string, uris: vscode.Uri[], stream: unknown): Promise<void> {
     const s = stream as { externalEdit?: (t: unknown, cb: () => Thenable<unknown>) => Thenable<string> };
-    if (!s.externalEdit) return Promise.resolve();
+    if (!s.externalEdit) {return Promise.resolve();}
     return new Promise(resolve => {
       let r: () => void = () => {};
       const deferred = new Promise<void>(res => { r = res; });
       const cb = async () => { resolve(); await deferred; };
-      this._edits.set(key, { resolve: r, onDidComplete: s.externalEdit!(uris, cb) });
+      this._edits.set(key, {
+        resolve: r,
+        complete: resolve,
+        onDidComplete: s.externalEdit!(uris, cb),
+      });
     });
   }
   completeEdit(key: string): Thenable<string> | undefined {
     const e = this._edits.get(key);
-    if (!e) return undefined;
+    if (!e) {return undefined;}
     this._edits.delete(key);
     e.resolve();
     return e.onDidComplete;
   }
-  dispose() { for (const e of this._edits.values()) e.resolve(); this._edits.clear(); }
+  dispose() {
+    for (const e of this._edits.values()) {
+      e.resolve();
+      e.complete();
+    }
+    this._edits.clear();
+  }
 }
 
 function unwrapOpenCodeEvent(rawEvent: unknown): OpenCodeEvent | undefined {
-  if (!rawEvent || typeof rawEvent !== 'object') return undefined;
+  if (!rawEvent || typeof rawEvent !== 'object') {return undefined;}
   const maybeEnvelope = rawEvent as Partial<OpenCodeStreamEvent> & { payload?: OpenCodeEvent };
-  if (maybeEnvelope.payload) return maybeEnvelope.payload;
+  if (maybeEnvelope.payload) {return maybeEnvelope.payload;}
   if (typeof (rawEvent as { type?: unknown }).type === 'string') {
     return rawEvent as OpenCodeEvent;
   }
@@ -58,34 +103,196 @@ function unwrapOpenCodeEvent(rawEvent: unknown): OpenCodeEvent | undefined {
 async function* readOpenCodeEvents(stream: AsyncIterable<unknown>): AsyncIterable<OpenCodeEvent> {
   for await (const rawEvent of stream) {
     const event = unwrapOpenCodeEvent(rawEvent);
-    if (event) yield event;
+    if (event) {yield event;}
+  }
+}
+
+/**
+ * Diagnostic commands deliberately use disposable backend sessions.  A
+ * broken transport must not keep a chat request (or the extension host)
+ * waiting forever while those resources are being released.
+ */
+const DIAGNOSTIC_COLLECTION_TIMEOUT_MS = 120_000;
+const DIAGNOSTIC_OPERATION_TIMEOUT_MS = 2_000;
+
+type DiagnosticOperationSettlement<T> =
+  | { status: 'fulfilled'; value: T }
+  | { status: 'rejected' | 'timeout' };
+
+async function settleDiagnosticOperation<T>(
+  operationFactory: () => PromiseLike<T> | T,
+  timeoutMs: number,
+  logger: { appendLine(message: string): void } | undefined,
+  label: string,
+): Promise<DiagnosticOperationSettlement<T>> {
+  // Attach the rejection handler immediately and keep it attached after a
+  // timeout wins. This prevents a late backend rejection from becoming an
+  // unhandled promise rejection.
+  const operation = Promise.resolve().then(operationFactory);
+  let timedOut = false;
+  const observed = operation.then(
+    result => {
+      if (result && typeof result === 'object' && 'error' in result) {
+        const error = (result as { error?: unknown }).error;
+        if (error !== undefined) {
+          logger?.appendLine(`[commands] ${label} returned an error: ${String(error)}`);
+        }
+      }
+      return { status: 'fulfilled' as const, value: result };
+    },
+    error => {
+      logger?.appendLine(
+        `[commands] ${label} failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return { status: 'rejected' as const };
+    },
+  );
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const result = await Promise.race<DiagnosticOperationSettlement<T>>([
+      observed,
+      new Promise<DiagnosticOperationSettlement<T>>(resolve => {
+        timer = setTimeout(() => {
+          timedOut = true;
+          logger?.appendLine(`[commands] ${label} timed out after ${timeoutMs}ms`);
+          resolve({ status: 'timeout' });
+        }, timeoutMs);
+      }),
+    ]);
+    return timedOut ? { status: 'timeout' } : result;
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  }
+}
+
+function observeDiagnosticCancellation(token: vscode.CancellationToken): {
+  promise: Promise<void>;
+  dispose: () => void;
+} {
+  let resolveCancellation!: () => void;
+  let disposed = false;
+  let subscription: { dispose(): void } | undefined;
+  const promise = new Promise<void>(resolve => {
+    resolveCancellation = () => {
+      if (!disposed) {resolve();}
+    };
+    if (token.isCancellationRequested) {
+      resolveCancellation();
+      return;
+    }
+    try {
+      subscription = token.onCancellationRequested(() => resolveCancellation());
+    } catch {
+      // Some test/runtime hosts expose only the boolean cancellation flag.
+    }
+  });
+  return {
+    promise,
+    dispose: () => {
+      disposed = true;
+      try { subscription?.dispose(); } catch { /* best effort */ }
+    },
+  };
+}
+
+async function cleanupDiagnosticSession(
+  ctx: BackendContext,
+  sessionId: string,
+  directory: string | undefined,
+  options: {
+    streamOpened: boolean;
+    abort: boolean;
+    promptPromise?: PromiseLike<unknown>;
+    collectorPromise?: PromiseLike<unknown>;
+    logger?: { appendLine(message: string): void };
+  },
+): Promise<void> {
+  // Closing the channel first wakes the normal broker iterator. Abort then
+  // stops backend work, after which prompt/collector promises are drained for
+  // a bounded period before the disposable session is deleted/released.
+  if (options.streamOpened) {
+    try {
+      ctx.backend.events.closeSessionStream(sessionId);
+    } catch (error) {
+      options.logger?.appendLine(
+        `[commands] close session stream failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  if (options.abort) {
+    await settleDiagnosticOperation(
+      () => ctx.backend.sessions.abort(sessionId, directory),
+      DIAGNOSTIC_OPERATION_TIMEOUT_MS,
+      options.logger,
+      `abort session ${sessionId}`,
+    );
+  }
+
+  if (options.collectorPromise) {
+    await settleDiagnosticOperation(
+      () => options.collectorPromise!,
+      DIAGNOSTIC_OPERATION_TIMEOUT_MS,
+      options.logger,
+      `drain event collector ${sessionId}`,
+    );
+  }
+  if (options.promptPromise) {
+    await settleDiagnosticOperation(
+      () => options.promptPromise!,
+      DIAGNOSTIC_OPERATION_TIMEOUT_MS,
+      options.logger,
+      `drain prompt ${sessionId}`,
+    );
+  }
+
+  if (ctx.backend.sessions.delete) {
+    await settleDiagnosticOperation(
+      () => ctx.backend.sessions.delete!(sessionId, directory),
+      DIAGNOSTIC_OPERATION_TIMEOUT_MS,
+      options.logger,
+      `delete session ${sessionId}`,
+    );
+  }
+  if (typeof ctx.backend.sessions.release === 'function') {
+    await settleDiagnosticOperation(
+      () => ctx.backend.sessions.release(sessionId, directory),
+      DIAGNOSTIC_OPERATION_TIMEOUT_MS,
+      options.logger,
+      `release session ${sessionId}`,
+    );
   }
 }
 
 export async function routeCommand(
   command: string,
   state: ExtensionState,
+  ctx: BackendContext,
   stream: vscode.ChatResponseStream,
   _token: vscode.CancellationToken,
 ): Promise<vscode.ChatResult> {
   switch (command.toLowerCase()) {
     case 'new':
-      await handleNewCommand(state, stream);
+      await handleNewCommand(state, ctx, stream);
       break;
     case 'help':
-      handleHelpCommand(stream);
+      handleHelpCommand(ctx, stream);
       break;
     case 'model':
-      await handleModelCommand(state, stream);
+      await handleModelCommand(state, ctx, stream);
       break;
     case 'test-external-edit':
-      await handleTestExternalEditCommand(state, stream, _token);
+      await handleTestExternalEditCommand(state, ctx, stream, _token);
       break;
     case 'test-external-edit-real':
-      await handleTestExternalEditRealCommand(state, stream, _token);
+      await handleTestExternalEditRealCommand(state, ctx, stream, _token);
       break;
     case 'test-external-edit-e2e':
-      await handleTestExternalEditE2ECommand(state, stream, _token);
+      if (!requireOpenCodeDiagnostic(command.toLowerCase(), ctx, stream)) {break;}
+      await handleTestExternalEditE2ECommand(state, ctx, stream, _token);
       break;
     case 'test-subagent-single-blocking':
       await handleTestSubagentSingleBlockingCommand(stream, _token);
@@ -103,7 +310,8 @@ export async function routeCommand(
       await handleTestFileReadStreamCommand(stream, _token);
       break;
     case 'test-stream-latency':
-      await handleTestStreamLatencyCommand(state, stream, _token);
+      if (!requireOpenCodeDiagnostic(command.toLowerCase(), ctx, stream)) {break;}
+      await handleTestStreamLatencyCommand(state, ctx, stream, _token);
       break;
     case 'test-thinking':
       await handleTestThinkingCommand(stream, _token);
@@ -121,12 +329,13 @@ export async function routeCommand(
 
 async function handleNewCommand(
   state: ExtensionState,
+  ctx: BackendContext,
   stream: vscode.ChatResponseStream,
 ): Promise<void> {
-  const ready = await ensureServer(state, stream);
+  const ready = await ensureServer(state, ctx, stream);
   if (!ready) {return;}
   try {
-    const result = await state.backend.sessions.create();
+    const result = await ctx.backend.sessions.create();
     const sessionId = result.data?.id;
     if (!sessionId) {
       throw new Error('Session not created');
@@ -138,39 +347,47 @@ async function handleNewCommand(
   }
 }
 
-function handleHelpCommand(stream: vscode.ChatResponseStream): void {
-  stream.markdown(
-    [
-      '## Available Commands',
-      '',
-      '- **/new** — Start a new conversation session',
-      '- **/help** — Show this help message',
-      '- **/model** — Show the current active model',
-      '- **/test-external-edit** — Test externalEdit bubble push (VSCode API)',
-      '- **/test-external-edit-real** — Test externalEdit with direct disk write (simulates server)',
-      '- **/test-external-edit-e2e** — End-to-end test via real OpenCode prompt',
-      '- **/test-subagent-single-blocking** — Single subagent, blocking',
-      '- **/test-subagent-multi-blocking** — Multi subagent, sequential blocking',
-      '- **/test-subagent-single-parallel** — Single subagent, parallel/callback',
-      '- **/test-subagent-multi-parallel** — Multi subagent, all parallel',
-      '- **/test-file-read-stream** — Run file-bubble lifecycle experiment matrix',
-      '- **/test-stream-latency** — Measure streaming delta latency from backend (batch detection + timing)',
-      '- **/test-thinking** — Diagnostic: verify thinkingProgress API and reasoning/text boundary rendering',
-      '- **/test-question** — Test questionCarousel UI flow',
-      '',
-      'Just type your message to chat with OpenCode!',
-    ].join('\n'),
-  );
+function handleHelpCommand(ctx: BackendContext, stream: vscode.ChatResponseStream): void {
+  const backendName = ctx.displayName;
+  const lines = [
+    '## Available Commands',
+    '',
+    '- **/new** — Start a new conversation session',
+    '- **/help** — Show this help message',
+    '- **/model** — Show the current active model',
+    '- **/test-external-edit** — Test externalEdit bubble push (VSCode API)',
+    '- **/test-external-edit-real** — Test externalEdit with direct disk write (simulates server)',
+    ...(ctx.id === 'opencode'
+      ? [
+          `- **/test-external-edit-e2e** — End-to-end test via real ${backendName} prompt`,
+        ]
+      : []),
+    '- **/test-subagent-single-blocking** — Single subagent, blocking',
+    '- **/test-subagent-multi-blocking** — Multi subagent, sequential blocking',
+    '- **/test-subagent-single-parallel** — Single subagent, parallel/callback',
+    '- **/test-subagent-multi-parallel** — Multi subagent, all parallel',
+    '- **/test-file-read-stream** — Run file-bubble lifecycle experiment matrix',
+    ...(ctx.id === 'opencode'
+      ? [
+          '- **/test-stream-latency** — Measure streaming delta latency from backend (batch detection + timing)',
+        ]
+      : []),
+    '- **/test-thinking** — Diagnostic: verify thinkingProgress API and reasoning/text boundary rendering',
+    '- **/test-question** — Test questionCarousel UI flow',
+  ];
+  lines.push('', `Just type your message to chat with ${backendName}!`);
+  stream.markdown(lines.join('\n'));
 }
 
 async function handleModelCommand(
   state: ExtensionState,
+  ctx: BackendContext,
   stream: vscode.ChatResponseStream,
 ): Promise<void> {
-  const ready = await ensureServer(state, stream);
+  const ready = await ensureServer(state, ctx, stream);
   if (!ready) {return;}
   try {
-    const modelsResp = await state.backend.config.models();
+    const modelsResp = await ctx.backend.config.models();
     const modelList = modelsResp.data ?? [];
     if (modelList.length > 0) {
       const lines: string[] = ['## Available Models', ''];
@@ -205,8 +422,9 @@ async function handleModelCommand(
  */
 async function handleTestExternalEditCommand(
   state: ExtensionState,
+  _ctx: BackendContext,
   stream: vscode.ChatResponseStream,
-  token: vscode.CancellationToken,
+  _token: vscode.CancellationToken,
 ): Promise<void> {
   const workspaceFolders = vscode.workspace.workspaceFolders;
   if (!workspaceFolders?.length) {
@@ -284,7 +502,6 @@ async function handleTestExternalEditCommand(
 /** Read file content from disk via Node fs (bypasses VSCode entry model) */
 function readDiskContent(fsPath: string): string {
   try {
-    const { readFileSync } = require('fs') as typeof import('fs');
     return readFileSync(fsPath, 'utf-8');
   } catch {
     return '(read failed)';
@@ -307,26 +524,39 @@ function readVscodeModelContent(uri: vscode.Uri): string {
 function waitForVscodeFileChange(uri: vscode.Uri, timeoutMs: number): Promise<boolean> {
   return new Promise((resolve) => {
     let settled = false;
+    let fsWatcher: vscode.FileSystemWatcher | undefined;
+    let sub: { dispose(): void } | undefined;
 
     const done = (result: boolean) => {
       if (settled) {return;}
       settled = true;
       clearTimeout(timer);
-      sub.dispose();
+      sub?.dispose();
+      fsWatcher?.dispose();
       resolve(result);
     };
 
     const timer = setTimeout(() => { done(false); }, timeoutMs);
 
-    const sub = vscode.workspace.onDidChangeTextDocument((e) => {
-      if (e.document.uri.toString() === uri.toString()) {
-        done(true);
-      }
-    });
+    try {
+      sub = vscode.workspace.onDidChangeTextDocument((e) => {
+        if (e.document.uri.toString() === uri.toString()) {
+          done(true);
+        }
+      });
+    } catch {
+      done(false);
+      return;
+    }
 
     // Also watch for file system changes (file may not be open as text doc)
-    const fsWatcher = vscode.workspace.createFileSystemWatcher(uri.fsPath);
-    fsWatcher.onDidChange(() => { done(true); });
+    try {
+      fsWatcher = vscode.workspace.createFileSystemWatcher(uri.fsPath);
+      fsWatcher.onDidChange(() => { done(true); });
+    } catch {
+      // A host without file-system watcher support can still use the text
+      // document event and the timeout fallback above.
+    }
   });
 }
 
@@ -346,6 +576,7 @@ function waitForVscodeFileChange(uri: vscode.Uri, timeoutMs: number): Promise<bo
  */
 async function handleTestExternalEditRealCommand(
   state: ExtensionState,
+  _ctx: BackendContext,
   stream: vscode.ChatResponseStream,
   token: vscode.CancellationToken,
 ): Promise<void> {
@@ -481,11 +712,21 @@ async function handleTestExternalEditRealCommand(
       if (delayMs > 0) {
         roundStream.markdown(`4️⃣ Waiting ${delayMs}ms for VSCode file watcher...\n\n`);
         await new Promise<void>((resolve) => {
-          const timer = setTimeout(resolve, delayMs);
-          token.onCancellationRequested(() => {
+          let settled = false;
+          let disposeCancellation = () => {};
+          const finish = () => {
+            if (settled) {return;}
+            settled = true;
             clearTimeout(timer);
+            disposeCancellation();
             resolve();
-          });
+          };
+          const timer = setTimeout(finish, delayMs);
+          // Register after `finish` exists so a synchronous cancellation
+          // callback from a host/test token is also handled safely.
+          const cancellationSubscription = token.onCancellationRequested(finish);
+          disposeCancellation = () => cancellationSubscription.dispose();
+          if (settled) {disposeCancellation();}
         });
 
         const vscodeAfterWait = readVscodeModelContent(uri);
@@ -587,6 +828,7 @@ async function handleTestExternalEditRealCommand(
 
 async function handleTestExternalEditE2ECommand(
   state: ExtensionState,
+  ctx: BackendContext,
   stream: vscode.ChatResponseStream,
   token: vscode.CancellationToken,
 ): Promise<void> {
@@ -596,198 +838,274 @@ async function handleTestExternalEditE2ECommand(
     return;
   }
 
-  // 1. Start server
-  stream.markdown('🧪 **E2E Test: real OpenCode prompt → file edit → externalEdit**\n\n');
-  stream.markdown('1️⃣ Starting OpenCode server...\n\n');
-  const ready = await ensureServer(state, stream);
-  if (!ready) {return;}
   const directory = workspaceFolders[0].uri.fsPath;
-
-  // 2. Create temp file for the edit target
   const tmpUri = vscode.Uri.joinPath(workspaceFolders[0].uri, `.e2e-edit-target-${Date.now()}.txt`);
   const tmpPath = tmpUri.fsPath;
-  const originalContent = 'hello world';
-  writeFileSync(tmpPath, originalContent, 'utf-8');
-  stream.markdown(`2️⃣ Created test file: \`${tmpPath}\`\n\n`);
-
-  // 3. Create session
-  stream.markdown('3️⃣ Creating session...\n\n');
-  let sessionId: string;
-  try {
-      const sessionResp = await state.backend.sessions.create({ directory });
-      sessionId = sessionResp.data?.id ?? '';
-    if (!sessionId) {throw new Error('empty session id');}
-    stream.markdown(`   Session: \`${sessionId}\`\n\n`);
-  } catch (err) {
-    stream.markdown(`❌ Failed to create session: ${err}\n\n`);
-    try { unlinkSync(tmpPath); } catch { /* best effort */ }
-    return;
-  }
-
   const tracker = new DiagnosticEditTracker();
   const editKey = `ask-${Date.now()}`;
+  const cancellation = observeDiagnosticCancellation(token);
+  let sessionId: string | undefined;
+  let eventStream: BackendEventStream<OpenCodeStreamEvent> | undefined;
+  let streamOpened = false;
+  let promptPromise: PromiseLike<unknown> | undefined;
+  let promptCompleted = false;
+  let promptFailed = false;
+  let collectorPromise: PromiseLike<unknown> | undefined;
+  let collectorCompleted = false;
+  let abortSession = false;
   let baselineCaptured = false;
   let editComplete = false;
   let undoStopId = '';
-
-  // 4. Subscribe to SSE + send prompt
-  stream.markdown('4️⃣ Subscribing to SSE and sending prompt...\n\n');
-
-  const prompt = `Edit the file ${tmpPath}: replace "hello world" with "hello e2e test". Do not add any other text.`;
-  state.outputChannel.appendLine(`[e2e] Prompt: ${prompt}`);
-
-  let eventStream: import('../acp/backend').AcpEventStream;
-  try {
-    await state.backend.events.ensureStarted();
-    eventStream = state.backend.events.openSessionStream(sessionId);
-  } catch (err) {
-    stream.markdown(`❌ Failed to subscribe to events: ${err}\n\n`);
-    try { unlinkSync(tmpPath); } catch { /* best effort */ }
-    tracker.dispose();
-    return;
-  }
-
-  // Send prompt (fire and don't await)
-  const promptPromise = state.backend.sessions.prompt(sessionId, prompt, directory).catch((err: unknown) => {
-    state.outputChannel.appendLine(`[e2e] Prompt error: ${err}`);
-  });
-
-  // 5. Process SSE events
-  stream.markdown('5️⃣ Processing SSE event stream...\n\n');
-  stream.markdown('```\n');
-
   let eventCount = 0;
   let permissionAskedCount = 0;
   let toolCompletedCount = 0;
   let editCallID = '';
 
   try {
-    for await (const evt of readOpenCodeEvents(eventStream.stream)) {
-      if (token.isCancellationRequested) {break;}
-      eventCount++;
-      const evtType = evt.type;
+    // 1. Start server and create the temporary edit target.
+    stream.markdown('🧪 **E2E Test: real OpenCode prompt → file edit → externalEdit**\n\n');
+    stream.markdown('1️⃣ Starting OpenCode server...\n\n');
+    const ready = await ensureServer(state, ctx, stream);
+    if (!ready) {return;}
 
-      if (evtType === 'permission.asked') {
-        const properties = (evt as PermissionAskedEvent).properties;
-        permissionAskedCount++;
-        const callID = properties.tool?.callID ?? '';
-        const filepath = properties.metadata?.filepath ?? '';
-        stream.markdown(
-          `[${eventCount}] 🔐 permission.asked id=${properties.id ?? '?'} ` +
-          `callID=${callID || '(empty)'} ` +
-          `filepath=${filepath || '(empty)'}\n`,
-        );
-        // If filepath matches target, parallel trackEdit + "once"
-        if (typeof filepath === 'string' && filepath?.toLowerCase() === tmpPath?.toLowerCase()) {
-          editCallID = callID;
-          stream.markdown(`     🎯 Matched target file — parallel trackEdit + "once"\n`);
-          await Promise.all([
-            tracker.trackEdit(editKey, [tmpUri], stream).then(() => {
-              baselineCaptured = true;
-              stream.markdown(`     ✅ trackEdit resolved — baseline captured\n`);
-            }).catch((err: unknown) => {
-              stream.markdown(`     ❌ trackEdit error: ${err}\n`);
-            }),
-            (async () => {
-              if (properties.sessionID && properties.id) {
-                try {
-                  await state.backend.permissions.reply(properties.sessionID, properties.id, 'once', directory);
-                  stream.markdown(`     ✅ Replied "once"\n`);
-                } catch (err) {
-                  stream.markdown(`     ❌ Reply failed: ${err}\n`);
-                }
-              }
-            })(),
-          ]);
-        } else if (properties.sessionID && properties.id) {
-          // Non-matching filepath — just reply "once"
-          try {
-            await state.backend.permissions.reply(properties.sessionID, properties.id, 'once', directory);
-            stream.markdown(`     ✅ Replied "once"\n`);
-          } catch (err) {
-            stream.markdown(`     ❌ Reply failed: ${err}\n`);
-          }
+    writeFileSync(tmpPath, 'hello world', 'utf-8');
+    stream.markdown(`2️⃣ Created test file: \`${tmpPath}\`\n\n`);
+
+    // 2. Create a disposable backend session. Keep the id before checking the
+    // result so a malformed response can still be cleaned up in finally.
+    stream.markdown('3️⃣ Creating session...\n\n');
+    const sessionResp = await ctx.backend.sessions.create({ directory });
+    sessionId = sessionResp.data?.id;
+    if (sessionResp.error || !sessionId) {
+      throw new Error(String(sessionResp.error ?? 'empty session id'));
+    }
+    stream.markdown(`   Session: \`${sessionId}\`\n\n`);
+
+    // 3. Subscribe before firing the prompt. The prompt is observed from the
+    // moment it is created so a fast rejection cannot become unhandled.
+    stream.markdown('4️⃣ Subscribing to SSE and sending prompt...\n\n');
+    const prompt = `Edit the file ${tmpPath}: replace "hello world" with "hello e2e test". Do not add any other text.`;
+    state.outputChannel.appendLine(`[e2e] Prompt: ${prompt}`);
+    await ctx.backend.events.ensureStarted();
+    eventStream = ctx.backend.events.openSessionStream(sessionId) as BackendEventStream<OpenCodeStreamEvent>;
+    streamOpened = true;
+    promptPromise = Promise.resolve()
+      .then(() => ctx.backend.sessions.prompt(sessionId!, prompt, directory))
+      .then(result => {
+        promptCompleted = true;
+        if (result && typeof result === 'object' && 'error' in result
+            && (result as { error?: unknown }).error !== undefined) {
+          promptFailed = true;
+          state.outputChannel.appendLine(`[e2e] Prompt error: ${String((result as { error?: unknown }).error)}`);
         }
-      } else if (evtType === 'message.part.updated') {
-        const part = evt.properties.part;
-        if (part?.type === 'tool' && part?.state?.status === 'completed') {
-          toolCompletedCount++;
-          const toolCallID = part.callID ?? part.id ?? '';
+        return result;
+      }, err => {
+        promptCompleted = true;
+        promptFailed = true;
+        state.outputChannel.appendLine(`[e2e] Prompt error: ${err instanceof Error ? err.message : String(err)}`);
+        return undefined;
+      });
+
+    // 4. Process events, but never let a dead backend hold the request open.
+    stream.markdown('5️⃣ Processing SSE event stream...\n\n');
+    stream.markdown('```\n');
+    const collect = async (): Promise<void> => {
+      for await (const evt of readOpenCodeEvents(eventStream!.stream)) {
+        if (token.isCancellationRequested) {
+          abortSession = true;
+          break;
+        }
+        eventCount++;
+        const evtType = evt.type;
+
+        if (evtType === 'permission.asked') {
+          const properties = (evt as PermissionAskedEvent).properties;
+          permissionAskedCount++;
+          const callID = properties.tool?.callID ?? '';
+          const filepath = properties.metadata.filepath;
           stream.markdown(
-            `[${eventCount}] 🔧 tool completed: ${part.tool ?? '?'} callID=${toolCallID}\n`,
+            `[${eventCount}] 🔐 permission.asked id=${properties.id ?? '?'} ` +
+            `callID=${callID || '(empty)'} ` +
+            `filepath=${filepath || '(empty)'}\n`,
           );
-          // completeEdit when the matched tool finishes
-          if (baselineCaptured && !editComplete && editCallID && toolCallID === editCallID) {
-            const result = tracker.completeEdit(editKey);
-            if (result) {
-              undoStopId = (await result) || '';
-              editComplete = true;
-              stream.markdown(`     ✅ completeEdit at tool.completed — undoStopId: \`${undoStopId || '(empty)'}\`\n`);
-            } else {
-              stream.markdown(`     ⚠️ completeEdit returned undefined\n`);
+          const matchesTarget = filepath?.toLowerCase() === tmpPath.toLowerCase();
+          const allowChoice = matchesTarget
+            ? await Promise.race([
+                vscode.window.showWarningMessage(
+                  `ACP backend requests permission to edit ${filepath}.`,
+                  { modal: true, detail: 'This diagnostic command will continue only after an explicit decision.' },
+                  'Allow Once',
+                ),
+                cancellation.promise.then(() => undefined),
+              ])
+            : undefined;
+          if (token.isCancellationRequested) {
+            abortSession = true;
+            break;
+          }
+          const permissionResponse = diagnosticPermissionResponse(matchesTarget, allowChoice);
+          if (!matchesTarget) {
+            stream.markdown('     Unexpected permission path; rejecting automatically.\n');
+          }
+          if (permissionResponse === 'once' && matchesTarget) {
+            editCallID = callID;
+            stream.markdown(`     🎯 Matched target file — parallel trackEdit + "once"\n`);
+            await Promise.all([
+              tracker.trackEdit(editKey, [tmpUri], stream).then(() => {
+                baselineCaptured = true;
+                stream.markdown(`     ✅ trackEdit resolved — baseline captured\n`);
+              }).catch((err: unknown) => {
+                stream.markdown(`     ❌ trackEdit error: ${err}\n`);
+              }),
+              (async () => {
+                if (properties.sessionID && properties.id) {
+                  try {
+                    await ctx.backend.permissions.reply(properties.sessionID, properties.id, permissionResponse, directory);
+                    stream.markdown(`     ✅ Replied "${permissionResponse}"\n`);
+                  } catch (err) {
+                    stream.markdown(`     ❌ Reply failed: ${err}\n`);
+                  }
+                }
+              })(),
+            ]);
+          } else if (properties.sessionID && properties.id) {
+            try {
+              await ctx.backend.permissions.reply(properties.sessionID, properties.id, permissionResponse, directory);
+              stream.markdown(`     ✅ Replied "${permissionResponse}"\n`);
+            } catch (err) {
+              stream.markdown(`     ❌ Reply failed: ${err}\n`);
             }
           }
-        } else if (part?.type === 'tool' && part?.state?.status) {
-          stream.markdown(
-            `[${eventCount}] 🔧 tool ${part.state.status}: ${part.tool ?? '?'}\n`,
-          );
+        } else if (evtType === 'message.part.updated') {
+          const part = evt.properties.part;
+          if (part?.type === 'tool' && part?.state?.status === 'completed') {
+            toolCompletedCount++;
+            const toolCallID = part.callID ?? part.id ?? '';
+            stream.markdown(
+              `[${eventCount}] 🔧 tool completed: ${part.tool ?? '?'} callID=${toolCallID}\n`,
+            );
+            if (baselineCaptured && !editComplete && editCallID && toolCallID === editCallID) {
+              const result = tracker.completeEdit(editKey);
+              if (result) {
+                const completion = await settleDiagnosticOperation<string>(
+                  () => result,
+                  DIAGNOSTIC_OPERATION_TIMEOUT_MS,
+                  state.outputChannel,
+                  `complete edit ${editKey}`,
+                );
+                if (completion.status === 'fulfilled') {
+                  editComplete = true;
+                  undoStopId = completion.value || '';
+                  stream.markdown(
+                    `     ✅ completeEdit at tool.completed resolved — undoStopId: \`${undoStopId || '(empty)'}\`\n`,
+                  );
+                } else {
+                  stream.markdown('     ⚠️ completeEdit did not resolve\n');
+                }
+              } else {
+                stream.markdown(`     ⚠️ completeEdit returned undefined\n`);
+              }
+            }
+          } else if (part?.type === 'tool' && part?.state?.status) {
+            stream.markdown(
+              `[${eventCount}] 🔧 tool ${part.state.status}: ${part.tool ?? '?'}\n`,
+            );
+          }
+        } else if (evtType === 'session.idle') {
+          stream.markdown(`[${eventCount}] ✅ session.idle — turn complete\n`);
+          break;
+        } else if (evtType === 'session.diff') {
+          const diffs = (evt as any).properties?.diff;
+          stream.markdown(`[${eventCount}] 📄 session.diff: ${diffs?.length ?? 0} file(s)\n`);
         }
-      } else if (evtType === 'session.idle') {
-        stream.markdown(`[${eventCount}] ✅ session.idle — turn complete\n`);
-        break;
-      } else if (evtType === 'session.diff') {
-        const diffs = (evt as any).properties?.diff;
-        stream.markdown(`[${eventCount}] 📄 session.diff: ${diffs?.length ?? 0} file(s)\n`);
+      }
+    };
+    collectorPromise = collect().then(() => undefined, err => {
+      stream.markdown(`\n❌ Event stream error: ${err}\n`);
+      abortSession = true;
+    });
+
+    let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+    const timeoutPromise = new Promise<'timeout'>(resolve => {
+      timeoutTimer = setTimeout(() => {
+        abortSession = true;
+        stream.markdown('\n⏱️ **Timeout reached (120s). Stopping collection.**\n');
+        resolve('timeout');
+      }, DIAGNOSTIC_COLLECTION_TIMEOUT_MS);
+    });
+    try {
+      const outcome = await Promise.race([
+        collectorPromise.then(() => 'completed' as const),
+        cancellation.promise.then(() => 'cancelled' as const),
+        timeoutPromise,
+      ]);
+      if (outcome === 'cancelled') {
+        abortSession = true;
+        stream.markdown('\n⏹️ **Cancellation requested. Stopping collection.**\n');
+      } else if (outcome === 'timeout') {
+        abortSession = true;
+      } else {
+        collectorCompleted = true;
+      }
+    } finally {
+      if (timeoutTimer !== undefined) {
+        clearTimeout(timeoutTimer);
       }
     }
+    stream.markdown('```\n\n');
+
+    // 5. Summary is emitted before finally removes the temporary file.
+    const fileContent = existsSync(tmpPath) ? readDiskContent(tmpPath) : '(file deleted)';
+    const fileChanged = fileContent.includes('hello e2e test');
+    stream.markdown([
+      '---\n\n',
+      '### E2E Summary (Ask-time trackEdit + parallel once)\n\n',
+      `| Metric | Value |\n`,
+      `|---|---|\n`,
+      `| Events received | ${eventCount} |\n`,
+      `| permission.asked | ${permissionAskedCount} |\n`,
+      `| tool completed | ${toolCompletedCount} |\n`,
+      `| Baseline captured (at ask) | ${baselineCaptured} |\n`,
+      `| completeEdit (at tool.completed) | ${editComplete} |\n`,
+      `| undoStopId | \`${undoStopId || '(none)'}\` |\n`,
+      `| File changed on disk | ${fileChanged} |\n`,
+      `| File content | \`${fileContent.trim()}\` |\n\n`,
+    ].join(''));
+
+    if (editComplete && undoStopId) {
+      stream.markdown('**✅ Ask-time parallel approach worked!** Check the bubble above for the diff.\n\n');
+    } else if (editComplete && !undoStopId) {
+      stream.markdown(
+        '**⚠️ completeEdit resolved but undoStopId is empty.**\n' +
+        'VSCode may not have captured the diff — file watcher latency?\n\n',
+      );
+    } else if (!baselineCaptured && permissionAskedCount > 0) {
+      stream.markdown('**❌ permission.asked received but trackEdit failed.**\n\n');
+    } else if (permissionAskedCount === 0) {
+      stream.markdown('**⚠️ No `permission.asked` event received.** Check opencode.json `permission.edit` setting.\n\n');
+    }
   } catch (err) {
-    stream.markdown(`\n❌ Event stream error: ${err}\n`);
+    abortSession = true;
+    const msg = err instanceof Error ? err.message : String(err);
+    stream.markdown(`\n❌ **Error:** ${msg}\n`);
+  } finally {
+    cancellation.dispose();
+    // Resolve any pending trackEdit waiters before draining the collector. A
+    // permission dialog may leave the collector suspended inside trackEdit;
+    // disposing the tracker lets the bounded drain finish promptly.
+    tracker.dispose();
+    if (sessionId) {
+      await cleanupDiagnosticSession(ctx, sessionId, directory, {
+        streamOpened,
+        abort: abortSession || token.isCancellationRequested || !collectorCompleted || !promptCompleted || promptFailed,
+        promptPromise,
+        collectorPromise,
+        logger: state.outputChannel,
+      });
+    }
+    try { if (existsSync(tmpPath)) { unlinkSync(tmpPath); } } catch { /* best effort */ }
+    state.outputChannel.appendLine('[commands] test-external-edit-e2e completed');
   }
-
-  stream.markdown('```\n\n');
-
-  // 6. Summary
-  const fileContent = existsSync(tmpPath) ? readDiskContent(tmpPath) : '(file deleted)';
-  const fileChanged = fileContent.includes('hello e2e test');
-
-  stream.markdown([
-    '---\n\n',
-    '### E2E Summary (Ask-time trackEdit + parallel once)\n\n',
-    `| Metric | Value |\n`,
-    `|---|---|\n`,
-    `| Events received | ${eventCount} |\n`,
-    `| permission.asked | ${permissionAskedCount} |\n`,
-    `| tool completed | ${toolCompletedCount} |\n`,
-    `| Baseline captured (at ask) | ${baselineCaptured} |\n`,
-    `| completeEdit (at tool.completed) | ${editComplete} |\n`,
-    `| undoStopId | \`${undoStopId || '(none)'}\` |\n`,
-    `| File changed on disk | ${fileChanged} |\n`,
-    `| File content | \`${fileContent.trim()}\` |\n\n`,
-  ].join(''));
-
-  if (editComplete && undoStopId) {
-    stream.markdown('**✅ Ask-time parallel approach worked!** Check the bubble above for the diff.\n\n');
-  } else if (editComplete && !undoStopId) {
-    stream.markdown(
-      '**⚠️ completeEdit resolved but undoStopId is empty.**\n' +
-      'VSCode may not have captured the diff — file watcher latency?\n\n',
-    );
-  } else if (!baselineCaptured && permissionAskedCount > 0) {
-    stream.markdown(
-      '**❌ permission.asked received but trackEdit failed.**\n\n',
-    );
-  } else if (permissionAskedCount === 0) {
-    stream.markdown(
-      '**⚠️ No `permission.asked` event received.** Check opencode.json `permission.edit` setting.\n\n',
-    );
-  }
-
-  // Cleanup
-  state.backend.events.closeSessionStream(sessionId);
-  try { if (existsSync(tmpPath)) { unlinkSync(tmpPath); } } catch { /* best effort */ }
-  tracker.dispose();
-
-  state.outputChannel.appendLine('[commands] test-external-edit-e2e completed');
 }
 
 // ---------------------------------------------------------------------------
@@ -822,44 +1140,6 @@ function checkSubagentApi(stream: vscode.ChatResponseStream): Stream | null {
   return s;
 }
 
-function pushProgressiveCard(
-  stream: Stream, callId: string, toolName: string, invocationMessage: string,
-): void {
-  if (VS.ChatToolInvocationPart && (stream as any).push) {
-    const part: ChatToolInvocationPart = new VS.ChatToolInvocationPart(toolName, callId);
-    (part as any).enablePartialUpdate = true;
-    part.isComplete = false;
-    part.invocationMessage = invocationMessage;
-    (stream as any).push(part);
-  }
-}
-
-function pushSubagentCard(
-  stream: Stream,
-  callId: string,
-  agentName: string,
-  description: string,
-  prompt: string,
-  result: string,
-  subAgentInvocationId: string,
-  invocationMessage: string,
-  pastTenseMessage: string,
-): void {
-  if (VS.ChatToolInvocationPart && (stream as any).push) {
-    const part: ChatToolInvocationPart = new VS.ChatToolInvocationPart('task', callId);
-    (part as any).enablePartialUpdate = true;
-    (part as any).subAgentInvocationId = subAgentInvocationId;
-    part.isComplete = true;
-    part.isError = false;
-    part.invocationMessage = invocationMessage;
-    part.pastTenseMessage = pastTenseMessage;
-    if (VS.ChatSubagentToolInvocationData) {
-      part.toolSpecificData = new VS.ChatSubagentToolInvocationData(description, agentName, prompt, result);
-    }
-    (stream as any).push(part);
-  }
-}
-
 function pushChildTool(
   stream: Stream,
   callId: string,
@@ -880,47 +1160,6 @@ function pushChildTool(
     if (toolSpecificData) {
       (part as any).toolSpecificData = toolSpecificData;
     }
-    (stream as any).push(part);
-  }
-}
-
-function updateSubagentProgress(stream: Stream, callId: string, message: string): void {
-  if (stream.updateToolInvocation) {
-    try { stream.updateToolInvocation(callId, { invocationMessage: message }); } catch { /* best-effort */ }
-  }
-}
-
-/**
- * Push a "result" tool card INSIDE the subagent card (with subAgentInvocationId).
- * This simulates how Copilot shows the agent's final result as a tool inside the expandable card.
- */
-function pushResultTool(
-  stream: Stream,
-  subagentInvocationId: string,
-  resultText: string,
-): void {
-  const resultCallId = `result_${uid()}`;
-  const toolName = 'result';
-
-  // Register as child of subagent
-  if (stream.beginToolInvocation) {
-    stream.beginToolInvocation(resultCallId, toolName, {
-      subagentInvocationId,
-    });
-  }
-
-  // Push completed result card grouped under the subagent
-  if (VS.ChatToolInvocationPart && (stream as any).push) {
-    const part: ChatToolInvocationPart = new VS.ChatToolInvocationPart(toolName, resultCallId);
-    (part as any).subAgentInvocationId = subagentInvocationId;
-    part.isComplete = true;
-    part.isError = false;
-    part.invocationMessage = resultText;
-    // Render as collapsible input/output block (ChatSimpleToolResultData)
-    (part as any).toolSpecificData = {
-      input: 'subagent execution',
-      output: resultText,
-    } satisfies ChatSimpleToolResultData;
     (stream as any).push(part);
   }
 }
@@ -1381,7 +1620,7 @@ async function handleTestFileReadStreamCommand(
 
   const bubbleMarkdown = (startLine?: number, endLine?: number): vscode.MarkdownString => {
     const uri = lowerCaseFileUri(tmpUri).toString();
-    const range = startLine != null && endLine != null ? `#${startLine}-${endLine}` : '';
+    const range = startLine !== undefined && endLine !== undefined ? `#${startLine}-${endLine}` : '';
     return new vscode.MarkdownString(`Read [](${uri}${range})`);
   };
 
@@ -1580,10 +1819,11 @@ interface DeltaTiming {
  */
 async function handleTestStreamLatencyCommand(
   state: ExtensionState,
+  ctx: BackendContext,
   stream: vscode.ChatResponseStream,
   token: vscode.CancellationToken,
 ): Promise<void> {
-  const ready = await ensureServer(state, stream);
+  const ready = await ensureServer(state, ctx, stream);
   if (!ready) {return;}
 
   // The prompt must trigger a long reasoning/thinking response.
@@ -1612,42 +1852,57 @@ async function handleTestStreamLatencyCommand(
   const perfNow = () => performance.now();
   const allEvents: { ts: number; type: string }[] = [];
   const deltas: DeltaTiming[] = [];
+  const cancellation = observeDiagnosticCancellation(token);
+  let sessionId: string | undefined;
+  let eventStream: BackendEventStream<OpenCodeStreamEvent> | undefined;
+  let streamOpened = false;
+  let promptPromise: PromiseLike<unknown> | undefined;
+  let promptCompleted = false;
+  let promptFailed = false;
+  let collectPromise: PromiseLike<unknown> | undefined;
+  let collectorCompleted = false;
+  let abortSession = false;
 
   try {
     stream.markdown('## 🔬 Streaming Latency Diagnostic\n\n');
     stream.progress('Creating session...');
 
     // 1. Create a new session
-    const sessionResult = await state.backend.sessions.create({
+    const sessionResult = await ctx.backend.sessions.create({
       title: 'stream-latency-test',
     });
     if (sessionResult.error || !sessionResult.data) {
       stream.markdown(`❌ Failed to create session: ${sessionResult.error ?? 'unknown'}\n`);
       return;
     }
-    const sessionId = sessionResult.data.id;
+    sessionId = sessionResult.data.id;
     stream.markdown(`- Session: \`${sessionId.slice(0, 12)}...\`\n`);
 
     // 2. Subscribe to global events
     stream.progress('Subscribing to event stream...');
-    await state.backend.events.ensureStarted();
+    await ctx.backend.events.ensureStarted();
 
     // 3. Open per-session stream
-    const eventStream = state.backend.events.openSessionStream(sessionId);
+    eventStream = ctx.backend.events.openSessionStream(sessionId) as BackendEventStream<OpenCodeStreamEvent>;
+    streamOpened = true;
 
     // 4. Fire the prompt (non-blocking)
     stream.progress('Sending thinking prompt...');
     const promptStart = perfNow();
-    const promptPromise = state.backend.sessions
+    promptPromise = ctx.backend.sessions
       .prompt(sessionId, THINKING_PROMPT)
       .then((result: { error?: unknown; data?: unknown }) => {
+        promptCompleted = true;
         if (result.error) {
+          promptFailed = true;
           state.outputChannel.appendLine(
             `[stream-latency] Prompt error: ${String(result.error)}`,
           );
         }
       })
       .catch((err: unknown) => {
+        promptCompleted = true;
+        promptFailed = true;
         state.outputChannel.appendLine(
           `[stream-latency] Prompt exception: ${err instanceof Error ? err.message : String(err)}`,
         );
@@ -1668,16 +1923,8 @@ async function handleTestStreamLatencyCommand(
     const eventTypes = new Map<string, number>();
 
     // Timeout safety: 120s max
-    const TIMEOUT_MS = 120_000;
-    const timeoutPromise = new Promise<void>((resolve) => {
-      setTimeout(() => {
-        stream.markdown('\n⏱️ **Timeout reached (120s). Stopping collection.**\n');
-        resolve();
-      }, TIMEOUT_MS);
-    });
-
-    const collectPromise = (async () => {
-      for await (const event of readOpenCodeEvents(eventStream.stream)) {
+    collectPromise = (async () => {
+      for await (const event of readOpenCodeEvents(eventStream!.stream)) {
         if (token.isCancellationRequested) {break;}
 
         const now = perfNow();
@@ -1721,14 +1968,35 @@ async function handleTestStreamLatencyCommand(
       }
     })();
 
-    // Race between collection and timeout
-    await Promise.race([collectPromise, timeoutPromise]);
-
-    // Ensure prompt settles
-    await promptPromise;
-
-    // Close the stream
-    state.backend.events.closeSessionStream(sessionId);
+    // Race collection against cancellation and a bounded timeout. The
+    // collector itself is drained in finally after the channel is closed.
+    let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+    const timeoutPromise = new Promise<'timeout'>(resolve => {
+      timeoutTimer = setTimeout(() => {
+        abortSession = true;
+        stream.markdown('\n⏱️ **Timeout reached (120s). Stopping collection.**\n');
+        resolve('timeout');
+      }, DIAGNOSTIC_COLLECTION_TIMEOUT_MS);
+    });
+    try {
+      const outcome = await Promise.race([
+        collectPromise.then(() => 'completed' as const),
+        cancellation.promise.then(() => 'cancelled' as const),
+        timeoutPromise,
+      ]);
+      if (outcome === 'cancelled') {
+        abortSession = true;
+        stream.markdown('\n⏹️ **Cancellation requested. Stopping collection.**\n');
+      } else if (outcome === 'timeout') {
+        abortSession = true;
+      } else {
+        collectorCompleted = true;
+      }
+    } finally {
+      if (timeoutTimer !== undefined) {
+        clearTimeout(timeoutTimer);
+      }
+    }
 
     // 6. Compute and display statistics
     if (deltas.length === 0) {
@@ -1864,8 +2132,20 @@ async function handleTestStreamLatencyCommand(
 
     stream.markdown('\n✅ **Streaming latency diagnostic complete.**\n');
   } catch (err) {
+    abortSession = true;
     const msg = err instanceof Error ? err.message : String(err);
     stream.markdown(`\n❌ **Error:** ${msg}\n`);
+  } finally {
+    cancellation.dispose();
+    if (sessionId) {
+      await cleanupDiagnosticSession(ctx, sessionId, undefined, {
+        streamOpened,
+        abort: abortSession || token.isCancellationRequested || !collectorCompleted || !promptCompleted || promptFailed,
+        promptPromise,
+        collectorPromise: collectPromise,
+        logger: state.outputChannel,
+      });
+    }
   }
 }
 
@@ -2092,7 +2372,6 @@ async function handleTestQuestionCommand(
     'Project name',
     {
       message: 'What should we name the project?',
-      placeholder: 'my-awesome-project',
     },
   );
 
@@ -2126,7 +2405,6 @@ async function handleTestQuestionCommand(
     'Region',
     {
       message: 'Which region?',
-      placeholder: 'e.g., eastus, us-west-2',
     },
   );
 

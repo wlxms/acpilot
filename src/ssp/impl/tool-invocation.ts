@@ -4,7 +4,7 @@
  * Kind: 'toolInvocation'
  *
  * This is the CORE SSP — it internalizes all tool rendering logic from the
- * trunk opencode-bridge.ts (formatInvocationMsg, formatPastTenseMsg,
+ * trunk opencode pipeline (formatInvocationMsg, formatPastTenseMsg,
  * buildToolSpecificData) to avoid the v2 "death by extraction" failure
  * where tool-data.ts became dead code.
  *
@@ -37,7 +37,7 @@
  */
 
 import * as vscode from 'vscode';
-import { SerializableStreamPart, IMutableStreamPart } from '../types';
+import { SerializableStreamPart, type IMutableStreamPart } from '../types';
 import type { SspStream } from '../types';
 import type { SerializableStreamPartMeta, SerializableToolState } from '../types';
 import type { ToolInvocationStreamPartPayload } from '../types';
@@ -111,18 +111,22 @@ export class ToolInvocationSSP extends SerializableStreamPart<
   }
 
   /** IMutableStreamPart.update — merge only, no emitStateChange */
-  update(data: Partial<ToolInvocationStreamPartPayload>): void {
+  update(
+    data: Partial<Omit<ToolInvocationStreamPartPayload, 'state'>> & {
+      state?: Partial<SerializableToolState>;
+    },
+  ): void {
     this.nextRenderMode = (
       data as Partial<ToolInvocationStreamPartPayload> & { renderMode?: 'updateOnly' }
     ).renderMode;
     if (data.state) {
       this.payload.state = { ...this.payload.state, ...data.state };
     }
-    if (data.toolName !== undefined) this.payload.toolName = data.toolName;
-    if (data.callId !== undefined) this.payload.callId = data.callId;
-    if (data.messageId !== undefined) this.payload.messageId = data.messageId;
-    if (data.sessionId !== undefined) this.payload.sessionId = data.sessionId;
-    if (data.partId !== undefined) this.payload.partId = data.partId;
+    if (data.toolName !== undefined) {this.payload.toolName = data.toolName;}
+    if (data.callId !== undefined) {this.payload.callId = data.callId;}
+    if (data.messageId !== undefined) {this.payload.messageId = data.messageId;}
+    if (data.sessionId !== undefined) {this.payload.sessionId = data.sessionId;}
+    if (data.partId !== undefined) {this.payload.partId = data.partId;}
   }
 
   /**
@@ -132,7 +136,7 @@ export class ToolInvocationSSP extends SerializableStreamPart<
   render(stream: SspStream): void {
     const { callId, toolName, state } = this.payload;
     const effectiveCallId = callId ?? this.payload.partId;
-    if (!effectiveCallId) return;
+    if (!effectiveCallId) {return;}
 
     const status = state.status;
 
@@ -226,6 +230,9 @@ export class ToolInvocationSSP extends SerializableStreamPart<
           const pastMsg = this.formatPastTenseMsg(toolName, title, state.startTime, state.endTime, input);
           part.pastTenseMessage = typeof pastMsg === 'string' ? pastMsg : pastMsg.value;
         }
+        if (state.metadata?.presentation === 'system') {
+          part.pastTenseMessage = title;
+        }
       }
 
       // Contract C4: toolSpecificData mapping
@@ -295,7 +302,7 @@ export class ToolInvocationSSP extends SerializableStreamPart<
     state: SerializableToolState,
     isError: boolean,
   ): void {
-    if (!stream.beginToolInvocation) return;
+    if (!stream.beginToolInvocation) {return;}
 
     const title = state.title ?? toolName;
     const input = state.input ?? {};
@@ -328,11 +335,15 @@ export class ToolInvocationSSP extends SerializableStreamPart<
       if (toolName === 'read') {
         return;
       }
-      const pastMsg = this.formatPastTenseMsg(toolName, title, state.startTime, state.endTime, input);
+      const pastMsg = state.metadata?.presentation === 'system'
+        ? title
+        : this.formatPastTenseMsg(toolName, title, state.startTime, state.endTime, input);
       try {
         stream.updateToolInvocation?.(callId, {
           pastTenseMessage: typeof pastMsg === 'string' ? pastMsg : pastMsg.value,
-          invocationMessage: isError ? `✗ ${toolName}` : `✓ ${toolName}`,
+          invocationMessage: state.metadata?.presentation === 'system'
+            ? title
+            : isError ? `✗ ${toolName}` : `✓ ${toolName}`,
           isAttachedToThinking: true,
         } as any);
       } catch { /* ignore */ }
@@ -359,10 +370,10 @@ export class ToolInvocationSSP extends SerializableStreamPart<
       limit?: number,
     ): vscode.MarkdownString => {
       const uri = vscode.Uri.file(filePath).toString().toLowerCase();
-      const range = offset != null || limit != null
+      const range = offset !== undefined || limit !== undefined
         ? (() => {
             const start = offset ?? 1;
-            const end = limit != null ? start + limit - 1 : start;
+            const end = limit !== undefined ? start + limit - 1 : start;
             return `#${start}-${end}`;
           })()
         : '';
@@ -434,7 +445,7 @@ export class ToolInvocationSSP extends SerializableStreamPart<
     timeEnd?: number,
     input?: Record<string, unknown>,
   ): string | vscode.MarkdownString {
-    const duration = (timeStart != null && timeEnd != null)
+    const duration = (timeStart !== undefined && timeEnd !== undefined)
       ? ` (${((timeEnd - timeStart) / 1000).toFixed(1)}s)`
       : '';
 
@@ -446,18 +457,18 @@ export class ToolInvocationSSP extends SerializableStreamPart<
       suffix = '',
     ): vscode.MarkdownString => {
       const uri = vscode.Uri.file(filePath).toString().toLowerCase();
-      const range = offset != null || limit != null
+      const range = offset !== undefined || limit !== undefined
         ? (() => {
             const start = offset ?? 1;
-            const end = limit != null ? start + limit - 1 : start;
+            const end = limit !== undefined ? start + limit - 1 : start;
             return `#${start}-${end}`;
           })()
         : '';
       let lineInfo = '';
-      if (offset != null || limit != null) {
+      if (offset !== undefined || limit !== undefined) {
         const start = offset ?? 1;
-        const end = limit != null ? start + limit - 1 : undefined;
-        lineInfo = end != null ? ` line ${start}-${end}` : ` line ${start}`;
+        const end = limit !== undefined ? start + limit - 1 : undefined;
+        lineInfo = end !== undefined ? ` line ${start}-${end}` : ` line ${start}`;
       }
       return new vscode.MarkdownString(`${verb} [](${uri}${range})${lineInfo}${suffix}${duration}`);
     };
@@ -565,7 +576,7 @@ export class ToolInvocationSSP extends SerializableStreamPart<
           commandLine: { original: command },
           language: (input.language as string) ?? 'bash',
           output: output ? { text: truncate(output, 2000) } : undefined,
-          state: exitCode != null ? { exitCode } : undefined,
+          state: exitCode !== undefined ? { exitCode } : undefined,
         } satisfies ChatTerminalToolInvocationData;
       }
 
@@ -583,7 +594,7 @@ export class ToolInvocationSSP extends SerializableStreamPart<
         if (output) {
           const lines = output.split('\n');
           for (const line of lines) {
-            const fileMatch = line.match(/^[A-Za-z]:\\(?:[^\\]+\\)*[^:]+|^\/(?:[^\/]+\/)*[^:]+/);
+            const fileMatch = line.match(/^[A-Za-z]:\\(?:[^\\]+\\)*[^:]+|^\/(?:[^/]+\/)*[^:]+/);
             if (fileMatch) {
               try { values.push(vscode.Uri.file(fileMatch[0])); } catch { /* skip */ }
             }
@@ -716,7 +727,7 @@ export class ToolInvocationSSP extends SerializableStreamPart<
 
 function formatSubagentInput(input: Record<string, unknown>): string {
   const entries = Object.entries(input);
-  if (entries.length === 0) return '';
+  if (entries.length === 0) {return '';}
   return entries
     .map(([key, value]) => {
       const rendered = typeof value === 'string' ? value : JSON.stringify(value);

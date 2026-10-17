@@ -1,10 +1,18 @@
 # Permission 机制分析与可行性验证
 
+> **历史实现记录**：本文保留早期 Permission 调研及旧 `StreamBridge` 路径，正文的
+> “当前”状态不代表现行代码。权限事件现在由各 Backend Pipeline 映射为统一 SSP；
+> 现行边界见 [阶段一架构设计](../docs/refactor/copilot-agent-sss-phase1-design.md)。
+>
+> **现行状态（2026-09）**：当前依赖为 `@opencode-ai/sdk@1.16.0`，入口使用
+> `@opencode-ai/sdk/v2`；OpenCode 与 ACP Pipeline 已处理 permission 请求并将
+> 交互映射到 SSP。下文的 v1 API、版本号和“零匹配”结论均属于历史快照。
+
 ## 概述
 
 OpenCode 服务端有一套完整的 permission 系统，可以控制工具（edit、bash、read 等）的执行行为：`allow`（自动执行）、`ask`（暂停等待审批）、`deny`（拒绝）。
 
-当前 VSCode 扩展 **完全没有处理** `permission.asked` 事件，导致即使服务端配置了 `permission.edit = "ask"`，审批机制也不会在扩展侧生效。
+（历史快照）当时的 VSCode 扩展 **完全没有处理** `permission.asked` 事件，导致即使服务端配置了 `permission.edit = "ask"`，审批机制也不会在扩展侧生效。现行实现已由 Backend Pipeline 接管。
 
 ---
 
@@ -137,7 +145,7 @@ client.postSessionIdPermissionsPermissionId({
 
 ### 1.5 SDK 类型定义位置
 
-SDK 版本 `@opencode-ai/sdk@1.14.41`：
+当时记录的 SDK 版本为 `@opencode-ai/sdk@1.14.41`（历史版本；当前为 1.16.0）：
 
 ```
 node_modules/@opencode-ai/sdk/dist/gen/types.gen.d.ts
@@ -158,9 +166,9 @@ node_modules/@opencode-ai/sdk/dist/v2/gen/types.gen.d.ts
 
 ---
 
-## 2. 当前扩展状态（缺失分析）
+## 2. 历史扩展状态（缺失分析）
 
-### 2.1 完全不处理 Permission 事件
+### 2.1 当时完全不处理 Permission 事件
 
 `src/` 目录中搜索 `permission`、`asked`、`replied`、`reply` — **零匹配**（排除无关的 `subtask` 子串）。
 
@@ -404,7 +412,7 @@ case 'permission.replied':
 
 ### 6.1 v1 vs v2 SDK 事件类型差异
 
-当前项目使用 `@opencode-ai/sdk@1.14.41`，其类型分为两个版本：
+该历史快照使用 `@opencode-ai/sdk@1.14.41`，其类型分为两个版本：
 
 | | v1 (`dist/gen/`) | v2 (`dist/v2/gen/`) |
 |---|---|---|
@@ -413,7 +421,7 @@ case 'permission.replied':
 | Reply API | `PostSessionIdPermissionsPermissionIdData` | `PermissionReplyData` |
 | `Event` 联合类型包含 | `EventPermissionUpdated`, `EventPermissionReplied` | `EventPermissionAsked`, `EventPermissionReplied` |
 
-**重要：实际运行时服务端发送的事件类型是 `permission.asked`，但 v1 SDK 的 `Event` 联合类型中没有这个字符串。** 这意味着：
+**历史注意：实际运行时服务端发送的事件类型是 `permission.asked`，但当时 v1 SDK 的 `Event` 联合类型中没有这个字符串。** 这意味着：
 
 1. TypeScript 类型检查不会覆盖 `permission.asked`
 2. 但 SSE 流中确实会传来这个事件

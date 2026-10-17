@@ -1,9 +1,17 @@
 # 知识储备: 自定义 Agent / 模型选择器集成
 
+> **历史调研归档**：该 TODO 的路径与模型架构已经被多 Backend 重构取代。当前每个
+> Backend 拥有独立 Vendor，模型目录和调用由 `BackendModelProvider` 提供；不要按
+> 正文中的 `src/acp/*` 路径新增代码。现行设计见
+> [阶段一架构设计](../docs/refactor/copilot-agent-sss-phase1-design.md)。
+>
+> **完成状态（2026-09）**：模型目录、独立 Vendor、模型选择解析和原生 LM 路由已
+> 落地；下文保留为早期 API 调研，不再是待实现清单。
+
 > 对应 TODO: **切换到 OpenCode Session Target 后，支持自定义 Agent 和模型选择**
 >
 > 编写日期: 2026-05-27
-> 状态: `📝 知识收集阶段` → `⏳ 待实现`
+> 状态: `✅ 已由多 Backend 模型架构落地`
 
 ---
 
@@ -178,10 +186,11 @@ vscode.chat.registerChatSessionContentProvider(
 
 ### 3.1 数据层已完整实现
 
-从数据生产到消费的链路已经打通，只需要补齐 `optionGroups` 这一层映射：
+（历史判断）当时认为只需要补齐 `optionGroups` 这一层映射；现行实现由
+`src/surfaces/vscode/model-catalog.ts` 和各 Backend Vendor 提供模型目录：
 
 ```
-OpenCode SDK ──→ Adapter ──→ ACP Types ──→ (待实现) ChatSessionProviderOptionItem
+OpenCode SDK ──→ Backend Adapter ──→ Backend Model Catalog ──→ Copilot Vendor
                                                               ↓
                                                     ChatSessionProviderOptionGroup
                                                               ↓
@@ -315,9 +324,9 @@ if (state.selectedModelOverride) {
 }
 ```
 
-### 3.5 当前 `experimental-session.ts` 的问题
+### 3.5 历史 `experimental-session.ts` 的问题
 
-`createSessionContentProvider()` 返回的 provider 对象**没有设置 `optionGroups` 属性和 `onDidChangeChatSessionProviderOptions` 事件**。这是实现该功能需要修改的核心文件。
+`createSessionContentProvider()` 当时返回的 provider 对象**没有设置 `optionGroups` 属性和 `onDidChangeChatSessionProviderOptions` 事件**。这是历史分析，不代表现行模型目录实现。
 
 ---
 

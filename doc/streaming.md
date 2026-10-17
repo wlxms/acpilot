@@ -1,5 +1,9 @@
 # Streaming 渲染技术文档
 
+> **历史实现记录**：本文描述重构前的 OpenCode 专用 `StreamBridge` 流程。当前生产
+> 路径由每个 Backend 的 `BackendPipeline` 直接把原始事件转换为 SSP，并写入绑定的
+> SSS。现行边界见 [阶段一架构设计](../docs/refactor/copilot-agent-sss-phase1-design.md)。
+
 ## 架构选型：SSE 事件流 vs 轮询
 
 ### 结论

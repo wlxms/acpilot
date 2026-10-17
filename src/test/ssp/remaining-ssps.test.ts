@@ -5,7 +5,7 @@ import { ExternalEditSSP } from '../../ssp/impl/external-edit';
 import { SubagentManager } from '../../ssp/impl/subagent';
 import { SessionLifecycleSSP, SessionDiffSSP } from '../../ssp/impl/session-lifecycle';
 import { InteractionRequestSSP, InteractionResponseSSP } from '../../ssp/impl/interaction';
-import { RawAcpEventSSP } from '../../ssp/impl/raw-acp-event';
+import { OpaqueEventSSP } from '../../ssp/impl/opaque-event';
 
 function mockStream(): SspStream {
   return { markdown: vi.fn(), progress: vi.fn(), push: vi.fn() };
@@ -130,13 +130,13 @@ describe('InteractionResponseSSP', () => {
 });
 
 // ===========================================================================
-// RawAcpEventSSP
+// OpaqueEventSSP
 // ===========================================================================
 
-describe('RawAcpEventSSP', () => {
+describe('OpaqueEventSSP', () => {
   it('render should be no-op', () => {
     const stream = mockStream();
-    const ssp = new RawAcpEventSSP({ event: { type: 'unknown.event', data: 'test' } });
+    const ssp = new OpaqueEventSSP({ event: { type: 'unknown.event', data: 'test' } });
     ssp.render(stream);
     expect(stream.push).not.toHaveBeenCalled();
   });
@@ -149,7 +149,7 @@ describe('RawAcpEventSSP', () => {
 describe('SubagentManager', () => {
   it('should start and complete a subagent scope', () => {
     const mgr = new SubagentManager();
-    const scope = mgr.startSubagent('call1');
+    const scope = mgr.startSubagent('call1', { toolName: 'task', title: 'Task', input: {} });
     expect(scope.callId).toBe('call1');
     expect(scope.completed).toBe(false);
 
@@ -163,7 +163,7 @@ describe('SubagentManager', () => {
     const mgr = new SubagentManager();
     expect(mgr.hasBusyDescendant()).toBe(false);
 
-    mgr.startSubagent('call1');
+    mgr.startSubagent('call1', { toolName: 'task', title: 'Task', input: {} });
     expect(mgr.hasBusyDescendant()).toBe(true);
 
     mgr.completeSubagent('call1');

@@ -2,14 +2,14 @@
  * Reference extraction utilities for VSCode ChatRequest.
  *
  * Converts VSCode `ChatPromptReference` values (images, file URIs,
- * code locations) into ACP `AcpFileAttachment` objects that can be
+ * code locations) into ACP `BackendFileAttachment` objects that can be
  * passed to the OpenCode backend alongside the user prompt.
  *
  * @module
  */
 import * as vscode from 'vscode';
 import * as path from 'path';
-import type { AcpFileAttachment } from '../acp/types';
+import type { BackendFileAttachment } from '../backend/types';
 
 // ---------------------------------------------------------------------------
 // MIME type map
@@ -329,7 +329,7 @@ function binaryToDataUri(data: unknown, mimeType: string, logger?: { appendLine(
  *   plain text in the user prompt so the model can use tools to read them.
  */
 export interface ExtractedReferences {
-  attachments: AcpFileAttachment[];
+  attachments: BackendFileAttachment[];
   paths: string[];
 }
 
@@ -337,7 +337,7 @@ export interface ExtractedReferences {
  * Extract image attachments and non-image path references from a VSCode
  * `ChatRequest.references` array.
  *
- * - Pasted images and image files (`image/*` mime) become `AcpFileAttachment`
+ * - Pasted images and image files (`image/*` mime) become `BackendFileAttachment`
  *   entries — the opencode backend reads the URL and embeds the bytes.
  * - Everything else (text files, source code, configs, directories,
  *   unknown extensions) becomes a plain path string.  Paths inside
@@ -365,7 +365,7 @@ export function extractAttachmentsFromReferences(
 
   const seenAttachments = new Set<string>();
   const seenPaths = new Set<string>();
-  const attachments: AcpFileAttachment[] = [];
+  const attachments: BackendFileAttachment[] = [];
   const paths: string[] = [];
 
   for (let i = 0; i < references.length; i++) {

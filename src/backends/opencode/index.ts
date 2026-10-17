@@ -8,7 +8,7 @@
  * ```
  */
 
-import { registerBackend } from '../../acp/backend-registry';
+import { registerBackend } from '../../backend/backend-registry';
 import { OpenCodeBackend } from './adapter';
 
 registerBackend('opencode', () => new OpenCodeBackend());

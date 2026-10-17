@@ -5,8 +5,8 @@
  * - InteractionRequestSSP (kind: 'interactionRequest') — permission.asked / question.asked
  * - InteractionResponseSSP (kind: 'interactionResponse') — permission.replied / question.replied / question.rejected
  *
- * Render: no-op (permissions are auto-approved by Bridge; questions are handled
- * via Bridge's questionCarousel. These SSPs exist for persistence/audit only.)
+ * Render: no-op (permissions are auto-approved by the Pipeline; questions are handled
+ * via the Pipeline's questionCarousel. These SSPs exist for persistence/audit only.)
  */
 
 import { SerializableStreamPart } from '../types';

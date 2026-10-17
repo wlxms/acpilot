@@ -1,5 +1,14 @@
 # Question Tool 支持 — 实现与调试记录
 
+> **历史实现记录**：本文保留 Question Tool 的协议调研和重构前调用路径，其中
+> `StreamBridge`、`src/acp/*` 等名称已不是生产 API。现行实现由 Backend Pipeline
+> 创建 `QuestionSSP`；架构边界见
+> [阶段一架构设计](../docs/refactor/copilot-agent-sss-phase1-design.md)。
+>
+> **现行状态（2026-09）**：本文第 3、5、6 节中的 SDK v1/raw HTTP 结果是历史
+> 快照，不是当前实现指引。当前 OpenCode 适配器使用 `@opencode-ai/sdk/v2` 的
+> `sdk.question.reply()` / `sdk.question.reject()`。
+
 ## 概述
 
 OpenCode 后端的 AI 代理可以通过 `question` 工具向用户提问（单选、多选、文本输入）。本文记录了从协议实现到端到端验证的完整过程，包括关键 bug 的发现与修复。
@@ -235,7 +244,7 @@ v1: OpencodeClient.prototype keys = constructor, postSessionIdPermissionsPermiss
 v2: OpencodeClient.prototype getters = auth, app, global, event, config, ..., question, permission, ...
 ```
 
-**当前修复**：adapter 的 `questions.reply()` / `questions.reject()` 使用 raw HTTP：
+**当时的修复**：adapter 的 `questions.reply()` / `questions.reject()` 使用 raw HTTP：
 ```typescript
 const response = await fetch(`${baseUrl}/question/${requestId}/reply?directory=...`, {
   method: 'POST',
@@ -244,11 +253,11 @@ const response = await fetch(`${baseUrl}/question/${requestId}/reply?directory=.
 });
 ```
 
-**更好的修复**（待执行）：将 `server.ts` 的导入改为 v2：
+**后续迁移（已完成）**：将 `server.ts` 的导入改为 v2：
 ```typescript
-// 当前
+// 历史
 import { createOpencode } from '@opencode-ai/sdk';
-// 改为
+// 现行
 import { createOpencode } from '@opencode-ai/sdk/v2';
 ```
 
@@ -295,7 +304,7 @@ private async pumpWithReconnect(client: OpenCodeClient): Promise<void> {
 ### 核心修改文件
 | 文件 | 变更 |
 |------|------|
-| `src/backends/opencode/adapter.ts` | 新增 `questions.reply()` / `questions.reject()`（raw HTTP 实现） |
+| `src/backends/opencode/adapter.ts` | 历史记录：`questions.reply()` / `questions.reject()` 曾使用 raw HTTP；现行实现调用 SDK v2 |
 | `src/backends/opencode/event-broker.ts` | `pumpWithReconnect()` 自动重连、session channel 生命周期 |
 | `src/backends/opencode/events.ts` | `normalizeQuestionAsked()` 事件归一化 |
 | `src/backends/opencode/sdk-events.ts` | `QuestionAskedEvent` 类型定义 |
@@ -346,10 +355,10 @@ Tests       3 passed (3)
 
 ## 6. 已知问题与待办
 
-### 待执行
+### 历史待办（已归档；不作为当前实施清单）
 
-- [ ] **迁移到 SDK v2**：将 `server.ts` 的 `import { createOpencode } from '@opencode-ai/sdk'` 改为 `from '@opencode-ai/sdk/v2'`，即可使用 `client.question.reply()` 而非 raw HTTP
-- [ ] **检查 v2 类型兼容性**：`sdk-events.ts`、`types/index.ts` 等文件的类型导入是否兼容 v2
+- [x] **迁移到 SDK v2**：现行入口为 `src/opencode/server.ts` 的 `@opencode-ai/sdk/v2`
+- [x] **检查 v2 类型兼容性**：现行 Question 操作位于 `src/backends/opencode/adapter.ts`
 - [ ] **清理诊断日志**：streaming.ts、handler.ts 中的临时 console.log 可移除
 - [ ] **ESLint 进一步调优**：当前 moderate config，后续可考虑更严格
 

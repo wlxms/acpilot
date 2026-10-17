@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import * as vscode from 'vscode';
-import { CollectorStream } from '../../acp/streaming/collector-stream';
+import { CollectorStream } from '../../backend/streaming/collector-stream';
 
 describe('CollectorStream', () => {
   let stream: CollectorStream;
@@ -83,7 +83,7 @@ describe('CollectorStream', () => {
     vi.doMock('vscode', () => patchedVscode);
 
     const { CollectorStream: FallbackStream } = await import(
-      '../../acp/streaming/collector-stream'
+      '../../backend/streaming/collector-stream'
     );
     const s = new FallbackStream();
     s.thinkingProgress({ text: 'thinking now' });

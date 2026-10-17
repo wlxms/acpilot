@@ -59,7 +59,7 @@ describe('SerializableStreamPart (base class)', () => {
       expect(ssp.meta.turnIndex).toBe(0);
       expect(ssp.meta.sequence).toBe(0);
       expect(ssp.meta.requestId).toBe('');
-      expect(ssp.meta.source).toBe('acp-event');
+      expect(ssp.meta.source).toBe('backend-event');
       expect(ssp.meta.createdAt).toBeTruthy();
     });
 

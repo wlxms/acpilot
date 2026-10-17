@@ -97,12 +97,15 @@ export class EventEmitter<T> {
 
 export class ChatParticipant {
     public iconPath: ThemeIcon | { light: ThemeIcon; dark: ThemeIcon } | undefined;
+    public requestHandler: ChatRequestHandler;
     private _feedbackListeners: Array<(e: ChatResultFeedback) => unknown> = [];
 
     constructor(
         public readonly id: string,
-        public readonly handler: ChatRequestHandler,
-    ) {}
+        handler: ChatRequestHandler,
+    ) {
+        this.requestHandler = handler;
+    }
 
     onDidReceiveFeedback(
         listener: (e: ChatResultFeedback) => unknown,
@@ -147,6 +150,7 @@ export class LanguageModelToolCallPart {
 export interface LanguageModelChatCapabilities {
     readonly imageInput?: boolean;
     readonly toolCalling?: boolean | number;
+    readonly agentMode?: boolean;
 }
 
 export interface LanguageModelChatInformation {
@@ -157,6 +161,7 @@ export interface LanguageModelChatInformation {
     readonly maxInputTokens: number;
     readonly maxOutputTokens: number;
     readonly capabilities: LanguageModelChatCapabilities;
+    readonly isBYOK?: boolean;
     readonly targetChatSessionType?: string;
     readonly isUserSelectable?: boolean;
     readonly isDefault?: boolean | Record<string, boolean>;
@@ -448,6 +453,35 @@ export interface ChatResponseStream {
 export interface CancellationToken {
     isCancellationRequested: boolean;
     onCancellationRequested: (listener: () => unknown) => { dispose(): void };
+}
+
+/** Minimal cancellation source used by runtime-control tests. */
+export class CancellationTokenSource {
+    private cancelled = false;
+    private readonly emitter = new EventEmitter<void>();
+    readonly token: CancellationToken;
+
+    constructor() {
+        const token = {} as CancellationToken;
+        // Define the getter with an arrow so it remains bound to this source
+        // when the token is passed through the runtime API.
+        Object.defineProperty(token, 'isCancellationRequested', {
+            enumerable: true,
+            get: () => this.cancelled,
+        });
+        token.onCancellationRequested = (listener) => this.emitter.event(listener);
+        this.token = token;
+    }
+
+    cancel(): void {
+        if (this.cancelled) {return;}
+        this.cancelled = true;
+        this.emitter.fire(undefined);
+    }
+
+    dispose(): void {
+        this.emitter.dispose();
+    }
 }
 
 export interface ChatResult {

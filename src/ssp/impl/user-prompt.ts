@@ -7,7 +7,7 @@
  * This SSP exists solely so the user's prompt is serialized to session.jsonl
  * and can be reconstructed as a ChatRequestTurn during session restore.
  *
- * Pushed by handler before bridge.run().
+ * Pushed by handler before pipeline.run().
  */
 
 import { SerializableStreamPart } from '../types';

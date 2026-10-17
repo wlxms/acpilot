@@ -97,6 +97,12 @@ export interface MessagePartDeltaEvent {
     partID: string;
     delta: string;
     field?: string;
+    /** Session the delta belongs to (present at runtime, optional in schema). */
+    sessionID?: string;
+    /** Compatibility spelling emitted by some OpenCode event versions. */
+    sessionId?: string;
+    /** messageID echoed on some delta events (present at runtime, optional). */
+    messageID?: string;
   };
 }
 
@@ -137,6 +143,8 @@ interface BaseStreamPart {
   type: PartType;
   messageID?: string;
   sessionID?: string;
+  /** Compatibility spelling emitted by some OpenCode event versions. */
+  sessionId?: string;
 }
 
 export interface TextStreamPart extends BaseStreamPart {
@@ -201,6 +209,10 @@ export interface MessagePartUpdatedEvent {
   properties: {
     part: StreamPart;
     delta?: string;
+    /** Session may be attached to the event envelope instead of the part. */
+    sessionID?: string;
+    /** Compatibility spelling used by some OpenCode event versions. */
+    sessionId?: string;
   };
 }
 

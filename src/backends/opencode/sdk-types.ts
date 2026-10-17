@@ -6,7 +6,7 @@
  */
 
 import type { OpenCodeEventStream } from './sdk-events';
-import type { AcpSessionStatus } from '../../acp/types';
+import type { BackendSessionStatus } from '../../backend/types';
 
 // ===========================================================================
 // SDK response wrapper — mirrors the hey-api RequestResult flat shape
@@ -31,12 +31,18 @@ export interface SdkProviderModel {
   id: string;
   name?: string;
   providerID?: string;
+  api?: { url?: string; npm?: string; type?: string };
+  limit?: { context?: number; output?: number };
   capabilities?: Record<string, unknown>;
 }
 
 export interface SdkProvider {
   id: string;
   name: string;
+  api?: { url?: string; type?: string; package?: string };
+  options?: Record<string, unknown>;
+  key?: string;
+  source?: string;
   models?: Record<string, SdkProviderModel>;
 }
 
@@ -69,7 +75,7 @@ export interface SdkUserMessage {
   role: 'user';
   time: { created: number };
   agent: string;
-  model: { providerID: string; modelID: string };
+  model: { providerID: string; modelID: string; variant?: string };
 }
 
 export interface SdkAssistantMessage {
@@ -80,6 +86,8 @@ export interface SdkAssistantMessage {
   parentID: string;
   modelID: string;
   providerID: string;
+  /** Variant selected for this assistant turn, when reported by SDK v2. */
+  variant?: string;
   cost: number;
   tokens: { input: number; output: number; reasoning: number; cache: { read: number; write: number } };
   error?: { name: string; data?: { message?: string } };
@@ -136,7 +144,7 @@ export type SdkPart = SdkTextPart | SdkReasoningPart | SdkToolPart | SdkSubtaskP
 // OpenCodeClient — typed contract for the OpenCode SDK v2 client
 //
 // This interface describes the subset of the SDK v2 OpencodeClient API
-// that our codebase actually consumes. The adapter layer bridges between
+// that our codebase actually consumes. The adapter layer connects between
 // this contract and the raw SDK at the architectural boundary (server.ts).
 // ===========================================================================
 
@@ -158,12 +166,19 @@ export interface OpenCodeClient {
       directory?: string;
       title?: string;
     }): Promise<SdkResponse<SdkSessionData>>;
+    delete(parameters: {
+      sessionID: string;
+      directory?: string;
+    }): Promise<SdkResponse<boolean>>;
     prompt(parameters: {
       sessionID: string;
       directory?: string;
       parts?: unknown;
       model?: unknown;
       agent?: string;
+      tools?: Record<string, boolean>;
+      /** SDK v2 model variant (for example, a provider-specific speed/reasoning preset). */
+      variant?: string;
     }): Promise<SdkResponse<unknown>>;
     promptAsync(parameters: {
       sessionID: string;
@@ -171,6 +186,9 @@ export interface OpenCodeClient {
       parts?: unknown;
       model?: unknown;
       agent?: string;
+      tools?: Record<string, boolean>;
+      /** SDK v2 model variant (for example, a provider-specific speed/reasoning preset). */
+      variant?: string;
     }): Promise<SdkResponse<unknown>>;
     revert(parameters: {
       sessionID: string;
@@ -191,7 +209,7 @@ export interface OpenCodeClient {
     }): Promise<SdkResponse<Array<{ id?: string; parentID?: string }>>>;
     status(parameters?: {
       directory?: string;
-    }): Promise<SdkResponse<Record<string, AcpSessionStatus>>>;
+    }): Promise<SdkResponse<Record<string, BackendSessionStatus>>>;
     messages(parameters: {
       sessionID: string;
       directory?: string;
@@ -252,6 +270,23 @@ export interface OpenCodeClient {
       requestID: string;
       directory?: string;
     }): Promise<SdkResponse<boolean>>;
+  };
+  /** OpenCode v2 session-scoped interaction endpoints. */
+  v2?: {
+    permission?: {
+      reply(parameters: {
+        sessionID: string;
+        requestID: string;
+        reply?: 'once' | 'always' | 'reject';
+        message?: string;
+      }): Promise<SdkResponse<unknown>>;
+    };
+    question?: {
+      reject(parameters: {
+        sessionID: string;
+        requestID: string;
+      }): Promise<SdkResponse<boolean>>;
+    };
   };
 }
 

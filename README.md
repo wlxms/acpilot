@@ -2,20 +2,22 @@
 
 在 VSCode Copilot Chat 中使用任意 [ACP (Agent Client Protocol)](https://github.com/zcovex/acp) 兼容的 AI 编码助手后端。
 
-`@opencode hello` → 实时推理过程 → 工具调用 → AI 流式输出
+`@opencode`、`@acp` 或 `@reasonix` → 实时推理过程 → 工具调用 → AI 流式输出
 
-ACPilot 以 ACP 协议为语义核心,将后端与 VS Code surface 解耦。当前内置 OpenCode backend,后续将拓展支持所有 ACP 协议兼容的 backend。
+ACPilot 以 ACP 语义为核心，将 Copilot 接入层与可插拔 Agent 后端解耦。当前内置
+OpenCode、标准 ACP 和 Reasonix 后端；每个后端独立管理自己的会话、Pipeline 和
+Copilot Vendor。
 
 ## 功能
 
-- **聊天集成**: 在 Copilot Chat 输入 `@opencode` 即可对话
+- **聊天集成**: 在 Copilot Chat 输入 `@opencode`、`@acp` 或 `@reasonix` 即可对话（对应后端需已配置）
 - **实时推理显示**: AI 思考过程实时流式展示（thinkingProgress API）
 - **原生工具调用卡片**: 文件读取、Shell 命令等以原生 UI 渲染，可点击展开
 - **子代理支持**: 子代理/子任务自动以可展开卡片展示
 - **流式输出**: AI 回复 token-by-token 实时显示
 - **斜杠命令**: `/new` 新会话, `/help` 帮助, `/model` 模型列表
-- **ACP-first 架构**: 以 ACP 语义层解耦 backend 与 VS Code surface,OpenCode 是当前内置 backend,架构上可扩展到任意 ACP 协议 backend
-- **实验性 Session Provider 开关**: 可在入口层按运行时能力切换是否启用实验性 surface
+- **多后端架构**: Copilot ↔ SSS/SSP ↔ Agent；后端协议和 Pipeline 独立，模型提供是后端的附加能力
+- **多后端 Session Provider**: OpenCode、标准 ACP 与 Reasonix 共用同一会话恢复管线
 
 ## 工具调用 UI 展示
 
@@ -28,7 +30,7 @@ task / subagent      → 点击展开子代理完整对话
 
 ## 安装
 
-1. 确保已安装 [OpenCode CLI](https://opencode-ai.com) 并完成认证
+1. 按需安装并配置后端。使用 OpenCode 时请先安装 [OpenCode CLI](https://opencode-ai.com) 并完成认证；标准 ACP 和 Reasonix 后端可在设置中配置目标
 2. 克隆仓库
    ```bash
    git clone https://github.com/wlxms/acpilot.git
@@ -51,6 +53,8 @@ task / subagent      → 点击展开子代理完整对话
 | `@opencode /model` | 显示可用 AI 模型列表 |
 | `@opencode /new` | 开始新对话会话 |
 | `@opencode /help` | 显示帮助 |
+| `@acp read package.json` | 通过当前配置的标准 ACP 后端对话 |
+| `@reasonix read package.json` | 通过 Reasonix ACP 后端对话 |
 
 ## 开发
 
@@ -58,8 +62,11 @@ task / subagent      → 点击展开子代理完整对话
 # 类型检查
 npm run lint
 
-# 测试（350+ 单元测试）
+# 测试（555 个单元测试）
 npm test
+
+# VS Code Extension Host + loopback 控制端点 smoke/e2e
+npm run test:runtime
 ```
 
 ### 技术栈
@@ -67,52 +74,77 @@ npm test
 | 层 | 技术 |
 |---|------|
 | 聊天 UI | VSCode Chat Participant API (稳定 + `chatParticipantAdditions` proposal) |
-| 流式桥接 | SSE 事件 → `thinkingProgress()` / `markdown()` |
+| 流式处理 | BackendPipeline 解析事件 → SSP/SSS → Copilot 渲染 |
 | 工具渲染 | `ChatToolInvocationPart` + 6 种 `toolSpecificData` |
-| SDK | `@opencode-ai/sdk` ^1.16.0 |
+| SDK | `@opencode-ai/sdk` ^1.16.0、`@agentclientprotocol/sdk` ^1.0.0 |
 | 构建 | esbuild (ESM→CJS) |
 | 测试 | vitest + 自定义 vscode mock |
 
-### ACP-first 架构
+### 三领域架构
 
-当前代码库采用 **SSP-first / SSS-owned-stream** 分层架构，彻底解耦协议语义、序列化与平台渲染：
+当前代码库采用 **SSP-first / SSS-owned-stream** 分层架构：后端协议解析与 Copilot
+编排分开，SSP 自身保留状态、序列化和面向注入 host stream 的渲染行为：
 
 ```txt
 src/
-├── acp/                  # ACP 协议语义层（零 vscode / SDK 依赖）
-│   ├── backend.ts        #   AcpBackend / AcpBridge 核心接口
-│   ├── streaming/        #   可序列化会话流（SSS：拥有 vscode 流，push/update API）
+├── backend/              # 多后端共享契约、会话与持久化
+│   ├── backend.ts        #   Backend / BackendPipeline / BackendModelProvider 契约
+│   ├── streaming/        #   SSS/SessionStreamNode（拥有 host stream，push/update API）
 │   ├── serializable/     #   JSONL 序列化（session.jsonl / meta.jsonl）
 │   └── checkpoint/       #   Checkpoint 审批状态与持久化
 ├── ssp/                  # 可序列化流部件层（SSP 自洽：状态 + 渲染 + 序列化）
 │   ├── types.ts          #   SerializableStreamPart 基类 + IMutableStreamPart
 │   └── impl/             #   10+ 具体 SSP（AssistantText / Reasoning / Tool / Edit / Question …）
-├── backends/opencode/    # OpenCode → ACP 后端适配（Bridge 薄路由 ~825 行）
-├── acpmodels/            # Copilot ⇄ ACP 模型双向同步注册表
-├── surfaces/vscode/      # VS Code surface（稳定 participant + 实验 session provider）
+├── backends/opencode/    # OpenCode Backend Pipeline 与协议解析
+├── backends/acp/         # 标准 ACP Backend、transport 与 Pipeline
+├── backends/reasonix/    # Reasonix 的 ACP preset Backend
+├── surfaces/vscode/model-catalog.ts # CopilotModelCatalog 与模型路由
+├── surfaces/vscode/      # VS Code participant、session provider 与模型 surface
 ├── participant/          # ChatRequestHandler 编排层（handler + checkpoint + title）
 ├── settings/             # Webview 设置面板
-├── opencode/             # SDK 封装（server + client）
+├── opencode/             # OpenCode SDK 封装（server + client）
+├── test-control/         # 本机 Extension Host e2e 控制 API
 └── extension.ts          # 入口：backend + surface 装配
 ```
 
 **数据流**：
 
 ```
-用户消息 → ChatRequestHandler → SessionManager 解析会话
-  → SerializableSessionStream 创建本回合流
-  → OpenCodeBackend.sessions.prompt → 后端 SSE 事件
-  → OpenCodeBridge.run() 路由事件
-  → SSS.push(SSP) / update(id, data)
-  → SSP 渲染到 ChatResponseStream + 追加到 session.jsonl
+Copilot request
+  → Copilot integration 绑定 Chat Session / Backend Session
+  → 打开 Backend Session event stream
+  → 启动绑定 SSS 的 BackendPipeline
+  → Backend Session prompt
+  → BackendPipeline.run() 解析后端流式事件
+  → Pipeline 将统一 SSP 写入绑定的 SSS
+  → SSS 持久化、重放并渲染到 VS Code
 ```
 
-- `src/acp/*`：定义统一语义事件、会话、权限、模型接口，后端可替换
+- `src/backend/*`：定义统一会话、配置、权限与持久化契约
 - `src/ssp/*`：每个 SSP 自洽——拥有自身状态、渲染逻辑、序列化契约，直接 import vscode 类型
-- `src/acp/streaming/*`：`SerializableSessionStream` 拥有 vscode 流，Bridge 只调 `push()/update()`，永不直接触达 UI
-- `src/backends/opencode/*`：`OpenCodeBridge` 是 ~825 行薄路由，将 ACP 事件映射到 SSP 调用
+- `src/backend/streaming/*`：`SerializableSessionStream` 拥有注入的 VS Code 流；
+  Pipeline 只调 `push()/update()`，永不直接触达 VS Code API。Native LM 使用同一基类的
+  `TransientSessionStream`，不创建持久化文件
+- `src/backends/opencode/*`：OpenCode Pipeline 解析 OpenCode raw 事件并映射到统一 SSP
 
-3 文件持久化（中断安全）：
+Copilot 模型链路：
+
+```text
+Copilot model selection
+  → CopilotModelCatalog.list()/resolve()
+  → BackendModelProvider.invoke()
+  → 创建临时 Backend Session
+  → 打开 event stream → ensureStarted
+  → 创建并启动绑定 TransientSessionStream 的 BackendPipeline
+  → prompt(providerID/modelID)
+  → SSP → native LM response sink（不落盘）
+  → close/release；Backend 支持时 delete
+```
+
+每个 Backend 只拥有一个 Copilot Vendor。模型提供是 Backend 的附加能力；ACPilot 的
+核心仍是通过 Copilot 接入层调用可插拔的 ACP/Agent 后端。
+
+JSONL 持久化（中断安全）：
 
 ```
 {workspaceRoot}/.acpilot/{backend}/{sessionId}/
@@ -122,23 +154,12 @@ src/
     └── subsession.jsonl
 ```
 
-### 实验性 Session Provider
+### Session Provider
 
-默认仍然使用稳定的 chat participant 路径。
-
-如果想实验性启用 session provider surface，可在 VS Code 设置中打开：
-
-```json
-{
-  "acpilot.experimental.sessionProvider": true
-}
-```
-
-说明：
-
-- 该开关**只在运行时存在对应 proposed API 时生效**
-- 如果运行环境不支持，扩展会自动回退到稳定 participant 路径
-- 当前实验 surface 主要用于架构隔离和未来扩展点预留
+每个已注册后端都使用同一套 Chat Session Provider、participant handler 和
+SSP 恢复管线；Backend instance、session namespace 和 model catalog 由各后端隔离。
+运行环境缺少所需 VS Code API 时仅保留 participant surface，不存在单后端恢复路径
+或独立的兼容存储格式。
 
 ### 项目结构
 
@@ -146,26 +167,30 @@ src/
 src/
 ├── extension.ts              # 入口: activate/deactivate，注册 ChatParticipant
 ├── statusbar.ts              # 状态栏管理
-├── acp/                      # ACP 协议语义层
-│   ├── backend.ts            #   AcpBackend / AcpBridge 核心接口
-│   ├── streaming/            #   SSS 会话流（push/update，3 文件持久化）
+├── backend/                  # 多后端共享契约与会话流
+│   ├── backend.ts            #   Backend / BackendPipeline / BackendModelProvider 契约
+│   ├── streaming/            #   SSS 会话流（push/update，JSONL 持久化）
 │   ├── serializable/         #   JSONL 序列化器
 │   ├── checkpoint/           #   Checkpoint 状态存储
 │   └── ...                   #   事件总线 / 会话映射 / 选择存储
 ├── ssp/                      # 可序列化流部件层（自洽状态 + 渲染）
 │   ├── types.ts              #   SerializableStreamPart 基类
 │   └── impl/                 #   10+ 具体 SSP（Text/Reasoning/Tool/Edit/…）
-├── backends/opencode/        # OpenCode 后端（Bridge 薄路由 + 事件归一化）
-├── acpmodels/                # Copilot ⇄ ACP 模型双向同步
-├── surfaces/vscode/          # VS Code surfaces（稳定 + 实验 + 能力检测）
+├── backends/opencode/        # OpenCode Backend Pipeline + raw 事件解析
+├── backends/acp/             # 标准 ACP Backend + Pipeline
+├── backends/reasonix/        # Reasonix ACP preset
+├── backend/transient-session-stream.ts # Native LM 的不落盘 stream
+├── surfaces/vscode/model-catalog.ts # CopilotModelCatalog
+├── surfaces/vscode/          # VS Code surfaces 与能力检测
 ├── participant/              # ChatRequestHandler 编排（handler/commands/checkpoint）
 ├── settings/                 # Webview 设置面板
 ├── opencode/                 # SDK 封装（server + client）
 ├── types/                    # 共享类型（ExtensionState + vscode proposed API 声明）
-└── test/                     # vitest 测试（350+ 用例）
+└── test/                     # vitest 测试（555 个用例）
 ```
 
-详细技术文档见 [doc/tech-summary.md](doc/tech-summary.md)。
+详细技术文档见 [阶段一架构设计](docs/refactor/copilot-agent-sss-phase1-design.md)。
+Extension Host 端点与本机 e2e 用法见 [Runtime Test Control](docs/runtime-test-control.md)。
 
 ## 许可证
 

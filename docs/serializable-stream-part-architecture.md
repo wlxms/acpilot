@@ -1,5 +1,19 @@
 # Serializable Stream Part Architecture
 
+> **状态与术语说明（2026-09）**：本文的概念图最初使用了
+> `SerializableSession`、`SerializableTurnRecord`、`StreamingRecorder` 和
+> `Projector` 等逻辑角色名；这些不是当前代码中的类名。现行实现以
+> `SerializableSessionStream`、`SessionStreamNodeBase`、`CollectorStream` 和
+> `experimental-session.ts` 的恢复函数为准。下方保留概念名时，应按映射表阅读，
+> 不要据此新增同名类。
+
+| 概念角色（本文） | 当前实现 |
+| --- | --- |
+| `SerializableSession` / `SerializableTurnRecord` | `SerializableSessionStream` + `SessionStreamNodeBase` |
+| `StreamingRecorder` | `SessionStreamNodeBase.push/update/flush` |
+| `SerializableSessionReader` / `SerializableTurnReader` | `readAllStreamParts()`, `readMetaIndex()`, `readSubsessionRecords()` |
+| `RestoreProjector` / `Projector` | `CollectorStream` 与 SSP `.render()`，编排于 `experimental-session.ts` |
+
 ## Goal
 
 The session pipeline should be organized around persistent data concepts, not
@@ -24,9 +38,9 @@ SerializableSession
 |     -> async patch SessionMeta and backend title
 | - SerializableTurnRecord
     | > write TurnMeta with prompt and request id
-    | - StreamingRecorder
-        | - StreamingBridge
-            | - EventHandler
+    | - SessionStreamNodeBase (stream recorder)
+        | - BackendPipeline
+            | - SSP mapper
                 -> SerializableStreamPart[]
         | > append SSP records incrementally
         | > update derived indexes when needed
@@ -36,32 +50,33 @@ SerializableSession
 Deserialization follows the same data concepts:
 
 ```text
-SerializableSessionReader
+experimental-session restore coordinator
 | > read SessionMeta
-| - SerializableTurnReader
+| - deserialize helpers
     | > read TurnMeta
     | > read SerializableStreamPart[]
     | > rebuild derived indexes from part meta if missing
-    | - RestoreProjector
+    | - CollectorStream + SSP render
         -> VS Code ChatRequestTurn / ChatResponseTurn
 ```
 
 ## Ownership
 
-`SerializableSession` owns session identity, title state, archived state,
+The session-level role (implemented by `SerializableSessionStream` and its store)
+owns session identity, title state, archived state,
 checkpoint approval cursor, and session-level indexes.
 
 `TitleLifecycle` is a session concern. It starts when the first prompt is known,
 not at turn finalization. Turn finalization may reconcile an already observed
 title, but should not be the primary naming path.
 
-`SerializableTurnRecord` owns prompt, turn index, VS Code request id, backend
+The turn-level metadata carried by stream records owns prompt, turn index, VS Code request id, backend
 message id, status, and timing.
 
 `SerializableStreamPart` owns extensible streamed content plus local recovery
 metadata.
 
-`Projector` is an adapter from SSP records to a target surface. A projector does
+The restore/render adapter (`CollectorStream` plus SSP `render()` methods) is an adapter from SSP records to a target surface. It does
 not own data or session lifecycle. It only renders or materializes SSPs.
 
 Examples:
@@ -99,19 +114,16 @@ The default path now persists specialized SSP records:
 
 - `userPrompt`
 - `assistantText`
-- `assistantTextDelta`
 - `reasoning`
-- `reasoningDelta`
 - `toolInvocation`
 - `sessionLifecycle`
 - `sessionDiff`
 - `interactionRequest`
 - `interactionResponse`
 - `externalEdit`
-- `externalEditMetadata`
-- `rawAcpEvent`
+- `opaqueEvent`
 
-`rawAcpEvent` remains a lossless fallback for unknown or newly added backend
+`opaqueEvent` remains a lossless fallback for unknown or newly added backend
 events, but it is no longer the normal record for common chat, tool, lifecycle,
 interaction, or edit metadata.
 
@@ -137,27 +149,22 @@ indexes.
 This model covers the current behavior through these invariants:
 
 - Live streaming appends SSP records as events arrive.
-- Restore prefers SSP records, then falls back to legacy raw event records.
+- Restore reads SSP records only; unsupported historical formats are rejected.
 - SSP meta contains enough data to rebuild turn ownership and request ids.
 - External edit SSPs carry `requestId`, `toolCallId`, and `editId` locally.
-  Restore merges those records with `_meta.json.requestDetails` so the edit
-  bubble can recover even when the session meta index is incomplete.
-- Session-level `_meta.json` remains a fast index and session state file, not
-  the only source of part recovery truth.
-- Checkpoints remain artifact records, referenced by SSP meta or payload.
+  Restore merges those records with the part entries in `meta.jsonl` so the
+  edit bubble can recover after restart.
+- Session-level state is materialized from append-only `meta.jsonl` patches.
+- File snapshots are scoped records inside root or subsession JSONL streams.
 - Fork/rewind remain session and turn metadata concerns, not plain stream parts.
-- `permission.asked` and `question.asked` are persisted even though the bridge
+- `permission.asked` and `question.asked` are persisted even though the Pipeline
   handles them as synchronous UI barriers.
 - First-prompt naming is a session concern: the provisional prompt title is
   written immediately, and generated titles patch meta/backend asynchronously.
   Turn finalization only reconciles titles already observed from the backend.
 
-## Legacy Compatibility
+## Storage Contract
 
-Live persistence now always writes SSP records (`stream-part`). The previous
-raw ACP `event` writer is no longer a live architecture path.
-
-Restore still reads legacy raw `event` records as a compatibility fallback for
-sessions written before SSP existed. That fallback is intentionally isolated at
-the deserialization boundary: once loaded, legacy events are rendered through
-the same restore pipeline as projected SSP events.
+The runtime has one persistence contract: `session.jsonl` and `meta.jsonl`, plus
+recursive `subsessions/*/subsession.jsonl` streams. Format conversion is an
+offline release concern and is not part of activation or restore.

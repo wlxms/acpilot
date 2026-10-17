@@ -44,16 +44,16 @@ restored text edit diff: ... added=... removed=... textEditPayload=empty+done
 ```
 
 Those logs proved that checkpoint replay was available, but the session metadata
-needed by the bubble was missing. The fallback `turn-0` id is only a compatibility
-path. It is not the same as the real request id that VS Code uses to associate
-the edit bubble with the editing session.
+needed by the bubble was missing. A generated `turn-0` id is not the real request
+id that VS Code uses to associate the edit bubble with the editing session, so
+the restore path no longer creates synthetic request ids.
 
 The root cause was metadata overwrite:
 
 1. The live external edit produced a valid undo stop id.
 2. `SerializableSessionStream.onExternalEdit()` could persist request details.
 3. Later title updates called the full meta write path.
-4. That full write replaced `_meta.json` and dropped `requestDetails`.
+4. That full write replaced the session metadata snapshot and dropped `requestDetails`.
 5. Restore then had no edit records, so it fell back to `turn-N`.
 
 ## Fixed Contract
@@ -63,7 +63,7 @@ The restore contract is now:
 - Capture the real VS Code request id from `request.id`.
 - Pass it into `SerializableSessionStream`.
 - Persist request details as `{ turnIndex, vscodeRequestId, toolIdEditMap }`.
-- Merge new request details with existing `_meta.json` details.
+- Merge new request details through append-only `meta.jsonl` session patches.
 - Update titles through the metadata merge path instead of overwriting the whole
   meta file.
 - Restore `ChatRequestTurn` with the persisted request id when available.
@@ -84,14 +84,14 @@ Expected healthy logs:
 ## Implementation Points
 
 - `src/participant/handler.ts` passes `request.id` into the serializable stream.
-- `src/acp/streaming/session-stream.ts` persists and merges request details.
-- `src/backends/opencode/opencode-bridge.ts` reports external edit undo stop ids
+- `src/backend/streaming/session-stream.ts` persists and merges request details.
+- `src/backends/opencode/pipeline.ts` reports external edit undo stop ids
   through `onExternalEdit`.
 - `src/participant/session-title.ts` uses `sessionStore.updateMeta()` so title
   changes preserve `requestDetails`.
 - `src/surfaces/vscode/experimental-session.ts` rebuilds request turns with the
   persisted request id and logs whether it came from request details or fallback.
-- `src/acp/checkpoint/replay.ts` still emits the empty edit group plus done
+- `src/backend/checkpoint/replay.ts` still emits the empty edit group plus done
   marker, matching Copilot CLI restore behavior.
 
 ## Verification

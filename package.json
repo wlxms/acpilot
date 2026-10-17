@@ -31,6 +31,13 @@
           "fontPath": "./resources/font-icons/opencode-icon.woff",
           "fontCharacter": "\\E001"
         }
+      },
+      "acpilot-a": {
+        "description": "ACPilot status bar icon (Agent Client Protocol logomark)",
+        "default": {
+          "fontPath": "./resources/font-icons/opencode-icon.woff",
+          "fontCharacter": "\\E002"
+        }
       }
     },
     "commands": [
@@ -42,39 +49,24 @@
     ],
     "languageModelChatProviders": [
       {
-        "vendor": "opencode-cli",
-        "displayName": "OpenCode CLI",
+        "vendor": "opencode",
+        "displayName": "OpenCode",
         "managementCommand": "acpilot.openSettings"
       },
       {
-        "vendor": "opencode-zen",
-        "displayName": "OpenCode Zen",
+        "vendor": "acp",
+        "displayName": "ACP Agent",
+        "managementCommand": "acpilot.openSettings"
+      },
+      {
+        "vendor": "reasonix",
+        "displayName": "Reasonix",
         "managementCommand": "acpilot.openSettings"
       }
     ],
     "configuration": {
       "title": "ACPilot",
       "properties": {
-        "acpilot.experimental.sessionProvider": {
-          "type": "boolean",
-          "default": false,
-          "description": "Enable the experimental ACP-compatible VS Code chat session provider surface when the runtime exposes the required proposed API."
-        },
-        "acpilot.experimental.acpBackendModelSupport": {
-          "type": "boolean",
-          "default": true,
-          "description": "When enabled, ACP backend-specific models (e.g. OpenCode Zen/Go) are registered with sessionOnly=false so they appear in all Copilot session targets. Non-specific models get sessionOnly=true (opencode target only). When disabled, all models get sessionOnly=true."
-        },
-        "acpilot.experimental.acpModelBridge": {
-          "type": "boolean",
-          "default": false,
-          "description": "[Experimental] Enable ACP Model Bridge — bridges ACP backend models into Copilot's native model picker with full vendor isolation. (Not yet implemented)"
-        },
-        "acpilot.experimental.checkpointReplay": {
-          "type": "boolean",
-          "default": true,
-          "description": "Replay restored session file checkpoints through VS Code chat external edits when available, preserving ordinary workspace edits on conflicts."
-        },
         "acpilot.experimental.streamSchedulingMode": {
           "type": "string",
           "default": "tool-first",
@@ -89,6 +81,28 @@
             "Render tools immediately and buffer root reasoning or markdown until their part is complete."
           ],
           "description": "Controls how ACP stream parts are scheduled before rendering to VS Code chat."
+        },
+        "acpilot.backends.reasonix.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable the built-in Reasonix ACP backend target. It starts lazily when the Reasonix chat target is used."
+        },
+        "acpilot.backends.reasonix.command": {
+          "type": "string",
+          "default": "npx",
+          "description": "Command used to spawn the Reasonix ACP agent."
+        },
+        "acpilot.backends.reasonix.args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "-y",
+            "reasonix",
+            "acp"
+          ],
+          "description": "Arguments passed to the Reasonix ACP agent command."
         }
       }
     },
@@ -169,18 +183,73 @@
             "description": "Test questionCarousel UI flow (single-select, multi-select, text input)"
           }
         ]
+      },
+      {
+        "type": "acpilot.acp",
+        "name": "acp",
+        "displayName": "ACP Agent",
+        "description": "Any standard Agent Client Protocol agent (JSON-RPC 2.0)",
+        "icon": "$(acpilot-a)",
+        "inputPlaceholder": "Ask the ACP agent...",
+        "canDelegate": true,
+        "requiresCustomModels": false,
+        "capabilities": {
+          "supportsFileAttachments": true,
+          "supportsToolAttachments": true,
+          "supportsImageAttachments": true
+        },
+        "commands": [
+          {
+            "name": "new",
+            "description": "Start a new conversation session"
+          },
+          {
+            "name": "help",
+            "description": "Show available commands"
+          }
+        ]
+      },
+      {
+        "type": "acpilot.reasonix",
+        "name": "reasonix",
+        "displayName": "Reasonix",
+        "description": "AI coding agent powered by Reasonix ACP",
+        "icon": "$(acpilot-a)",
+        "inputPlaceholder": "Ask Reasonix anything...",
+        "canDelegate": true,
+        "requiresCustomModels": false,
+        "capabilities": {
+          "supportsFileAttachments": true,
+          "supportsToolAttachments": true,
+          "supportsImageAttachments": true
+        },
+        "commands": [
+          {
+            "name": "new",
+            "description": "Start a new conversation session"
+          },
+          {
+            "name": "help",
+            "description": "Show available commands"
+          },
+          {
+            "name": "model",
+            "description": "Show or change the current model"
+          }
+        ]
       }
     ]
   },
   "scripts": {
     "compile": "esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node",
     "watch": "npm run compile -- --sourcemap --watch",
-    "lint": "tsc --noEmit",
+    "lint": "tsc --noEmit && eslint src/",
     "lint:eslint": "eslint src/",
     "lint:all": "tsc --noEmit && eslint src/",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:integration": "vitest run -c vitest.integration.config.ts",
+    "test:integration": "npm run test:runtime",
+    "test:runtime": "npm run compile && node scripts/runtime-smoke.cjs",
     "generate-font": "node scripts/generate-font.cjs",
     "vscode:prepublish": "npm run generate-font && npm run compile"
   },
@@ -188,6 +257,7 @@
     "@eslint/js": "^10.0.1",
     "@types/node": "^20.19.40",
     "@types/vscode": "^1.125.0",
+    "@types/ws": "^8.18.1",
     "@typescript-eslint/eslint-plugin": "^8.60.0",
     "@typescript-eslint/parser": "^8.60.0",
     "esbuild": "^0.24.2",
@@ -199,12 +269,10 @@
     "vitest": "^4.1.5"
   },
   "dependencies": {
-    "@ai-sdk/anthropic": "^3.0.81",
-    "@ai-sdk/google": "^3.0.80",
-    "@ai-sdk/openai": "^3.0.67",
-    "@ai-sdk/openai-compatible": "^2.0.48",
-    "@opencode-ai/sdk": "^1.16.0",
-    "ai": "^6.0.193",
-    "opencode-ai": "^1.16.0"
+    "@agentclientprotocol/sdk": "^1.0.0",
+    "@opencode-ai/sdk": "1.18.0",
+    "opencode-ai": "1.18.0",
+    "ws": "^8.18.3",
+    "zod": "^3.25.0"
   }
 }

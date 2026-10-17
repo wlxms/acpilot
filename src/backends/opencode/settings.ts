@@ -5,23 +5,23 @@
  * declarative `BackendSettingsDescriptor` that the generic panel can render.
  */
 
-import type { BackendSettingsProvider } from '../../acp/backend';
+import type { BackendSettingsProvider } from '../../backend/backend';
 import type {
-  AcpAgent,
-  AcpModel,
+  BackendAgent,
+  BackendModel,
   BackendSettingsDescriptor,
   SettingsFieldGroup,
   TextField,
   SelectField,
   MapField,
-} from '../../acp/types';
-import { isUserSelectableAgent } from '../../acp/types';
-import type { AcpConfigOperations } from '../../acp/backend';
+} from '../../backend/types';
+import { isUserSelectableAgent } from '../../backend/types';
+import type { BackendConfigOperations } from '../../backend/backend';
 
 export class OpenCodeSettingsProvider implements BackendSettingsProvider {
-  constructor(private readonly configOps: AcpConfigOperations) {}
+  constructor(private readonly configOps: BackendConfigOperations) {}
 
-  async getDescriptor(agents: AcpAgent[], models: AcpModel[]): Promise<BackendSettingsDescriptor> {
+  async getDescriptor(agents: BackendAgent[], models: BackendModel[]): Promise<BackendSettingsDescriptor> {
     const configResp = await this.configOps.get();
     const rawConfig = (configResp.data ?? {}) as Record<string, unknown>;
 

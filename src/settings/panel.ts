@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
-import type { BackendSettingsDescriptor } from '../acp/types';
+import type { BackendSettingsDescriptor } from '../backend/types';
+import type { PermissionMode } from '../backend/types';
 
 export interface GlobalSettingItem {
   key: string;
@@ -14,14 +15,29 @@ export type SettingsMessage =
   | { type: 'ready' }
   | { type: 'refreshData' }
   | { type: 'setAgent'; agentId: string }
+  | { type: 'setPermissionMode'; permissionMode: PermissionMode }
   | { type: 'setModel'; providerID: string; modelID: string }
   | { type: 'setDefaultModel'; model: string }
   | { type: 'setDefaultAgent'; agent: string }
   | { type: 'saveBackendSettings'; values: Record<string, unknown> }
   | { type: 'setGlobalSetting'; key: string; value: boolean | string }
-| { type: 'connectProvider'; providerId: string; apiKey: string; baseURL?: string; displayName?: string }
-| { type: 'disconnectProvider'; configKey: string }
-| { type: 'updateProvider'; configKey: string; apiKey: string; baseURL?: string };
+  | { type: 'setBackendTarget'; targetId: string }
+  | { type: 'createAcpTarget'; name?: string; endpoint: string; authToken?: string }
+  | { type: 'updateAcpTarget'; targetId: string; name?: string; endpoint: string; authToken?: string }
+  | { type: 'deleteAcpTarget'; targetId: string }
+  | { type: 'connectProvider'; providerId: string; apiKey: string; baseURL?: string; displayName?: string }
+  | { type: 'disconnectProvider'; configKey: string }
+  | { type: 'updateProvider'; configKey: string; apiKey: string; baseURL?: string };
+
+export interface BackendTargetItem {
+  id: string;
+  kind: 'builtin' | 'acp';
+  name: string;
+  description: string;
+  endpoint?: string;
+  active: boolean;
+  editable: boolean;
+}
 
 export interface SettingsData {
   backendName: string;
@@ -30,6 +46,7 @@ export interface SettingsData {
   currentAgent?: string;
   currentModel?: { providerID: string; modelID: string };
   currentModelDisplayName?: string;
+  currentPermissionMode?: PermissionMode;
   /** Default agent from backend config */
   defaultAgent?: string;
   /** Default model from backend config */
@@ -56,6 +73,10 @@ export interface SettingsData {
   }>;
   /** Extension-level global settings (acpilot.experimental.*) */
   globalSettings?: GlobalSettingItem[];
+  /** Built-in and user-managed backend targets shown in the global Target picker. */
+  backendTargets?: BackendTargetItem[];
+  /** Selected settings target; ACP sessions use the selected ACP target when kind='acp'. */
+  activeBackendTargetId?: string;
 }
 
 export class SettingsPanel {
@@ -105,10 +126,13 @@ export class SettingsPanel {
     void this.panel.webview.postMessage({ type: 'updateData', data });
   }
 
-  public onDidRequestChange: ((message: SettingsMessage) => void) | undefined;
+  public onDidRequestChange: ((message: SettingsMessage) => Promise<void>) | undefined;
+  private messageQueue: Promise<void> = Promise.resolve();
 
   private handleMessage(message: SettingsMessage): void {
-    this.onDidRequestChange?.(message);
+    this.messageQueue = this.messageQueue
+      .then(async () => this.onDidRequestChange?.(message))
+      .then(() => undefined, () => undefined);
   }
 
   private dispose(): void {
@@ -321,14 +345,23 @@ export class SettingsPanel {
     .backend-target-main { display: flex; align-items: center; gap: 10px; }
     .backend-badge {
       width: 32px; height: 32px; border-radius: 8px; background: var(--accent); color: var(--accent-fg);
-      display: flex; align-items: center; justify-content: center; font-weight: 700;
+      display: flex; align-items: center; justify-content: center; flex-shrink: 0;
     }
+    .backend-badge svg { width: 20px; height: 20px; display: block; }
     .backend-meta { color: var(--muted); font-size: 11px; }
+    .target-list { display: flex; flex-direction: column; gap: 6px; margin-top: 12px; }
+    .target-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    .target-row-main { min-width: 0; flex: 1; cursor: pointer; }
+    .target-row-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+    .target-row .item-title, .target-row .item-meta { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .target-form .setting-item { padding: 8px 0; }
+    .target-form input { width: 100%; }
 
-    .session-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .session-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
     .session-grid > .card { display: flex; flex-direction: column; margin-bottom: 0; }
     .session-grid h3 { margin: 0 0 6px; font-size: 13px; font-weight: 600; }
     .session-grid .desc { color: var(--muted); font-size: 11px; margin-bottom: 6px; }
+    @media (max-width: 720px) { .session-grid { grid-template-columns: 1fr; } }
 
     /* Dropdowns */
     .dropdown-container { position: relative; width: 100%; min-width: 0; }
@@ -543,7 +576,11 @@ export class SettingsPanel {
         <div class="card">
           <div class="backend-target">
             <div class="backend-target-main">
-              <div class="backend-badge">AI</div>
+              <div class="backend-badge">
+                <svg viewBox="0 0 24 24" fill="currentColor" aria-label="OpenCode">
+                  <path d="M22 24H2V0h20zM17 4.8H7v14.4h10z"/>
+                </svg>
+              </div>
               <div>
                 <div style="font-weight:600;" id="backend-target-name">OpenCode</div>
                 <div class="backend-meta">Current backend target</div>
@@ -567,6 +604,19 @@ export class SettingsPanel {
                 <div class="dropdown-trigger-icon">▼</div>
               </button>
               <div id="agent-dropdown-panel" class="dropdown-panel"></div>
+            </div>
+          </div>
+          <div class="card">
+            <h3>Permissions</h3>
+            <div class="desc">Access scope for the next request</div>
+            <div class="dropdown-container">
+              <button id="permission-mode-dropdown-trigger" class="dropdown-trigger">
+                <div id="permission-mode-dropdown-selected">
+                  <div class="item-title">Ask</div>
+                </div>
+                <div class="dropdown-trigger-icon">▼</div>
+              </button>
+              <div id="permission-mode-dropdown-panel" class="dropdown-panel"></div>
             </div>
           </div>
           <div class="card">
@@ -659,20 +709,42 @@ export class SettingsPanel {
 
   <div id="backend-chooser-modal" class="modal-backdrop hidden">
     <div class="modal">
-      <h3>Choose Backend</h3>
-      <div class="desc">Backend switching UI placeholder. Current implementation only supports OpenCode. Custom backend entry is interface-only for now.</div>
-      <div class="card" style="padding:0; border:none; background:transparent;">
-        <div class="list-card-item selected">
-          <div class="item-title">OpenCode</div>
-          <div class="item-meta">Built-in backend</div>
-        </div>
-        <div class="list-card-item">
-          <div class="item-title">Custom Backend</div>
-          <div class="item-meta">Placeholder only — no runtime implementation yet</div>
-        </div>
-      </div>
+      <h3>Choose Target</h3>
+      <div class="desc">Select the Settings target. When an ACP target is selected, the Copilot ACP session target connects to that remote endpoint.</div>
+      <div id="backend-target-list" class="target-list"></div>
       <div class="modal-actions">
+        <button id="btn-open-acp-target-form" class="button-secondary">Add ACP Target</button>
         <button id="btn-close-backend-chooser" class="button-secondary">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="acp-target-modal" class="modal-backdrop hidden">
+    <div class="modal">
+      <h3 id="acp-target-modal-title">ACP Target</h3>
+      <div class="desc">Configure a remote Agent Client Protocol endpoint.</div>
+      <div class="target-form">
+        <input type="hidden" id="acp-target-id">
+        <div class="setting-item">
+          <div class="setting-label">Name</div>
+          <div class="setting-desc">Display name shown in the Target picker</div>
+          <div class="setting-control"><input type="text" id="acp-target-name" placeholder="Production ACP"></div>
+        </div>
+        <div class="setting-item">
+          <div class="setting-label">Endpoint</div>
+          <div class="setting-desc">WebSocket URL for the remote ACP agent</div>
+          <div class="setting-control"><input type="text" id="acp-target-endpoint" placeholder="wss://agent.example.com/acp"></div>
+        </div>
+        <div class="setting-item">
+          <div class="setting-label">Auth Token</div>
+          <div class="setting-desc">Optional bearer token for the remote endpoint. Leave blank while editing to keep the current token.</div>
+          <div class="setting-control"><input type="password" id="acp-target-token" placeholder="Optional"></div>
+        </div>
+        <div class="modal-actions">
+          <button id="btn-delete-acp-target" class="button-secondary hidden" style="color:#f48771; border-color:#f48771;">Delete</button>
+          <button id="btn-cancel-acp-target" class="button-secondary">Cancel</button>
+          <button id="btn-save-acp-target">Save</button>
+        </div>
       </div>
     </div>
   </div>
@@ -708,6 +780,7 @@ export class SettingsPanel {
 
     // Backend chooser
     document.getElementById('btn-backend-chooser').addEventListener('click', () => {
+      renderBackendTargets(currentData);
       document.getElementById('backend-chooser-modal').classList.remove('hidden');
     });
     document.getElementById('btn-close-backend-chooser').addEventListener('click', () => {
@@ -718,25 +791,51 @@ export class SettingsPanel {
         document.getElementById('backend-chooser-modal').classList.add('hidden');
       }
     });
-    // + ACP Backend button reuses the backend chooser for now
     document.getElementById('btn-acp-backend-add').addEventListener('click', () => {
-      document.getElementById('backend-chooser-modal').classList.remove('hidden');
+      openAcpTargetModal();
+    });
+    document.getElementById('btn-open-acp-target-form').addEventListener('click', () => {
+      openAcpTargetModal();
+    });
+    document.getElementById('btn-cancel-acp-target').addEventListener('click', () => {
+      closeAcpTargetModal();
+    });
+    document.getElementById('btn-save-acp-target').addEventListener('click', saveAcpTargetFromForm);
+    document.getElementById('btn-delete-acp-target').addEventListener('click', () => {
+      const id = document.getElementById('acp-target-id').value;
+      if (!id) return;
+      if (!confirm('Delete this ACP target?')) return;
+      vscode.postMessage({ type: 'deleteAcpTarget', targetId: id });
+      closeAcpTargetModal();
+    });
+    document.getElementById('acp-target-modal').addEventListener('click', (event) => {
+      if (event.target && event.target.id === 'acp-target-modal') {
+        closeAcpTargetModal();
+      }
     });
 
     // Click-outside to close dropdowns
     document.addEventListener('click', (event) => {
       const isAgentDropdown = event.target.closest('#agent-dropdown-trigger');
       const isModelDropdown = event.target.closest('#model-dropdown-trigger');
+      const isPermissionModeDropdown = event.target.closest('#permission-mode-dropdown-trigger');
 
       if (isAgentDropdown) {
         document.getElementById('agent-dropdown-panel').classList.toggle('open');
         document.getElementById('model-dropdown-panel').classList.remove('open');
+        document.getElementById('permission-mode-dropdown-panel').classList.remove('open');
       } else if (isModelDropdown) {
         document.getElementById('model-dropdown-panel').classList.toggle('open');
         document.getElementById('agent-dropdown-panel').classList.remove('open');
+        document.getElementById('permission-mode-dropdown-panel').classList.remove('open');
+      } else if (isPermissionModeDropdown) {
+        document.getElementById('permission-mode-dropdown-panel').classList.toggle('open');
+        document.getElementById('agent-dropdown-panel').classList.remove('open');
+        document.getElementById('model-dropdown-panel').classList.remove('open');
       } else if (!event.target.closest('.dropdown-panel')) {
         document.getElementById('agent-dropdown-panel').classList.remove('open');
         document.getElementById('model-dropdown-panel').classList.remove('open');
+        document.getElementById('permission-mode-dropdown-panel').classList.remove('open');
       }
     });
 
@@ -750,8 +849,119 @@ export class SettingsPanel {
       }
     });
 
+    function renderBackendTargets(data) {
+      const targets = data?.backendTargets || [];
+      const active = targets.find(t => t.active) || targets[0];
+      document.getElementById('backend-target-name').textContent = active?.name || data?.backendName || 'Backend';
+      const meta = document.querySelector('.backend-meta');
+      if (meta) {
+        meta.textContent = active?.kind === 'acp'
+          ? (active.endpoint || active.description || 'ACP remote target')
+          : (active?.description || 'Current backend target');
+      }
+
+      const list = document.getElementById('backend-target-list');
+      if (!list) return;
+      list.innerHTML = '';
+
+      if (targets.length === 0) {
+        list.innerHTML = '<div class="empty-state">No targets available.</div>';
+        return;
+      }
+
+      targets.forEach(target => {
+        const row = document.createElement('div');
+        row.className = 'list-card-item target-row' + (target.active ? ' selected' : '');
+
+        const main = document.createElement('div');
+        main.className = 'target-row-main';
+        main.innerHTML =
+          '<div class="item-title">' + escapeHtml(target.name) + '</div>' +
+          '<div class="item-meta">' + escapeHtml(target.endpoint || target.description || '') + '</div>';
+        main.addEventListener('click', () => selectBackendTarget(target.id));
+        row.appendChild(main);
+
+        const actions = document.createElement('div');
+        actions.className = 'target-row-actions';
+
+        if (!target.active) {
+          const useBtn = document.createElement('button');
+          useBtn.className = 'button-secondary';
+          useBtn.textContent = 'Use';
+          useBtn.addEventListener('click', (event) => {
+            event.stopPropagation();
+            selectBackendTarget(target.id);
+          });
+          actions.appendChild(useBtn);
+        }
+
+        if (target.editable) {
+          const editBtn = document.createElement('button');
+          editBtn.className = 'button-secondary';
+          editBtn.textContent = 'Edit';
+          editBtn.addEventListener('click', (event) => {
+            event.stopPropagation();
+            openAcpTargetModal(target);
+          });
+          actions.appendChild(editBtn);
+        }
+
+        row.appendChild(actions);
+        list.appendChild(row);
+      });
+    }
+
+    function selectBackendTarget(targetId) {
+      vscode.postMessage({ type: 'setBackendTarget', targetId });
+      document.getElementById('backend-chooser-modal').classList.add('hidden');
+    }
+
+    function openAcpTargetModal(target) {
+      document.getElementById('acp-target-modal-title').textContent = target ? 'Edit ACP Target' : 'Add ACP Target';
+      document.getElementById('acp-target-id').value = target?.kind === 'acp'
+        ? target.id.replace(/^acp:/, '')
+        : '';
+      document.getElementById('acp-target-name').value = target?.name || '';
+      document.getElementById('acp-target-endpoint').value = target?.endpoint || '';
+      document.getElementById('acp-target-token').value = '';
+      document.getElementById('btn-delete-acp-target').classList.toggle('hidden', !target || target.kind !== 'acp');
+      document.getElementById('backend-chooser-modal').classList.add('hidden');
+      document.getElementById('acp-target-modal').classList.remove('hidden');
+    }
+
+    function closeAcpTargetModal() {
+      document.getElementById('acp-target-modal').classList.add('hidden');
+      document.getElementById('acp-target-id').value = '';
+      document.getElementById('acp-target-name').value = '';
+      document.getElementById('acp-target-endpoint').value = '';
+      document.getElementById('acp-target-token').value = '';
+    }
+
+    function saveAcpTargetFromForm() {
+      const id = document.getElementById('acp-target-id').value.trim();
+      const name = document.getElementById('acp-target-name').value.trim();
+      const endpoint = document.getElementById('acp-target-endpoint').value.trim();
+      const authToken = document.getElementById('acp-target-token').value.trim();
+      if (!endpoint) {
+        alert('Endpoint is required');
+        return;
+      }
+      if (!/^wss?:\\/\\//i.test(endpoint)) {
+        alert('Endpoint must start with ws:// or wss://');
+        return;
+      }
+      vscode.postMessage({
+        type: id ? 'updateAcpTarget' : 'createAcpTarget',
+        ...(id ? { targetId: id } : {}),
+        name: name || undefined,
+        endpoint,
+        authToken: authToken || undefined,
+      });
+      closeAcpTargetModal();
+    }
+
     function renderData(data) {
-      document.getElementById('backend-target-name').textContent = data.backendName || 'Backend';
+      renderBackendTargets(data);
 
       const agentSelected = document.getElementById('agent-dropdown-selected');
       const agentPanel = document.getElementById('agent-dropdown-panel');
@@ -781,6 +991,35 @@ export class SettingsPanel {
       // Collapsed trigger shows only the selected title (description is shown
       // inside the expanded dropdown panel on each option).
       agentSelected.innerHTML = '<div class="item-title">' + escapeHtml(currentAgentName) + '</div>';
+
+      const permissionModeOptions = [
+        { value: 'full-edit', label: 'Full access', description: 'Allow editing, execution, and subagents without prompting' },
+        { value: 'approval', label: 'Ask', description: 'Ask before editing, execution, and subagent operations' },
+        { value: 'read-only', label: 'Read-only', description: 'Disallow editing, execution, and subagent operations' },
+      ];
+      const permissionModePanel = document.getElementById('permission-mode-dropdown-panel');
+      const permissionModeSelected = document.getElementById('permission-mode-dropdown-selected');
+      permissionModePanel.innerHTML = '';
+      const currentPermissionMode = data.currentPermissionMode === 'full-edit'
+        || data.currentPermissionMode === 'read-only'
+        || data.currentPermissionMode === 'approval'
+        ? data.currentPermissionMode
+        : 'approval';
+      permissionModeOptions.forEach(option => {
+        const isSelected = option.value === currentPermissionMode;
+        const item = document.createElement('div');
+        item.className = 'list-card-item' + (isSelected ? ' selected' : '');
+        item.innerHTML = '<div class="item-title">' + escapeHtml(option.label) + '</div>' +
+          '<div class="item-meta">' + escapeHtml(option.description) + '</div>';
+        item.onclick = (e) => {
+          e.stopPropagation();
+          permissionModePanel.classList.remove('open');
+          vscode.postMessage({ type: 'setPermissionMode', permissionMode: option.value });
+        };
+        permissionModePanel.appendChild(item);
+      });
+      permissionModeSelected.innerHTML = '<div class="item-title">'
+        + escapeHtml(permissionModeOptions.find(option => option.value === currentPermissionMode)?.label ?? 'Ask') + '</div>';
 
       const modelSelected = document.getElementById('model-dropdown-selected');
       const modelPanel = document.getElementById('model-dropdown-panel');
@@ -998,6 +1237,43 @@ export class SettingsPanel {
       agentCtrl.appendChild(selDefaultAgent);
       agentRow.appendChild(agentCtrl);
       wrapper.appendChild(agentRow);
+
+      // Permission mode applies to requests made with the selected Agent and
+      // is shared with the Current Session control above.
+      const permissionRow = document.createElement('div');
+      permissionRow.className = 'setting-item';
+      const permissionText = document.createElement('div');
+      permissionText.className = 'setting-text';
+      permissionText.innerHTML = '<div class="setting-label">Permissions</div><div class="setting-desc">Permission scope used for Agent requests</div>';
+      permissionRow.appendChild(permissionText);
+      const permissionCtrl = document.createElement('div');
+      permissionCtrl.className = 'setting-control';
+      const selPermissionMode = document.createElement('select');
+      selPermissionMode.id = 'sel-default-permission-mode';
+      [
+        { value: 'full-edit', label: 'Full access' },
+        { value: 'approval', label: 'Ask' },
+        { value: 'read-only', label: 'Read-only' },
+      ].forEach(option => {
+        const item = document.createElement('option');
+        item.value = option.value;
+        item.textContent = option.label;
+        if (option.value === (data.currentPermissionMode === 'full-edit'
+          || data.currentPermissionMode === 'read-only'
+          || data.currentPermissionMode === 'approval'
+          ? data.currentPermissionMode
+          : 'approval')) {
+          item.selected = true;
+        }
+        selPermissionMode.appendChild(item);
+      });
+      selPermissionMode.onchange = () => vscode.postMessage({
+        type: 'setPermissionMode',
+        permissionMode: selPermissionMode.value,
+      });
+      permissionCtrl.appendChild(selPermissionMode);
+      permissionRow.appendChild(permissionCtrl);
+      wrapper.appendChild(permissionRow);
 
       // Default Model
       const modelRow = document.createElement('div');

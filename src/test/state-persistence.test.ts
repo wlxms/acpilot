@@ -4,7 +4,7 @@ import {
   loadPersistedSettingsState,
   savePersistedSettingsState,
 } from '../settings/state-persistence';
-import type { SelectionState } from '../acp/app-event-bus';
+import type { SelectionState } from '../backend/app-event-bus';
 
 class TestMemento implements vscode.Memento {
   private store = new Map<string, unknown>();
@@ -53,7 +53,7 @@ describe('state-persistence', () => {
   });
 
   it('returns empty object when no persisted state exists', () => {
-    expect(loadPersistedSettingsState(context)).toEqual({});
+    expect(loadPersistedSettingsState(context, 'opencode')).toEqual({});
   });
 
   it('saves and loads full selection state', () => {
@@ -61,11 +61,12 @@ describe('state-persistence', () => {
       agent: 'coder',
       model: { providerID: 'anthropic', modelID: 'claude-sonnet-4' },
       modelDisplayName: 'Claude Sonnet 4',
+      permissionMode: 'read-only',
     };
 
-    savePersistedSettingsState(context, state);
+    savePersistedSettingsState(context, 'opencode', state);
 
-    expect(loadPersistedSettingsState(context)).toEqual(state);
+    expect(loadPersistedSettingsState(context, 'opencode')).toEqual(state);
   });
 
   it('saves and loads partial selection state', () => {
@@ -73,32 +74,53 @@ describe('state-persistence', () => {
       model: { providerID: 'openai', modelID: 'gpt-4o' },
     };
 
-    savePersistedSettingsState(context, state);
+    savePersistedSettingsState(context, 'opencode', state);
 
-    expect(loadPersistedSettingsState(context)).toEqual({
+    expect(loadPersistedSettingsState(context, 'opencode')).toEqual({
       agent: undefined,
       model: { providerID: 'openai', modelID: 'gpt-4o' },
       modelDisplayName: undefined,
+      permissionMode: undefined,
     });
   });
 
   it('overwrites prior persisted state on subsequent saves', () => {
-    savePersistedSettingsState(context, {
+    savePersistedSettingsState(context, 'opencode', {
       agent: 'old-agent',
       model: { providerID: 'openai', modelID: 'gpt-4' },
       modelDisplayName: 'GPT-4',
     });
 
-    savePersistedSettingsState(context, {
+    savePersistedSettingsState(context, 'opencode', {
       agent: 'new-agent',
       model: { providerID: 'google', modelID: 'gemini-2.5-pro' },
       modelDisplayName: 'Gemini 2.5 Pro',
     });
 
-    expect(loadPersistedSettingsState(context)).toEqual({
+    expect(loadPersistedSettingsState(context, 'opencode')).toEqual({
       agent: 'new-agent',
       model: { providerID: 'google', modelID: 'gemini-2.5-pro' },
       modelDisplayName: 'Gemini 2.5 Pro',
+    });
+  });
+
+  it('keeps ACP target selections in separate instance namespaces', () => {
+    savePersistedSettingsState(context, 'acp:target-a', {
+      agent: 'agent-a',
+      model: { providerID: 'provider-a', modelID: 'model-a' },
+    });
+    savePersistedSettingsState(context, 'acp:target-b', {
+      agent: 'agent-b',
+      model: { providerID: 'provider-b', modelID: 'model-b' },
+    });
+
+    expect(loadPersistedSettingsState(context, 'acp:target-a')).toMatchObject({
+      agent: 'agent-a',
+      model: { providerID: 'provider-a', modelID: 'model-a' },
+    });
+    expect(loadPersistedSettingsState(context, 'acp:target-b')).toMatchObject({
+      agent: 'agent-b',
+      model: { providerID: 'provider-b', modelID: 'model-b' },
     });
   });
 });

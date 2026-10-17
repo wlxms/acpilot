@@ -1,10 +1,18 @@
 # TODO-03 知识储备：接收图片 / 文件附件 / 会话上下文
 
+> **历史调研归档**：本文保留附件能力的早期调研，正文中的 `src/acp/*` 文件路径和
+> “当前状态”已过时。现行公共类型位于 `src/backend/*`，具体协议转换由对应 Backend
+> 负责；架构边界见
+> [阶段一架构设计](../docs/refactor/copilot-agent-sss-phase1-design.md)。
+>
+> **完成状态（2026-09）**：附件提取已接入 `handler.ts`，通过
+> `BackendFileAttachment` 传给各 Backend adapter；下文保留为早期方案和 API 调研。
+
 ## 1. TODO 目标描述
 
 **任务**: 支持从 VSCode 会话中接收图片、文件附件、会话历史等额外信息，传递给 OpenCode backend 处理。
 
-**当前状态**: VSCode Chat 的 `chatSessions` contribution 已声明 `supportsFileAttachments: true`，但 `src/participant/handler.ts` 中的 request handler 仅处理了 `request.prompt`（文本输入）和 `context.history`（会话同步），**完全未解析 `request.references`**（附件数组）。
+**历史状态**: VSCode Chat 的 `chatSessions` contribution 已声明 `supportsFileAttachments: true`，但本文编写时 request handler 仅处理了 `request.prompt`（文本输入）和 `context.history`（会话同步），**完全未解析 `request.references`**（附件数组）；现行 `handler.ts` 已通过 `extractAttachmentsFromReferences()` 提取附件和路径引用。
 
 **最终目标**: 
 1. 用户在 VSCode Chat 输入框中粘贴图片、拖放文件、引用代码选区时，OpenCode 能正确接收并传递给模型
@@ -228,16 +236,16 @@ const result = await this.sdk.session.prompt({
 
 **关键发现**: SDK 完整支持 `FilePartInput`，其中 `url` 字段可以接受 `data:` URI。这意味着图片附件可以编码为 base64 后通过 `data:image/png;base64,...` 格式传递。
 
-### 3.4 当前 handler.ts 中缺失的附件处理
+### 3.4 历史 handler.ts 中缺失的附件处理
 
-`handler.ts` 的 `createParticipantHandler` 函数中：
+本文快照中的 `createParticipantHandler` 函数中：
 
 - ✅ `request.prompt` — 已解析（用户文本输入）
 - ✅ `context.history` — 已解析（仅用于 session 同步，不转发内容）
-- ❌ `request.references` — **完全未解析**
-- ❌ `request.references` 中的 `ChatReferenceBinaryData` — 完全未提取
-- ❌ `request.references` 中的 `Uri` — 完全未读取
-- ❌ `request.references` 中的 `Location` — 完全未读取
+- ❌ `request.references` — **当时完全未解析**
+- ❌ `request.references` 中的 `ChatReferenceBinaryData` — 当时完全未提取
+- ❌ `request.references` 中的 `Uri` — 当时完全未读取
+- ❌ `request.references` 中的 `Location` — 当时完全未读取
 
 `handler.ts` 中的 prompt 调用（第 302-306 行）:
 
@@ -266,7 +274,8 @@ prompt(
 ): Promise<AcpResult<unknown>>;
 ```
 
-**当前接口不支持传递附件或 parts。** 要实现图片/文件附件支持，需要扩展此接口。
+**历史接口不支持传递附件或 parts。** 现行 `BackendSessionOperations.prompt()` 已接受
+`BackendFileAttachment[]`，由具体 adapter 转换为后端协议。
 
 ---
 

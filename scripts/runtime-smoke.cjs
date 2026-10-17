@@ -196,7 +196,7 @@ async function waitForOpenCodeModels(port, trace) {
     const snapshot = await execute(descriptor.port, 'return await api.snapshot();');
     trace('snapshot', snapshot.backends.map(backend => ({ id: backend.id, status: backend.status })));
     const ids = snapshot.backends.map(backend => backend.id).sort();
-    for (const required of ['acp', 'opencode', 'reasonix']) {
+    for (const required of ['acp', 'opencode', 'dsh', 'reasonix']) {
       if (!ids.includes(required)) {
         throw new Error(`Missing backend in runtime snapshot: ${required}`);
       }
@@ -211,6 +211,13 @@ async function waitForOpenCodeModels(port, trace) {
     );
     if (acpState.id !== 'acp' || acpState.instanceKey !== 'acp:unconfigured') {
       throw new Error(`Unexpected ACP backend inspection: ${JSON.stringify(acpState)}`);
+    }
+    const dshState = await execute(
+      descriptor.port,
+      "return await api.inspectBackend('dsh');",
+    );
+    if (dshState.id !== 'dsh' || dshState.instanceKey !== 'dsh:unconfigured') {
+      throw new Error(`Unexpected DSH backend inspection: ${JSON.stringify(dshState)}`);
     }
     const acpSessions = await execute(
       descriptor.port,
@@ -227,7 +234,7 @@ async function waitForOpenCodeModels(port, trace) {
       throw new Error('ACP model listing did not return an array');
     }
     const modelListings = {};
-    for (const backendId of ['opencode', 'acp', 'reasonix']) {
+    for (const backendId of ['opencode', 'acp', 'dsh', 'reasonix']) {
       trace(`listLanguageModels ${backendId} start`);
       const models = backendId === 'opencode'
         ? await waitForOpenCodeModels(descriptor.port, trace)
@@ -274,10 +281,11 @@ async function waitForOpenCodeModels(port, trace) {
     }
     let modelRequest;
     if (process.env.ACPILOT_RUNTIME_MODEL_REQUEST === '1') {
-      const target = modelListings.opencode[0] || modelListings.acp[0] || modelListings.reasonix[0];
+      const target = modelListings.opencode[0] || modelListings.acp[0] || modelListings.dsh[0] || modelListings.reasonix[0];
       if (target) {
         const backendId = target.vendor === 'opencode' ? 'opencode'
-          : target.vendor === 'acp' ? 'acp' : 'reasonix';
+          : target.vendor === 'acp' ? 'acp'
+            : target.vendor === 'dsh' ? 'dsh' : 'reasonix';
         const started = await execute(
           descriptor.port,
           `return await api.startModelRequest(${JSON.stringify(backendId)}, ${JSON.stringify(target.id)}, 'Reply with one short sentence.');`,

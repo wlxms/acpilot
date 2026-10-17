@@ -8,18 +8,21 @@ import type { Backend } from '../backend/backend';
 
 describe('built-in backend registry', () => {
   it('loads every declared backend factory from the shared registry', () => {
-    expect(listBackendIds()).toEqual(expect.arrayContaining(['opencode', 'acp', 'reasonix']));
+    expect(listBackendIds()).toEqual(expect.arrayContaining(['opencode', 'acp', 'dsh', 'reasonix']));
 
     const opencode = createBackend('opencode');
     const acp = createBackend('acp');
     const reasonix = createBackend('reasonix');
+    const dsh = createBackend('dsh');
 
     expect(opencode.name).toBe('opencode');
     expect(acp.name).toBe('acp');
     expect(reasonix.name).toBe('reasonix');
+    expect(dsh.name).toBe('dsh');
     expect(opencode.modelProvider?.vendor).toBe('opencode');
     expect(acp.modelProvider?.vendor).toBe('acp');
     expect(reasonix.modelProvider?.vendor).toBe('reasonix');
+    expect(dsh.modelProvider?.vendor).toBe('dsh');
   });
 
   it('rejects a descriptor whose vendor differs from its model provider', () => {

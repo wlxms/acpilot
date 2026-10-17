@@ -317,9 +317,20 @@ export class AcpBackend implements Backend<ActiveSessionMessage> {
       let dispose: () => void;
       if (options.local) {
         const spawned = spawnAcpAgent({ ...options.local, cwd: options.local.cwd ?? directory });
+        try {
+          if (spawned.ready) {
+            await spawned.ready;
+          }
+        } catch (error) {
+          if (spawned.dispose) {
+            spawned.dispose();
+          } else {
+            spawned.process.kill();
+          }
+          throw error;
+        }
         stream = spawned.stream;
-        const child = spawned.process;
-        dispose = () => { child.kill(); };
+        dispose = spawned.dispose ?? (() => { spawned.process.kill(); });
       } else if (options.remote?.url) {
         const remote = await connectAcpRemote(options.remote);
         // A remote connect can outlive stop() before it returns its stream.

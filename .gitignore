@@ -6,4 +6,5 @@ dist
 *.tsbuildinfo
 .sisyphus
 tmp/
+.acpilot/
 120

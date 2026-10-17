@@ -13,7 +13,7 @@ import { ensureSessionDir } from './workspace-setup';
 import { SubsessionStream } from './subsession-stream';
 import { SessionStreamNodeBase } from './session-stream-node';
 import type { SessionStreamSchedulingMode } from './session-stream-node';
-import type { FileSnapshotRecord, SessionTitleSource } from '../serializable/types';
+import type { SessionTitleSource } from '../serializable/types';
 import type { SspStream } from '../../ssp/types';
 
 export interface SSSConfig {
@@ -45,6 +45,7 @@ export class SerializableSessionStream extends SessionStreamNodeBase<SubsessionS
   constructor(stream: vscode.ChatResponseStream, config: SSSConfig) {
     const schedulingMode = config.schedulingMode ?? getConfiguredSchedulingMode();
     super(stream as unknown as SspStream, {
+      sessionId: config.sessionId,
       turnIndex: config.turnIndex,
       requestId: config.requestId,
       schedulingMode,
@@ -65,6 +66,7 @@ export class SerializableSessionStream extends SessionStreamNodeBase<SubsessionS
       {
         turnIndex: this.rootConfig.turnIndex,
         requestId: this.rootConfig.requestId,
+        sessionId: this.rootConfig.sessionId,
         parentSessionId: this.rootConfig.sessionId,
         subAgentPath: [subAgentInvocationId],
         scheduler: this.scheduler,
@@ -73,13 +75,13 @@ export class SerializableSessionStream extends SessionStreamNodeBase<SubsessionS
   }
 
   writeMeta(patch: Record<string, unknown>): void {
-    if (!this.isActive) return;
+    if (!this.isActive) {return;}
     this.appendMeta({ type: 'session', ...patch });
   }
 
   recordFirstPrompt(prompt: string | undefined): void {
     const normalized = prompt?.replace(/\s+/g, ' ').trim();
-    if (!normalized || this.firstPrompt) return;
+    if (!normalized || this.firstPrompt) {return;}
     this.firstPrompt = normalized;
   }
 
@@ -93,7 +95,7 @@ export class SerializableSessionStream extends SessionStreamNodeBase<SubsessionS
     options?: { provisional?: boolean },
   ): string | undefined {
     const normalized = title.replace(/\s+/g, ' ').trim();
-    if (!normalized) return undefined;
+    if (!normalized) {return undefined;}
     const provisional = options?.provisional ?? false;
 
     this.writeMeta({
@@ -119,15 +121,6 @@ export class SerializableSessionStream extends SessionStreamNodeBase<SubsessionS
       });
     }
     return normalized;
-  }
-
-  serializeSnapshot(snapshot: FileSnapshotRecord): void {
-    if (!this.isActive) return;
-    const snapshotWithTurn: FileSnapshotRecord = {
-      ...snapshot,
-      turnIndex: snapshot.turnIndex ?? this.rootConfig.turnIndex,
-    };
-    this.appendStreamLine(buildLine('snapshot', snapshotWithTurn));
   }
 
   async initialize(): Promise<void> {
@@ -165,7 +158,7 @@ export class SerializableSessionStream extends SessionStreamNodeBase<SubsessionS
   }
 
   close(): void {
-    if (!this.isActive) return;
+    if (!this.isActive) {return;}
     this.flushScheduled('close');
     this.deactivate();
     this.appendStreamLine(buildLine('turn-end', {
@@ -182,7 +175,7 @@ export class SerializableSessionStream extends SessionStreamNodeBase<SubsessionS
   getSessionPath(): string | null { return this.streamPath; }
 
   protected override async beforeAppendStream(): Promise<void> {
-    if (this.headerWritten || !this.streamPath) return;
+    if (this.headerWritten || !this.streamPath) {return;}
     this.headerWritten = true;
     const hasContent = await fileHasContent(this.streamPath);
     if (!hasContent) {

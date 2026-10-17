@@ -2,7 +2,7 @@
  * SubagentManager + SubagentScope + formatSubagentProgress.
  *
  * Fully owned by SSP — no dependency on participant layer.
- * The participant layer and Bridge import FROM here, not the reverse.
+ * The participant layer and pipelines import FROM here, not the reverse.
  */
 
 // ===========================================================================
@@ -13,6 +13,10 @@ export interface SubagentScope {
   callId: string;
   toolCalls: Array<{ name: string; title?: string; status: string }>;
   completed: boolean;
+  /** True when the backend ended this subagent session with an error. */
+  failed?: boolean;
+  /** Backend-provided terminal error for a failed subagent session. */
+  error?: string;
   childSessionId?: string;
   childIdle?: boolean;
   subAgentInvocationId?: string;
@@ -83,7 +87,25 @@ export class SubagentManager {
 
   completeSubagent(callId: string, output?: string): SubagentScope | undefined {
     const scope = this.scopes.get(callId);
-    if (scope) { scope.completed = true; if (output !== undefined) scope.output = output; }
+    if (scope) {
+      scope.completed = true;
+      // A late task.completed event must not overwrite a terminal child error.
+      if (output !== undefined && !scope.failed) {scope.output = output;}
+    }
+    return scope;
+  }
+
+  /** Mark a subagent terminally failed and make it no longer busy. */
+  failSubagent(callId: string, error: string): SubagentScope | undefined {
+    const scope = this.scopes.get(callId);
+    if (scope) {
+      scope.completed = true;
+      scope.childIdle = true;
+      scope.failed = true;
+      scope.error = error;
+      scope.output = error;
+      scope.timeEnd = Date.now();
+    }
     return scope;
   }
 
@@ -112,10 +134,10 @@ export class SubagentManager {
 
   findScopeForSession(sessionId: string): SubagentScope | undefined {
     for (const scope of this.scopes.values()) {
-      if (scope.childSessionId === sessionId) return scope;
+      if (scope.childSessionId === sessionId) {return scope;}
     }
     for (const scope of this.scopes.values()) {
-      if (scope.descendantSessionIds.has(sessionId)) return scope;
+      if (scope.descendantSessionIds.has(sessionId)) {return scope;}
     }
     return undefined;
   }

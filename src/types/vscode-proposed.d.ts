@@ -40,6 +40,13 @@ declare module 'vscode' {
 declare module 'vscode' {
   export interface LanguageModelChatInformation {
     /**
+     * Marks a third-party language model as a user-owned/backend-owned model.
+     * VS Code uses this to include non-Copilot vendors in BYOK and Agent mode
+     * model selection flows.
+     */
+    readonly isBYOK?: boolean;
+
+    /**
      * When present, restricts this model to a specific chat session type.
      */
     readonly targetChatSessionType?: string;
@@ -53,6 +60,15 @@ declare module 'vscode' {
      * Whether this model is the default selection.
      */
     readonly isDefault?: boolean | Record<string, boolean>;
+  }
+
+  /**
+   * Whether the model is intended for Agent mode. Newer VS Code builds treat
+   * an omitted value as enabled, but declaring it explicitly keeps ACPilot
+   * models eligible across hosts that require the capability to be present.
+   */
+  export interface LanguageModelChatCapabilities {
+    readonly agentMode?: boolean;
   }
 
   /**
@@ -433,15 +449,16 @@ declare module 'vscode' {
      *   Must match the `type` declared in the `chatSessions` contribution
      *   in package.json.
      * @param provider - The content provider implementation.
-     * @param defaultChatParticipant - The chat participant to use as default
-     *   for sessions created through this provider.
+     * @param defaultChatParticipant - Legacy positional participant argument.
+     *   Session contributions with `canDelegate` are registered by VS Code;
+     *   providers may pass `undefined` here.
      * @param capabilities - Optional capabilities for this provider.
      * @returns A disposable that unregisters the provider.
      */
     export function registerChatSessionContentProvider(
       scheme: string,
       provider: ChatSessionContentProvider,
-      defaultChatParticipant: ChatParticipant,
+      defaultChatParticipant?: ChatParticipant,
       capabilities?: ChatSessionCapabilities,
     ): Disposable;
 

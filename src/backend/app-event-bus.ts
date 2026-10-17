@@ -7,7 +7,7 @@
  * No external dependencies — purely a TypeScript generic event emitter.
  */
 
-import type { BackendSessionStatus } from './types';
+import type { BackendSessionStatus, PermissionMode } from './types';
 
 // ===========================================================================
 // Shared selection-state type (also re-exported from selection-store.ts)
@@ -17,6 +17,7 @@ export interface SelectionState {
   agent?: string;
   model?: { providerID: string; modelID: string };
   modelDisplayName?: string;
+  permissionMode?: PermissionMode;
 }
 
 // ===========================================================================
@@ -24,12 +25,20 @@ export interface SelectionState {
 // ===========================================================================
 
 export interface AppEventMap {
+  /** Fired before a backend runtime is replaced or the extension deactivates. */
+  'backend-runtime-changing': {
+    backendId: string;
+    runtimeGeneration: number;
+    instanceKey: string;
+  };
   /** Fired when a backend has completed startup and is ready for use */
   'backend-ready': { backendId: string };
   /** Fired when a backend's session list has changed (created, deleted, etc.) */
   'session-list-changed': { backendId: string };
   /** Fired when the user changes agent or model selection for a backend */
   'selection-changed': SelectionState & { backendId: string };
+  /** Fired after the shared model catalog has been rebuilt for a backend. */
+  'models-changed': { backendId: string };
   /** Fired when a specific session's status transitions (idle → busy → retry → idle) */
   'session-status-changed': { sessionId: string; status: BackendSessionStatus; backendId: string };
 }
@@ -39,7 +48,7 @@ export interface AppEventMap {
 // ===========================================================================
 
 export class AppEventBus {
-  private handlers = new Map<string, Set<Function>>();
+  private handlers = new Map<string, Set<(payload: unknown) => void>>();
 
   /**
    * Subscribe to an event.
@@ -54,9 +63,10 @@ export class AppEventBus {
       set = new Set();
       this.handlers.set(event as string, set);
     }
-    set.add(handler);
+    const storedHandler = handler as (payload: unknown) => void;
+    set.add(storedHandler);
     return () => {
-      set?.delete(handler);
+      set?.delete(storedHandler);
     };
   }
 

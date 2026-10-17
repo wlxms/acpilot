@@ -48,7 +48,7 @@ export class ReasoningSSP extends SerializableStreamPart<
   }
 
   render(stream: SspStream): void {
-    if (!this.payload.text) return;
+    if (!this.payload.text) {return;}
 
     const delta: { text: string; id?: string; metadata?: Record<string, unknown> } = {
       text: this.payload.text,

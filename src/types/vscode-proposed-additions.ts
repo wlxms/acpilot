@@ -318,13 +318,10 @@ export interface ChatQuestionOption {
    */
   value: unknown;
   /**
-   * Optional detail text.
+   * Optional detail retained for callers that provide richer backend metadata.
+   * VS Code currently renders the label/value pair only.
    */
   detail?: string;
-  /**
-   * Whether this option is initially checked.
-   */
-  checked?: boolean;
 }
 
 /**
@@ -354,23 +351,11 @@ export class ChatQuestion {
   /**
    * The id(s) of the default selected option(s).
    */
-  selectedOptionIds?: string | string[];
+  defaultValue?: string | string[];
   /**
-   * Placeholder text for text input.
+   * Whether to allow free-form text in addition to predefined options.
    */
-  placeholder?: string;
-  /**
-   * Validation message.
-   */
-  validationMessage?: string;
-  /**
-   * Whether the input is invalid.
-   */
-  isInvalid?: boolean;
-  /**
-   * Whether to show the input as a password field.
-   */
-  password?: boolean;
+  allowFreeformInput?: boolean;
 
   constructor(
     id: string,
@@ -379,8 +364,8 @@ export class ChatQuestion {
     options?: {
       message?: string | MarkdownString;
       options?: ChatQuestionOption[];
-      selectedOptionIds?: string | string[];
-      placeholder?: string;
+      defaultValue?: string | string[];
+      allowFreeformInput?: boolean;
     },
   ) {
     this.id = id;
@@ -388,8 +373,8 @@ export class ChatQuestion {
     this.title = title;
     this.message = options?.message;
     this.options = options?.options;
-    this.selectedOptionIds = options?.selectedOptionIds;
-    this.placeholder = options?.placeholder;
+    this.defaultValue = options?.defaultValue;
+    this.allowFreeformInput = options?.allowFreeformInput;
   }
 }
 

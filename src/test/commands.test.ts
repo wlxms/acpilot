@@ -3,7 +3,7 @@ import * as vscode from 'vscode';
 import type { Backend } from '../backend/backend';
 import type { BackendServerStatus } from '../backend/types';
 import type { ExtensionState, BackendContext } from '../types';
-import { routeCommand } from '../participant/commands';
+import { diagnosticPermissionResponse, routeCommand } from '../participant/commands';
 import { AppEventBus } from '../backend/app-event-bus';
 
 // ---------------------------------------------------------------------------
@@ -71,6 +71,7 @@ describe('routeCommand', () => {
         prompt: vi.fn(),
         revert: vi.fn(),
         abort: vi.fn(),
+        release: vi.fn(),
         list: vi.fn(),
         children: vi.fn(),
         status: vi.fn(),
@@ -103,16 +104,13 @@ describe('routeCommand', () => {
         reply: vi.fn(),
         reject: vi.fn(),
       },
-      createBridge: vi.fn(() => ({
+      createPipeline: vi.fn(() => ({
         setStream: vi.fn(),
         setCallbacks: vi.fn(),
         setTracker: vi.fn(),
         processEvent: vi.fn(),
-        run: vi.fn().mockResolvedValue(true),
-        getUserMessageId: vi.fn().mockReturnValue(null),
-        getSessionTitle: vi.fn().mockReturnValue(null),
-        getHadSubagentTasks: vi.fn().mockReturnValue(false),
-      })) as unknown as Backend['createBridge'],
+        run: vi.fn().mockResolvedValue({ completed: true, userMessageId: null, sessionTitle: null, sessionTitleSource: null, hadSubagentTasks: false }),
+      })) as unknown as Backend['createPipeline'],
     };
     const outputChannel = {
       name: 'test',
@@ -127,8 +125,13 @@ describe('routeCommand', () => {
 
     ctx = {
       id: 'opencode',
+      instanceKey: 'opencode',
+      runtimeGeneration: 0,
+      acceptingRequests: true,
+      storageNamespace: 'opencode',
+      displayName: 'OpenCode',
       scheme: 'acpilot.opencode',
-      vendors: ['opencode-cli', 'opencode-zen'],
+      vendor: 'opencode',
       backend,
       sessions: {
         get: vi.fn((key: string) => sessionStore.get(key)),
@@ -142,7 +145,7 @@ describe('routeCommand', () => {
         setModel: vi.fn(async () => {}),
       } as unknown as BackendContext['selection'],
       sessionStore: {
-        getTurnsPath: vi.fn().mockReturnValue(''),
+        getSessionPath: vi.fn().mockReturnValue(''),
         getSessionDir: vi.fn().mockReturnValue(''),
         initialize: vi.fn().mockResolvedValue(undefined),
       } as any,
@@ -153,13 +156,12 @@ describe('routeCommand', () => {
       outputChannel,
       statusBar: {} as ExtensionState['statusBar'],
       bus: new AppEventBus(),
-      acpModels: {
-        sync: vi.fn(async () => {}),
+      modelCatalog: {
+        list: vi.fn(() => []),
         resolve: vi.fn(() => ({ kind: 'not-found' as const })),
-        getModelsForCopilotRegistration: vi.fn(() => []),
         refresh: vi.fn(async () => {}),
         dispose: vi.fn(),
-      } as unknown as ExtensionState['acpModels'],
+      } as unknown as ExtensionState['modelCatalog'],
     };
     stream = {
       markdown: vi.fn(),
@@ -226,6 +228,43 @@ describe('routeCommand', () => {
     expect(helpText).toContain('/help');
     expect(helpText).toContain('/model');
     expect(helpText).toContain('Available Commands');
+  });
+
+  it('does not expose OpenCode-only diagnostics through another backend', async () => {
+    const acpCtx = {
+      ...ctx,
+      id: 'acp',
+      displayName: 'ACP Agent',
+      vendor: 'acp',
+    } as BackendContext;
+
+    for (const command of ['test-external-edit-e2e', 'test-stream-latency']) {
+      await routeCommand(command, state, acpCtx, stream, token);
+    }
+
+    const messages = (stream.markdown as ReturnType<typeof vi.fn>).mock.calls
+      .map(([value]) => String(value));
+    expect(messages).toHaveLength(2);
+    expect(messages.every(message => message.includes('only available for the OpenCode backend'))).toBe(true);
+    expect(ctx.backend.start).not.toHaveBeenCalled();
+    expect(ctx.backend.events.ensureStarted).not.toHaveBeenCalled();
+  });
+
+  it('omits OpenCode-only diagnostics from another backend help text', async () => {
+    const acpCtx = {
+      ...ctx,
+      id: 'acp',
+      displayName: 'ACP Agent',
+      vendor: 'acp',
+    } as BackendContext;
+
+    await routeCommand('help', state, acpCtx, stream, token);
+
+    const helpText = (stream.markdown as ReturnType<typeof vi.fn>).mock
+      .calls[0][0] as string;
+    expect(helpText).not.toContain('/test-external-edit-e2e');
+    expect(helpText).not.toContain('/test-stream-latency');
+    expect(helpText).toContain('Just type your message to chat with ACP Agent!');
   });
 
   // -----------------------------------------------------------------------
@@ -325,5 +364,16 @@ describe('routeCommand', () => {
 
     // Provider with no active models should not appear
     expect(modelText).not.toContain('TestAI');
+  });
+});
+
+describe('diagnostic permission policy', () => {
+  it('rejects missing, unexpected, and unapproved edit paths', () => {
+    expect(diagnosticPermissionResponse(false, 'Allow Once')).toBe('reject');
+    expect(diagnosticPermissionResponse(true, undefined)).toBe('reject');
+  });
+
+  it('allows only an explicitly approved expected path', () => {
+    expect(diagnosticPermissionResponse(true, 'Allow Once')).toBe('once');
   });
 });

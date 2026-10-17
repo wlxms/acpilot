@@ -1,8 +1,11 @@
 /**
- * ACP (Agent Communication Protocol) domain types.
+ * Backend domain types — shared contracts across all backend adapters.
  *
- * These are protocol-agnostic abstractions that any backend adapter
- * must map to/from. No VSCode or SDK imports allowed.
+ * These are backend-agnostic abstractions (models, sessions, agents, config,
+ * settings) that every backend adapter implements. Per-backend protocol event
+ * shapes live with their adapters rather than here, so backends don't leak
+ * their private event shapes into the shared layer. No VSCode or SDK imports
+ * allowed.
  */
 
 // ===========================================================================
@@ -27,14 +30,18 @@ export interface BackendModel {
   provider?: string;
   /** Human-readable provider name (used for UI only) */
   providerName?: string;
-  /** Top-level truthy capability keys (legacy flat view, e.g. ["toolcall", "attachment"]) */
-  capabilities?: string[];
   /** Nested capability info: `input.image` indicates vision support */
   capabilitiesRaw?: Record<string, unknown>;
   /** Max input / context tokens (from SDK `limit.context`) */
   maxInputTokens?: number;
   /** Max output tokens (from SDK `limit.output`) */
   maxOutputTokens?: number;
+  /** Effective API endpoint used by an ordinary Copilot LLM request. */
+  apiBaseURL?: string;
+  /** Provider wire protocol hint (openai-compatible, anthropic, google). */
+  apiKind?: 'openai-compatible' | 'anthropic' | 'google';
+  /** In-memory credential supplied by the backend runtime, never persisted in the catalog. */
+  apiKey?: string;
 }
 
 export interface BackendProvider {
@@ -66,32 +73,6 @@ export interface BackendTurnMapping {
 }
 
 // ===========================================================================
-// ACP protocol stream parts
-// ===========================================================================
-
-export type AcpPartType =
-  | 'text'
-  | 'reasoning'
-  | 'tool'
-  | 'file'
-  | 'agent'
-  | 'step-start'
-  | 'step-finish';
-
-export type AcpToolStatus = 'pending' | 'running' | 'completed' | 'error';
-
-export interface AcpToolState {
-  status: AcpToolStatus;
-  input: Record<string, unknown>;
-  output?: string;
-  title?: string;
-  error?: string;
-  metadata?: Record<string, unknown>;
-  startTime?: number;
-  endTime?: number;
-}
-
-// ===========================================================================
 // Prompt attachments
 // ===========================================================================
 
@@ -110,186 +91,6 @@ export interface BackendFileAttachment {
    */
   url: string;
 }
-
-export interface AcpBasePart {
-  id: string;
-  type: AcpPartType;
-  messageId?: string;
-  sessionId?: string;
-}
-
-export interface AcpTextPart extends AcpBasePart {
-  type: 'text';
-  text: string;
-  synthetic?: boolean;
-  ignored?: boolean;
-  metadata?: Record<string, unknown>;
-}
-
-export interface AcpReasoningPart extends AcpBasePart {
-  type: 'reasoning';
-  text: string;
-}
-
-export interface AcpToolPart extends AcpBasePart {
-  type: 'tool';
-  toolName: string;
-  callId?: string;
-  state: AcpToolState;
-}
-
-export interface AcpStepPart extends AcpBasePart {
-  type: 'step-start' | 'step-finish';
-  reason?: string;
-  snapshot?: string;
-  cost?: number;
-  tokens?: { input: number; output: number; reasoning: number; cache: { read: number; write: number } };
-}
-
-export type AcpStreamPart = AcpTextPart | AcpReasoningPart | AcpToolPart | AcpStepPart;
-
-// ===========================================================================
-// Normalised semantic events
-// ===========================================================================
-
-export type AcpEventType =
-  | 'part.updated'
-  | 'part.delta'
-  | 'session.idle'
-  | 'session.status'
-  | 'session.diff'
-  | 'session.created'
-  | 'session.updated'
-  | 'session.deleted'
-  | 'session.error'
-  | 'permission.asked'
-  | 'permission.replied'
-  | 'question.asked'
-  | 'question.replied'
-  | 'question.rejected'
-  | 'server.connected'
-  | 'server.heartbeat';
-
-export interface AcpPartUpdatedEvent {
-  type: 'part.updated';
-  sessionId?: string;
-  part: AcpStreamPart;
-  delta?: string;
-}
-
-export interface AcpPartDeltaEvent {
-  type: 'part.delta';
-  partId: string;
-  delta: string;
-  field?: string;
-  sessionId?: string;
-}
-
-export interface AcpSessionIdleEvent {
-  type: 'session.idle';
-  sessionId?: string;
-}
-
-export interface AcpFileDiff {
-  file: string;
-  patch: string;
-  additions: number;
-  deletions: number;
-  status?: 'added' | 'deleted' | 'modified';
-}
-
-export interface AcpSessionDiffEvent {
-  type: 'session.diff';
-  sessionId: string;
-  diffs: AcpFileDiff[];
-}
-
-export interface AcpSessionLifecycleEvent {
-  type: 'session.created' | 'session.updated' | 'session.deleted' | 'session.error';
-  sessionId: string;
-  parentId?: string;
-  title?: string;
-  error?: string;
-}
-
-export interface AcpPermissionRequestEvent {
-  type: 'permission.asked';
-  permissionId: string;
-  sessionId: string;
-  permission: string;
-  patterns: string[];
-  metadata: Record<string, unknown>;
-  always: string[];
-  tool?: { messageId: string; callId: string };
-}
-
-export interface AcpPermissionReplyEvent {
-  type: 'permission.replied';
-  sessionId: string;
-  permissionId: string;
-  response: string;
-}
-
-// ===========================================================================
-// Question events
-// ===========================================================================
-
-export interface AcpQuestionOption {
-  label: string;
-  description: string;
-}
-
-export interface AcpQuestionInfo {
-  question: string;
-  header: string;
-  options: Array<AcpQuestionOption>;
-  multiple?: boolean;
-  custom?: boolean;
-}
-
-export interface AcpQuestionRequestEvent {
-  type: 'question.asked';
-  questionId: string;
-  sessionId: string;
-  questions: Array<AcpQuestionInfo>;
-  tool?: { messageId: string; callId: string };
-}
-
-export interface AcpQuestionReplyEvent {
-  type: 'question.replied';
-  sessionId: string;
-  requestId: string;
-}
-
-export interface AcpQuestionRejectedEvent {
-  type: 'question.rejected';
-  sessionId: string;
-  requestId: string;
-}
-
-export interface AcpServerLifecycleEvent {
-  type: 'server.connected' | 'server.heartbeat';
-}
-
-export interface AcpSessionStatusEvent {
-  type: 'session.status';
-  sessionId: string;
-  status: BackendSessionStatus;
-}
-
-export type AcpEvent =
-  | AcpPartUpdatedEvent
-  | AcpPartDeltaEvent
-  | AcpSessionIdleEvent
-  | AcpSessionDiffEvent
-  | AcpSessionLifecycleEvent
-  | AcpSessionStatusEvent
-  | AcpPermissionRequestEvent
-  | AcpPermissionReplyEvent
-  | AcpQuestionRequestEvent
-  | AcpQuestionReplyEvent
-  | AcpQuestionRejectedEvent
-  | AcpServerLifecycleEvent;
 
 // ===========================================================================
 // Result wrapper
@@ -323,6 +124,17 @@ export interface BackendMessageHistory {
 // ===========================================================================
 
 export type BackendPermissionResponse = 'once' | 'always' | 'reject';
+
+/** Permission scope selected for the next Agent request. */
+export type PermissionMode = 'full-edit' | 'approval' | 'read-only';
+
+export const DEFAULT_PERMISSION_MODE: PermissionMode = 'approval';
+
+export function normalizePermissionMode(value: unknown): PermissionMode {
+  return value === 'full-edit' || value === 'approval' || value === 'read-only'
+    ? value
+    : DEFAULT_PERMISSION_MODE;
+}
 
 // ===========================================================================
 // Agents

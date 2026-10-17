@@ -1,5 +1,9 @@
 /**
- * ACPModels feasibility verification script.
+ * Legacy OpenCode SDK feasibility verification script.
+ *
+ * This script predates the BackendModelProvider and native Copilot vendor
+ * route. It is retained as a direct OpenCode diagnostic; the supported
+ * extension-host smoke/e2e entry point is `npm run test:runtime`.
  *
  * Connects to the running OpenCode server on port 4096 and verifies:
  *  1. config.get() returns the current provider list
@@ -15,7 +19,7 @@ import { createOpencodeClient } from '@opencode-ai/sdk/v2/client';
 const SERVER_URL = 'http://127.0.0.1:4096';
 
 async function main() {
-  console.log('=== ACPModels Feasibility Verification ===\n');
+  console.log('=== Legacy OpenCode SDK Feasibility Verification ===\n');
 
   // ── Phase 0: Connect ──────────────────────────────────────────
   console.log('[0] Connecting to OpenCode server...');

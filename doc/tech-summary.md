@@ -1,4 +1,14 @@
-# ACPilot — VSCode 扩展技术总结
+# ACPilot — VSCode 扩展技术总结（历史 v4 归档）
+
+> 本文记录的是重构前的 v4 实现，保留作历史参考。当前架构和代码契约以
+> [阶段一架构设计](../docs/refactor/copilot-agent-sss-phase1-design.md) 和 README 为准：
+> `Copilot 接入层 ↔ SSS/SSP ↔ Agent Backend`。其中旧文中的 `AcpEvent`、
+> `OpenCodeBridge`、`acpmodels` 等名称已经从生产路径移除。
+
+> **归档说明**：以下正文保留 v4 重构前的实现细节，包含已删除的文件路径、事件
+> 类型和桥接流程，仅用于历史追溯。不要按本文的旧目录、`AcpEvent` 或
+> `OpenCodeBridge` 设计新增代码；当前实现以阶段一架构设计和各 Backend 的
+> `BackendPipeline`/SSP 契约为准。
 
 ## 概述
 

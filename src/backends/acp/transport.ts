@@ -12,8 +12,13 @@
 
 import { spawn, type ChildProcess } from 'node:child_process';
 import { Readable, Writable } from 'node:stream';
-import { createWebSocketStream } from '@agentclientprotocol/sdk/experimental/ws-client';
-import type { Stream } from '@agentclientprotocol/sdk';
+import {
+  createWebSocketStream,
+  type WebSocketConstructor,
+  type WebSocketLike,
+} from '@agentclientprotocol/sdk/experimental/ws-client';
+import { ndJsonStream, type Stream } from '@agentclientprotocol/sdk';
+import { WebSocket as NodeWebSocket } from 'ws';
 
 export interface LocalSpawnOptions {
   /** Command to run (e.g. 'npx', or an absolute path to an agent binary). */
@@ -50,9 +55,6 @@ export function spawnAcpAgent(opts: LocalSpawnOptions): { stream: Stream; proces
   const output = Writable.toWeb(child.stdin!) as WritableStream<Uint8Array>;
 
   // ndJsonStream(output, input) — note arg order: output first.
-  // Lazy-import to keep the transport module side-effect free.
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { ndJsonStream } = require('@agentclientprotocol/sdk') as typeof import('@agentclientprotocol/sdk');
   const stream = ndJsonStream(output, input);
   return { stream, process: child };
 }
@@ -65,32 +67,35 @@ export function spawnAcpAgent(opts: LocalSpawnOptions): { stream: Stream; proces
  * `ws` is a peer dependency the host extension must provide (the SDK lists it
  * only as a devDependency). If no token is needed, the global WebSocket works.
  */
-export async function connectAcpRemote(opts: RemoteConnectOptions): Promise<Stream> {
-  if (!opts.authToken) {
-    return createWebSocketStream(opts.url);
-  }
+export interface RemoteAcpConnection {
+  stream: Stream;
+  dispose(): void;
+}
 
-  // Authenticated path: load `ws` (host-provided) and pass its constructor.
-  let WSImpl: typeof WebSocket | undefined;
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const wsModule = require('ws') as { WebSocket: typeof WebSocket };
-    WSImpl = wsModule.WebSocket;
-  } catch {
-    throw new Error(
-      'ACP remote transport with authToken requires the `ws` npm package. ' +
-      'Install it (npm i ws) or omit authToken to use the global WebSocket.',
-    );
-  }
-
-  // Build a WS subclass that injects the Authorization header.
-  const token = opts.authToken;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const WSBase = WSImpl as any;
-  class AuthenticatedWebSocket extends WSBase {
-    constructor(address: string, protocols?: string | string[] | undefined) {
-      super(address, protocols, { headers: { Authorization: `Bearer ${token}` } });
-    }
-  }
-  return createWebSocketStream(opts.url, { WebSocket: AuthenticatedWebSocket as unknown as typeof WebSocket });
+export async function connectAcpRemote(opts: RemoteConnectOptions): Promise<RemoteAcpConnection> {
+  let socket: WebSocketLike | undefined;
+  const BaseWebSocket = NodeWebSocket as unknown as WebSocketConstructor;
+  const CapturingWebSocket = function (
+    this: unknown,
+    address: string,
+    protocols?: string | string[],
+    options?: { headers?: Record<string, string> },
+  ): WebSocketLike {
+    socket = new BaseWebSocket(address, protocols, options);
+    return socket;
+  } as unknown as WebSocketConstructor;
+  const headers = opts.authToken
+    ? { Authorization: `Bearer ${opts.authToken}` }
+    : undefined;
+  const stream = createWebSocketStream(opts.url, {
+    WebSocket: CapturingWebSocket,
+    headers,
+  });
+  return {
+    stream,
+    dispose: () => {
+      socket?.close();
+      socket = undefined;
+    },
+  };
 }

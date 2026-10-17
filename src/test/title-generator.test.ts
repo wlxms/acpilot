@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildTitlePrompt } from '../participant/title-generator';
+import { buildTitlePrompt } from '../participant/session-title';
 
 describe('buildTitlePrompt', () => {
   it('asks the model to follow the user request language', () => {

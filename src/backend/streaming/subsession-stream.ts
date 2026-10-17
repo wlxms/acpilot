@@ -12,6 +12,7 @@ import { SessionStreamNodeBase } from './session-stream-node';
 import type { SessionStreamNodeConfig, SessionStreamScheduler } from './session-stream-node';
 
 export interface SubsessionStreamConfig {
+  sessionId: string;
   turnIndex: number;
   requestId: string;
   parentSessionId?: string;
@@ -33,6 +34,7 @@ export class SubsessionStream extends SessionStreamNodeBase<SubsessionStream> {
     const nodeConfig: SessionStreamNodeConfig = {
       turnIndex: config.turnIndex,
       requestId: config.requestId,
+      sessionId: config.sessionId,
       parentSessionId: config.parentSessionId,
       subAgentInvocationId,
       parentSubAgentInvocationId: config.parentSubAgentInvocationId,
@@ -51,7 +53,7 @@ export class SubsessionStream extends SessionStreamNodeBase<SubsessionStream> {
   getSubDir(): string { return this.subDir ?? ''; }
 
   writeMeta(patch: Record<string, unknown>): void {
-    if (!this.isActive) return;
+    if (!this.isActive) {return;}
     this.appendMeta({ type: 'session', ...patch });
   }
 
@@ -63,6 +65,7 @@ export class SubsessionStream extends SessionStreamNodeBase<SubsessionStream> {
       {
         turnIndex: this.config.turnIndex,
         requestId: this.config.requestId,
+        sessionId: this.config.sessionId,
         parentSessionId: this.config.parentSessionId,
         parentSubAgentInvocationId: this.subAgentInvocationId,
         subAgentPath: [...(this.config.subAgentPath ?? [this.subAgentInvocationId]), subAgentInvocationId],
@@ -83,7 +86,7 @@ export class SubsessionStream extends SessionStreamNodeBase<SubsessionStream> {
 
   protected override appendMeta(data: Record<string, unknown>): void {
     this.enqueueWrite(async () => {
-      if (!this.subDir || !this.metaPath) return;
+      if (!this.subDir || !this.metaPath) {return;}
       await fs.mkdir(this.subDir, { recursive: true });
       await fs.appendFile(this.metaPath, JSON.stringify({ v: 2, ...data }) + '\n');
     });

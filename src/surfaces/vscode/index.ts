@@ -1,8 +1,8 @@
 /**
  * VS Code surface exports.
  *
- * Runtime OpenCode events are interpreted by the backend bridge and emitted as
- * SSP parts. The VS Code surfaces consume that shared bridge/SSP pipeline
+ * Runtime events are interpreted by the owning BackendPipeline and emitted as
+ * SSP parts. The VS Code surfaces consume that shared Pipeline/SSP flow
  * instead of owning protocol-specific rendering logic.
  *
  * @module

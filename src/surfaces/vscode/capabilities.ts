@@ -167,8 +167,14 @@ export function hasFullProposedSurface(
  * experimental surfaces.
  */
 export function hasRegisterChatSessionContentProvider(): boolean {
-  const chat = vscode.chat as Record<string, unknown>;
-  return typeof chat.registerChatSessionContentProvider === 'function';
+  try {
+    const chat = vscode.chat as Record<string, unknown>;
+    return typeof chat.registerChatSessionContentProvider === 'function';
+  } catch {
+    // Proposed API proxies can reject even a capability lookup when the host
+    // has not enabled the proposal for an installed extension.
+    return false;
+  }
 }
 
 /**

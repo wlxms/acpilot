@@ -3,7 +3,7 @@ import { promises as fs } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
-import { OpenCodeProtocolBridge } from '../backends/opencode/opencode-bridge';
+import { OpenCodePipeline } from '../backends/opencode/pipeline';
 import { SerializableSessionStream } from '../backend/streaming/session-stream';
 import { UserPromptSSP } from '../ssp/impl/user-prompt';
 import {
@@ -12,17 +12,12 @@ import {
   readMetaIndex,
   readSubsessionRecords,
 } from '../backend/streaming/deserialize';
-import type {
-  AcpEvent,
-  AcpPartDeltaEvent,
-  AcpSessionIdleEvent,
-  AcpSessionDiffEvent,
-  AcpPermissionRequestEvent,
-} from '../backend/types';
+import type { OpenCodeStreamEvent } from '../backends/opencode/sdk-events';
 import type { SessionStreamSchedulingMode } from '../backend/streaming/session-stream-node';
+import type { BackendPipelineResult } from '../backend/backend';
 
 // ---------------------------------------------------------------------------
-// Mock backend for bridge constructor
+// Mock backend for pipeline construction
 // ---------------------------------------------------------------------------
 
 function mockBackend(overrides?: {
@@ -40,6 +35,185 @@ function mockBackend(overrides?: {
     events: {},
     auth: {},
   } as any;
+}
+
+// ---------------------------------------------------------------------------
+// Test-only event shorthand
+//
+// The pipeline now consumes RAW OpenCode SSE events directly (no projection
+// layer — see pipeline.ts). Tests below are written in a compact
+// "shorthand" shape (flat IDs, flat tool state) for readability; this module
+// maps that shorthand to the real raw SSE shapes the pipeline expects. This is
+// a TEST FIXTURE ONLY — the production pipeline contains no such mapping.
+// ---------------------------------------------------------------------------
+
+/** Compact test shorthand converted to raw OpenCode SDK events by this fixture. */
+type ShorthandEvent =
+  | { type: 'part.updated'; sessionId?: string; part: ShorthandPart; delta?: string }
+  | { type: 'part.delta'; partId: string; delta: string; field?: string; sessionId?: string }
+  | { type: 'session.idle'; sessionId?: string }
+  | { type: 'session.created'; sessionId?: string; parentId?: string; title?: string }
+  | { type: 'session.updated'; sessionId?: string; title?: string }
+  | { type: 'session.deleted'; sessionId?: string }
+  | { type: 'session.error'; sessionId?: string; error?: unknown }
+  | { type: 'session.diff'; sessionId: string; diffs: unknown[] }
+  | { type: 'session.status'; sessionId: string; status: unknown }
+  | {
+      type: 'permission.asked';
+      permissionId: string;
+      sessionId: string;
+      permission: string;
+      patterns: string[];
+      metadata: Record<string, unknown>;
+      always: string[];
+      tool?: { messageId: string; callId: string };
+    }
+  | { type: 'question.asked'; questionId: string; sessionId: string; questions: unknown[] }
+  | { type: 'permission.replied'; sessionId: string; permissionId: string; response: string };
+
+type ShorthandPart =
+  | { type: 'text'; id: string; messageId?: string; sessionId?: string; text: string; synthetic?: boolean; ignored?: boolean }
+  | { type: 'reasoning'; id: string; messageId?: string; sessionId?: string; text: string }
+  | { type: 'tool'; id: string; messageId?: string; sessionId?: string; toolName: string; callId?: string; state: ShorthandToolState }
+  | { type: 'step-start'; id: string; messageId?: string; sessionId?: string }
+  | { type: 'step-finish'; id: string; messageId?: string; sessionId?: string };
+
+type ShorthandToolState =
+  | { status: 'pending'; input: Record<string, unknown>; title?: string; metadata?: Record<string, unknown> }
+  | { status: 'running'; input: Record<string, unknown>; title?: string; metadata?: Record<string, unknown>; startTime?: number }
+  | { status: 'completed'; input: Record<string, unknown>; output?: string; title?: string; metadata?: Record<string, unknown>; startTime?: number; endTime?: number }
+  | { status: 'error'; input: Record<string, unknown>; error?: string; title?: string; metadata?: Record<string, unknown>; startTime?: number; endTime?: number };
+
+/** Map a tool-state shorthand (flat time) to the raw nested-`time` shape. */
+function rawToolState(s: ShorthandToolState): Record<string, unknown> {
+  const time: Record<string, unknown> = {};
+  if (s.status !== 'pending') {
+    if ((s as { startTime?: number }).startTime != null) {time.start = (s as { startTime?: number }).startTime;}
+    if ((s as { endTime?: number }).endTime != null) {time.end = (s as { endTime?: number }).endTime;}
+  }
+  const out: Record<string, unknown> = { status: s.status, input: s.input };
+  // `title`/`metadata` only exist on running/completed in the raw schema; for
+  // the `pending`/`error` shorthand they are accepted but dropped to match the
+  // raw discriminated union.
+  if (s.status === 'running' || s.status === 'completed') {
+    if (s.title !== undefined) {out.title = s.title;}
+    if (s.metadata) {out.metadata = s.metadata;}
+  }
+  if (s.status === 'completed' && s.output !== undefined) {out.output = s.output;}
+  if (s.status === 'error' && s.error !== undefined) {out.error = s.error;}
+  if (Object.keys(time).length > 0) {out.time = time;}
+  return out;
+}
+
+/** Map a part shorthand (camelCase IDs, toolName) to the raw StreamPart shape (UPPER-case IDs, tool). */
+function rawPart(part: ShorthandPart): Record<string, unknown> {
+  const base: Record<string, unknown> = { id: part.id };
+  if (part.messageId !== undefined) {base.messageID = part.messageId;}
+  if (part.sessionId !== undefined) {base.sessionID = part.sessionId;}
+  switch (part.type) {
+    case 'text':
+      return { ...base, type: 'text', text: part.text, ...(part.synthetic ? { synthetic: true } : {}), ...(part.ignored ? { ignored: true } : {}) };
+    case 'reasoning':
+      return { ...base, type: 'reasoning', text: part.text };
+    case 'tool': {
+      const out: Record<string, unknown> = { ...base, type: 'tool', tool: part.toolName, state: rawToolState(part.state) };
+      if (part.callId !== undefined) {out.callID = part.callId;}
+      return out;
+    }
+    case 'step-start':
+      return { ...base, type: 'step-start' };
+    case 'step-finish':
+      return { ...base, type: 'step-finish' };
+  }
+}
+
+/**
+ * Convert a single shorthand event into the raw OpenCode SSE event the bridge
+ * consumes. Returns the unwrapped OpenCodeEvent shape (no `{directory,payload}`
+ * envelope — `run()` handles both).
+ */
+function toRawEvent(e: ShorthandEvent): OpenCodeStreamEvent {
+  switch (e.type) {
+    case 'part.updated': {
+      // The real SDK always puts the session id inside `part.sessionID`. The
+      // shorthand sometimes sets it at the event level instead — fold it onto
+      // the part so the raw event carries it where the bridge expects it.
+      const part = { ...e.part } as ShorthandPart & { sessionId?: string };
+      if (e.sessionId && part.sessionId === undefined) {
+        part.sessionId = e.sessionId;
+      }
+      return {
+        type: 'message.part.updated',
+        properties: { part: rawPart(part) as never, ...(e.delta !== undefined ? { delta: e.delta } : {}) },
+      } as never;
+    }
+    case 'part.delta': {
+      const props: Record<string, unknown> = { partID: e.partId, delta: e.delta };
+      if (e.field !== undefined) {props.field = e.field;}
+      if (e.sessionId !== undefined) {props.sessionID = e.sessionId;}
+      return { type: 'message.part.delta', properties: props } as never;
+    }
+    case 'session.idle':
+      return {
+        type: 'session.idle',
+        properties: e.sessionId !== undefined ? { sessionID: e.sessionId } : {},
+      } as never;
+    case 'session.created':
+      return {
+        type: 'session.created',
+        properties: { info: { id: e.sessionId ?? '', ...(e.parentId ? { parentID: e.parentId } : {}), ...(e.title ? { title: e.title } : {}) } },
+      } as never;
+    case 'session.updated':
+      return {
+        type: 'session.updated',
+        properties: { info: { id: e.sessionId ?? '', ...(e.title ? { title: e.title } : {}) } },
+      } as never;
+    case 'session.deleted':
+      return { type: 'session.deleted', properties: { info: { id: e.sessionId ?? '' } } } as never;
+    case 'session.error':
+      return {
+        type: 'session.error',
+        properties: {
+          ...(e.sessionId !== undefined ? { sessionID: e.sessionId } : {}),
+          ...(e.error !== undefined ? { error: e.error } : {}),
+        },
+      } as never;
+    case 'session.diff':
+      return { type: 'session.diff', properties: { sessionID: e.sessionId, diff: e.diffs } } as never;
+    case 'session.status':
+      return { type: 'session.status', properties: { sessionID: e.sessionId, status: e.status } } as never;
+    case 'permission.asked':
+      return {
+        type: 'permission.asked',
+        properties: {
+          id: e.permissionId,
+          sessionID: e.sessionId,
+          permission: e.permission,
+          patterns: e.patterns,
+          metadata: e.metadata,
+          always: e.always,
+          ...(e.tool ? { tool: { messageID: e.tool.messageId, callID: e.tool.callId } } : {}),
+        },
+      } as never;
+    case 'question.asked':
+      return {
+        type: 'question.asked',
+        properties: {
+          id: e.questionId,
+          sessionID: e.sessionId,
+          questions: e.questions,
+        },
+      } as never;
+    case 'permission.replied':
+      return {
+        type: 'permission.replied',
+        properties: {
+          sessionID: e.sessionId,
+          requestID: e.permissionId,
+          reply: e.response,
+        },
+      } as never;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -74,6 +248,12 @@ function mockStream(opts?: { withProposed?: boolean }): MockStream {
   return stream as MockStream;
 }
 
+function answerPermission(stream: MockStream, response: 'once' | 'always' | 'reject'): void {
+  (stream as MockStream & {
+    questionCarousel: ReturnType<typeof vi.fn>;
+  }).questionCarousel = vi.fn(async () => ({ q_0: { selectedValue: response } }));
+}
+
 function mockToken(isCancelled = false): vscode.CancellationToken {
   return {
     isCancellationRequested: isCancelled,
@@ -81,8 +261,22 @@ function mockToken(isCancelled = false): vscode.CancellationToken {
   };
 }
 
-function eventStream(events: AcpEvent[]): { stream: AsyncIterable<AcpEvent> } {
-  async function* gen(): AsyncIterable<AcpEvent> {
+/**
+ * Wrap a shorthand event stream, mapping each event to its raw SSE shape before
+ * the bridge consumes it. This is the single place where the test shorthand is
+ * translated — the bridge itself receives only raw events.
+ */
+function rawStream(events: AsyncIterable<ShorthandEvent>): AsyncIterable<OpenCodeStreamEvent> {
+  async function* gen(): AsyncIterable<OpenCodeStreamEvent> {
+    for await (const e of events) {
+      yield toRawEvent(e);
+    }
+  }
+  return gen();
+}
+
+function eventStream(events: ShorthandEvent[]): { stream: AsyncIterable<ShorthandEvent> } {
+  async function* gen(): AsyncIterable<ShorthandEvent> {
     for (const e of events) {yield e;}
   }
   return { stream: gen() };
@@ -92,14 +286,14 @@ function getTestSessionDir(workspaceRoot: string): string {
   return path.join(workspaceRoot, '.acpilot', 'test', 'test-session');
 }
 
-/** Compatibility helper: creates SSS with mock stream + runs events through bridge */
+/** Creates an SSS with a mock stream and runs raw backend events through the bridge. */
 async function runBridge(
-  bridge: OpenCodeProtocolBridge,
-  events: { stream: AsyncIterable<AcpEvent> },
+  bridgeFactory: (sss: SerializableSessionStream) => OpenCodePipeline,
+  events: { stream: AsyncIterable<ShorthandEvent> },
   stream: MockStream,
   token: vscode.CancellationToken,
   options?: { schedulingMode?: SessionStreamSchedulingMode },
-): Promise<boolean> {
+): Promise<BackendPipelineResult> {
   const sss = new SerializableSessionStream(stream as any, {
     workspaceRoot: '',
     backendName: 'test',
@@ -108,13 +302,12 @@ async function runBridge(
     requestId: 'test',
     schedulingMode: options?.schedulingMode,
   });
-  bridge.setSSS(sss);
-  const result = await bridge.run(events.stream, token);
+  const result = await bridgeFactory(sss).run(rawStream(events.stream), token);
   await sss.flush();
   return result;
 }
 
-function deltaEvent(delta: string, partId = 'prt_ai1'): AcpPartDeltaEvent {
+function deltaEvent(delta: string, partId = 'prt_ai1'): ShorthandEvent {
   return {
     type: 'part.delta',
     partId,
@@ -123,13 +316,13 @@ function deltaEvent(delta: string, partId = 'prt_ai1'): AcpPartDeltaEvent {
   };
 }
 
-function idleEvent(): AcpSessionIdleEvent {
+function idleEvent(): ShorthandEvent {
   return {
     type: 'session.idle',
   };
 }
 
-function idleEventFor(sessionId: string): AcpSessionIdleEvent {
+function idleEventFor(sessionId: string): ShorthandEvent {
   return {
     type: 'session.idle',
     sessionId,
@@ -144,7 +337,7 @@ function toolEvents(opts: {
   title?: string;
   timeStart?: number;
   timeEnd?: number;
-}): AcpEvent[] {
+}): ShorthandEvent[] {
   const partId = 'prt_tool001';
   return [
     {
@@ -159,10 +352,10 @@ function toolEvents(opts: {
       type: 'part.updated',
       part: { type: 'tool', toolName: opts.toolName, id: partId, callId: opts.callId, state: { status: 'completed', input: opts.input ?? {}, output: opts.output ?? '', title: opts.title, startTime: opts.timeStart ?? 0, endTime: opts.timeEnd ?? 100 } },
     },
-  ] satisfies AcpEvent[];
+  ];
 }
 
-function fullTurnEvents(opts: { tools?: AcpEvent[]; aiDeltas?: string[] }): AcpEvent[] {
+function fullTurnEvents(opts: { tools?: ShorthandEvent[]; aiDeltas?: string[] }): ShorthandEvent[] {
   const tools = opts.tools ?? toolEvents({ toolName: 'read', callId: 'call_001', input: { filePath: '/f.txt' }, output: 'hello' });
   const aiDeltas = opts.aiDeltas ?? ['OK'];
 
@@ -173,21 +366,24 @@ function fullTurnEvents(opts: { tools?: AcpEvent[]; aiDeltas?: string[] }): AcpE
     { type: 'part.updated', part: { type: 'text', text: '', messageId: 'msg_a1', id: 'prt_ai1' } },
     ...aiDeltas.map((d: string) => deltaEvent(d)),
     idleEvent(),
-  ] satisfies AcpEvent[];
+  ];
 }
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-describe('OpenCodeBridge', () => {
-  let bridge: OpenCodeProtocolBridge;
+describe('OpenCodePipeline', () => {
+  let bridge: (sss: SerializableSessionStream) => OpenCodePipeline;
 
   beforeEach(() => {
-    bridge = new OpenCodeProtocolBridge(mockBackend(), 'test-session');
+    bridge = (sss) => new OpenCodePipeline(mockBackend(), {
+      sessionId: 'test-session',
+      stream: sss,
+    });
   });
 
-  it('generates and persists a VS Code LM title when backend title echoes the first prompt', async () => {
+  it('persists the backend title without invoking VS Code LM', async () => {
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'bridge-title-'));
     const stream = mockStream();
     const sss = new SerializableSessionStream(stream as any, {
@@ -197,43 +393,25 @@ describe('OpenCodeBridge', () => {
       turnIndex: 0,
       requestId: 'req-title',
     });
-    const model = {
-      id: 'gpt-4o-mini',
-      vendor: 'copilot',
-      family: 'gpt-4o-mini',
-      name: 'GPT-4o mini',
-      version: '1',
-      maxInputTokens: 4096,
-      sendRequest: vi.fn(async () => ({
-        text: (async function* () {
-          yield 'OAuth Middleware';
-        })(),
-      })),
-    } as unknown as vscode.LanguageModelChat;
-    vi.spyOn(vscode.lm, 'selectChatModels').mockResolvedValue([model]);
-
     try {
       await sss.initialize();
       sss.recordFirstPrompt('how to implement oauth middleware');
-      bridge.setSSS(sss);
-
-      await bridge.run((async function* () {
+      const result = await bridge(sss).run(rawStream((async function* (): AsyncIterable<ShorthandEvent> {
         yield {
           type: 'session.updated',
           sessionId: 'test-session',
           title: 'how to implement oauth middleware',
-        } as any;
-        yield { type: 'session.idle', sessionId: 'test-session' } as any;
-      })(), mockToken());
+        };
+        yield { type: 'session.idle', sessionId: 'test-session' };
+      })()), mockToken());
       await sss.flush();
 
       const metaIndex = await readMetaIndex(path.join(getTestSessionDir(tmpDir), 'meta.jsonl'));
       const sessionMeta = metaIndex.get('session');
-      expect(model.sendRequest).toHaveBeenCalled();
-      expect(bridge.getSessionTitle()).toBe('OAuth Middleware');
-      expect(bridge.getSessionTitleSource()).toBe('copilot-style');
-      expect(sessionMeta?.title).toBe('OAuth Middleware');
-      expect(sessionMeta?.titleSource).toBe('copilot-style');
+      expect(result.sessionTitle).toBe('how to implement oauth middleware');
+      expect(result.sessionTitleSource).toBe('backend');
+      expect(sessionMeta?.title).toBe('how to implement oauth middleware');
+      expect(sessionMeta?.titleSource).toBe('backend');
       expect(sessionMeta?.provisionalTitle).toBe(false);
     } finally {
       vi.restoreAllMocks();
@@ -241,7 +419,7 @@ describe('OpenCodeBridge', () => {
     }
   });
 
-  it('treats a truncated prompt-prefix backend title as an echo', async () => {
+  it('persists a truncated backend title as-is without invoking VS Code LM', async () => {
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'bridge-title-truncated-'));
     const stream = mockStream();
     const sss = new SerializableSessionStream(stream as any, {
@@ -251,43 +429,25 @@ describe('OpenCodeBridge', () => {
       turnIndex: 0,
       requestId: 'req-title',
     });
-    const model = {
-      id: 'gpt-4o-mini',
-      vendor: 'copilot',
-      family: 'gpt-4o-mini',
-      name: 'GPT-4o mini',
-      version: '1',
-      maxInputTokens: 4096,
-      sendRequest: vi.fn(async () => ({
-        text: (async function* () {
-          yield 'Refactor Bridge Title Flow';
-        })(),
-      })),
-    } as unknown as vscode.LanguageModelChat;
-    vi.spyOn(vscode.lm, 'selectChatModels').mockResolvedValue([model]);
-
     try {
       await sss.initialize();
       sss.recordFirstPrompt('refactor bridge title flow to keep raw events inside the bridge boundary');
-      bridge.setSSS(sss);
-
-      await bridge.run((async function* () {
+      const result = await bridge(sss).run(rawStream((async function* (): AsyncIterable<ShorthandEvent> {
         yield {
           type: 'session.updated',
           sessionId: 'test-session',
           title: 'refactor bridge title flow...',
-        } as any;
-        yield { type: 'session.idle', sessionId: 'test-session' } as any;
-      })(), mockToken());
+        };
+        yield { type: 'session.idle', sessionId: 'test-session' };
+      })()), mockToken());
       await sss.flush();
 
       const metaIndex = await readMetaIndex(path.join(getTestSessionDir(tmpDir), 'meta.jsonl'));
       const sessionMeta = metaIndex.get('session');
-      expect(model.sendRequest).toHaveBeenCalled();
-      expect(bridge.getSessionTitle()).toBe('Refactor Bridge Title Flow');
-      expect(bridge.getSessionTitleSource()).toBe('copilot-style');
-      expect(sessionMeta?.title).toBe('Refactor Bridge Title Flow');
-      expect(sessionMeta?.titleSource).toBe('copilot-style');
+      expect(result.sessionTitle).toBe('refactor bridge title flow...');
+      expect(result.sessionTitleSource).toBe('backend');
+      expect(sessionMeta?.title).toBe('refactor bridge title flow...');
+      expect(sessionMeta?.titleSource).toBe('backend');
     } finally {
       vi.restoreAllMocks();
       await fs.rm(tmpDir, { recursive: true, force: true });
@@ -310,23 +470,21 @@ describe('OpenCodeBridge', () => {
     try {
       await sss.initialize();
       sss.recordFirstPrompt('how to implement oauth middleware');
-      bridge.setSSS(sss);
-
-      await bridge.run((async function* () {
+      const result = await bridge(sss).run(rawStream((async function* (): AsyncIterable<ShorthandEvent> {
         yield {
           type: 'session.updated',
           sessionId: 'test-session',
           title: 'OAuth Middleware',
-        } as any;
-        yield { type: 'session.idle', sessionId: 'test-session' } as any;
-      })(), mockToken());
+        };
+        yield { type: 'session.idle', sessionId: 'test-session' };
+      })()), mockToken());
       await sss.flush();
 
       const metaIndex = await readMetaIndex(path.join(getTestSessionDir(tmpDir), 'meta.jsonl'));
       const sessionMeta = metaIndex.get('session');
       expect(selectChatModelsSpy).not.toHaveBeenCalled();
-      expect(bridge.getSessionTitle()).toBe('OAuth Middleware');
-      expect(bridge.getSessionTitleSource()).toBe('backend');
+      expect(result.sessionTitle).toBe('OAuth Middleware');
+      expect(result.sessionTitleSource).toBe('backend');
       expect(sessionMeta?.title).toBe('OAuth Middleware');
       expect(sessionMeta?.titleSource).toBe('backend');
     } finally {
@@ -339,9 +497,316 @@ describe('OpenCodeBridge', () => {
     const stream = mockStream();
     const events = eventStream(fullTurnEvents({}));
     const result = await runBridge(bridge,events, stream, mockToken());
-    expect(result).toBe(true);
+    expect(result.completed).toBe(true);
     expect(stream.markdown).toHaveBeenCalledWith('OK');
   });
+
+  it('does not recursively generate a title for a title-generation pipeline', async () => {
+    const selectChatModels = vi.spyOn(vscode.lm, 'selectChatModels')
+      .mockRejectedValue(new Error('title generation must not recurse'));
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'bridge-title-recursion-'));
+    const stream = mockStream();
+    const sss = new SerializableSessionStream(stream as any, {
+      workspaceRoot: tmpDir,
+      backendName: 'test',
+      sessionId: 'test-session',
+      turnIndex: 0,
+      requestId: 'req-title-recursion',
+    });
+    try {
+      await sss.initialize();
+      sss.recordFirstPrompt('Generate a short title');
+      const result = await new OpenCodePipeline(mockBackend(), {
+        sessionId: 'test-session',
+        stream: sss,
+        suppressTitleGeneration: true,
+      }).run(rawStream((async function* (): AsyncIterable<ShorthandEvent> {
+        yield {
+          type: 'session.updated',
+          sessionId: 'test-session',
+          title: 'Generate a short title',
+        };
+        yield { type: 'session.idle', sessionId: 'test-session' };
+      })()), mockToken());
+      await sss.flush();
+
+      expect(result.sessionTitle).toBeNull();
+      expect(selectChatModels).not.toHaveBeenCalled();
+    } finally {
+      selectChatModels.mockRestore();
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('ends incomplete on session.error without waiting for session.idle or stream closure', async () => {
+    const stream = mockStream();
+    let releaseStream!: () => void;
+    const streamHeldOpen = new Promise<void>(resolve => {
+      releaseStream = resolve;
+    });
+    async function* events(): AsyncIterable<ShorthandEvent> {
+      yield {
+        type: 'session.error',
+        sessionId: 'test-session',
+        error: { name: 'ApiError', data: { message: 'model request failed' } },
+      };
+      await streamHeldOpen;
+    }
+
+    try {
+      const result = await runBridge(bridge, { stream: events() }, stream, mockToken());
+
+      expect(result.completed).toBe(false);
+      expect(result.error).toBe('model request failed');
+      expect(stream.progress).toHaveBeenCalledWith(expect.stringContaining('model request failed'));
+    } finally {
+      releaseStream();
+    }
+  });
+
+  it('completes a deferred parent turn when child session.error ends the child scope', async () => {
+    const stream = mockStream();
+    const taskCallId = 'call_child_error_terminal';
+    const childSessionId = 'ses_child_error_terminal';
+    let releaseStream!: () => void;
+    const streamHeldOpen = new Promise<void>(resolve => {
+      releaseStream = resolve;
+    });
+    async function* events(): AsyncIterable<ShorthandEvent> {
+      yield {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_child_error_task',
+          callId: taskCallId,
+          state: {
+            status: 'running',
+            input: { description: 'child failure' },
+            metadata: { sessionId: childSessionId },
+          },
+        },
+      };
+      // Parent idle enters deferred-idle because the child is still active.
+      yield idleEvent();
+      yield {
+        type: 'session.error',
+        sessionId: childSessionId,
+        error: { name: 'ApiError', data: { message: 'child model failed' } },
+      };
+      await streamHeldOpen;
+    }
+
+    try {
+      const result = await runBridge(bridge, { stream: events() }, stream, mockToken());
+
+      expect(result.completed).toBe(true);
+      expect(stream.progress).toHaveBeenCalledWith(expect.stringContaining('child model failed'));
+      const failedTask = stream.push.mock.calls
+        .map((call: unknown[]) => call[0] as { toolName?: string; toolCallId?: string; isComplete?: boolean })
+        .find(part => part.toolName === 'task' && part.toolCallId === taskCallId && part.isComplete === true);
+      expect(failedTask).toBeDefined();
+    } finally {
+      releaseStream();
+    }
+  });
+
+  it('continues the parent pipeline after a child session.error', async () => {
+    const stream = mockStream();
+    const taskCallId = 'call_child_error_parent_continues';
+    const childSessionId = 'ses_child_error_parent_continues';
+    const events = eventStream([
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_child_error_parent_task',
+          callId: taskCallId,
+          state: {
+            status: 'running',
+            input: { description: 'recoverable child failure' },
+            metadata: { sessionId: childSessionId },
+          },
+        },
+      },
+      {
+        type: 'session.error',
+        sessionId: childSessionId,
+        error: { name: 'ApiError', data: { message: 'child failed but parent continues' } },
+      },
+      {
+        type: 'part.updated',
+        part: { type: 'text', text: '', messageId: 'msg_parent_after_error', id: 'prt_parent_after_error' },
+      },
+      { type: 'part.delta', partId: 'prt_parent_after_error', delta: 'parent recovered', field: 'text' },
+      idleEvent(),
+    ]);
+
+    const result = await runBridge(bridge, events, stream, mockToken());
+
+    expect(result.completed).toBe(true);
+    expect(stream.markdown).toHaveBeenCalledWith('parent recovered');
+    expect(stream.progress).toHaveBeenCalledWith(expect.stringContaining('child failed but parent continues'));
+    const failedTask = stream.push.mock.calls
+      .map((call: unknown[]) => call[0] as { toolName?: string; toolCallId?: string; isComplete?: boolean })
+      .find(part => part.toolName === 'task' && part.toolCallId === taskCallId && part.isComplete === true);
+    expect(failedTask).toBeDefined();
+  });
+
+  it('persists a child session.error that arrives before scope binding', async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'pipeline-child-error-before-bind-'));
+    const stream = mockStream();
+    const sss = new SerializableSessionStream(stream as any, {
+      workspaceRoot: tmpDir,
+      backendName: 'test',
+      sessionId: 'test-session',
+      turnIndex: 0,
+      requestId: 'child-error-before-bind',
+    });
+    const firstCallId = 'call_child_error_before_bind';
+    const secondCallId = 'call_other_scope';
+    const childSessionId = 'ses_child_error_before_bind';
+    const secondChildSessionId = 'ses_other_scope';
+
+    try {
+      await sss.initialize();
+      const events = rawStream(eventStream([
+        {
+          type: 'part.updated',
+          part: {
+            type: 'tool',
+            toolName: 'task',
+            id: 'prt_child_error_before_bind',
+            callId: firstCallId,
+            state: { status: 'running', input: { description: 'first child' } },
+          },
+        },
+        {
+          type: 'part.updated',
+          part: {
+            type: 'tool',
+            toolName: 'task',
+            id: 'prt_other_scope',
+            callId: secondCallId,
+            state: { status: 'running', input: { description: 'second child' } },
+          },
+        },
+        // Two unbound scopes make this event intentionally ambiguous, so it is
+        // buffered until the matching task carries its child session id.
+        {
+          type: 'session.error',
+          sessionId: childSessionId,
+          error: { name: 'ApiError', data: { message: 'buffered child failure' } },
+        },
+        {
+          type: 'part.updated',
+          part: {
+            type: 'tool',
+            toolName: 'task',
+            id: 'prt_child_error_before_bind',
+            callId: firstCallId,
+            state: {
+              status: 'running',
+              input: { description: 'first child' },
+              metadata: { sessionId: childSessionId },
+            },
+          },
+        },
+        {
+          type: 'part.updated',
+          part: {
+            type: 'tool',
+            toolName: 'task',
+            id: 'prt_other_scope',
+            callId: secondCallId,
+            state: {
+              status: 'completed',
+              input: { description: 'second child' },
+              output: 'second complete',
+              metadata: { sessionId: secondChildSessionId },
+            },
+          },
+        },
+        idleEventFor(secondChildSessionId),
+        idleEvent(),
+      ]).stream);
+
+      const result = await new OpenCodePipeline(mockBackend(), {
+        sessionId: 'test-session',
+        stream: sss,
+      }).run(events, mockToken());
+      await sss.flush();
+
+      expect(result.completed).toBe(true);
+      const sessionDir = getTestSessionDir(tmpDir);
+      const subsessions = await readSubsessionRecords(sessionDir);
+      const failedSubsession = subsessions.find(sub => sub.subAgentInvocationId === firstCallId);
+      expect(failedSubsession).toBeDefined();
+      expect(failedSubsession?.metaIndex.get('session')?.status).toBe('failed');
+      expect(failedSubsession?.metaIndex.get('session')?.error).toBe('buffered child failure');
+      expect(failedSubsession?.records.some(record =>
+        record.kind === 'sessionLifecycle'
+        && (record.payload as { eventType?: string }).eventType === 'session.error',
+      )).toBe(true);
+
+      const rootRecords = await readAllStreamParts(path.join(sessionDir, 'session.jsonl'));
+      expect(rootRecords.some(record =>
+        record.kind === 'toolInvocation'
+        && (record.payload as { callId?: string }).callId === firstCallId
+        && (record.payload as { state?: { status?: string } }).state?.status === 'error',
+      )).toBe(true);
+    } finally {
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['sessionID', 'sessionId'] as const)(
+    'uses top-level %s on message.part.updated to keep child output out of the root stream',
+    async (sessionField) => {
+      const stream = mockStream();
+      const sss = new SerializableSessionStream(stream as any, {
+        workspaceRoot: '',
+        backendName: 'test',
+        sessionId: 'test-session',
+        turnIndex: 0,
+        requestId: 'test-request-top-level-session',
+      });
+      await sss.initialize();
+      async function* rawEvents(): AsyncIterable<OpenCodeStreamEvent> {
+        yield {
+          type: 'message.part.updated',
+          properties: {
+            part: {
+              type: 'text',
+              id: 'prt_root_user_top_level',
+              messageID: 'msg_root_user_top_level',
+              text: 'root prompt',
+            },
+            [sessionField]: 'test-session',
+          },
+        } as never;
+        yield {
+          type: 'message.part.updated',
+          properties: {
+            part: {
+              type: 'text',
+              id: 'prt_child_answer_top_level',
+              messageID: 'msg_child_answer_top_level',
+              text: 'child answer',
+            },
+            [sessionField]: 'child-session-top-level',
+          },
+        } as never;
+        yield { type: 'session.idle', properties: { sessionID: 'test-session' } } as never;
+      }
+
+      await bridge(sss).run(rawEvents(), mockToken());
+      await sss.flush();
+
+      expect(stream.markdown).not.toHaveBeenCalledWith('child answer');
+    },
+  );
 
   it('should stream AI text even when user echo is missing', async () => {
     const stream = mockStream();
@@ -354,9 +819,9 @@ describe('OpenCodeBridge', () => {
 
     const result = await runBridge(bridge,events, stream, mockToken());
 
-    expect(result).toBe(true);
+    expect(result.completed).toBe(true);
     expect(stream.markdown).toHaveBeenCalledWith(' world');
-    expect(bridge.getUserMessageId()).toBeNull();
+    expect(result.userMessageId).toBeNull();
   });
 
   // --- Tool: read → SimpleToolResultData ---
@@ -1099,7 +1564,7 @@ describe('OpenCodeBridge', () => {
           },
         },
       },
-    ] satisfies AcpEvent[]);
+    ] satisfies ShorthandEvent[]);
 
     await runBridge(bridge, events, stream, mockToken(), { schedulingMode: 'continuous' });
 
@@ -1164,7 +1629,7 @@ describe('OpenCodeBridge', () => {
           },
         },
       },
-    ] satisfies AcpEvent[]);
+    ] satisfies ShorthandEvent[]);
 
     await runBridge(bridge, events, stream, mockToken(), { schedulingMode: 'continuous' });
 
@@ -1229,7 +1694,7 @@ describe('OpenCodeBridge', () => {
         },
       },
       { type: 'part.updated', part: { type: 'reasoning', text: 'root thought', messageId: 'msg_a1', id: reasoningId } },
-    ] satisfies AcpEvent[]);
+    ] satisfies ShorthandEvent[]);
 
     await runBridge(bridge, events, stream, mockToken(), { schedulingMode: 'tool-first' });
 
@@ -1271,7 +1736,7 @@ describe('OpenCodeBridge', () => {
         },
       },
       { type: 'part.updated', part: { type: 'reasoning', text: 'root thought', messageId: 'msg_a1', id: reasoningId } },
-    ] satisfies AcpEvent[]);
+    ] satisfies ShorthandEvent[]);
 
     await runBridge(bridge, events, stream, mockToken());
 
@@ -1313,7 +1778,7 @@ describe('OpenCodeBridge', () => {
         },
       },
       idleEvent(),
-    ] satisfies AcpEvent[]);
+    ] satisfies ShorthandEvent[]);
 
     await runBridge(bridge, events, stream, mockToken());
 
@@ -1418,9 +1883,9 @@ describe('OpenCodeBridge', () => {
           },
         },
       },
-    ] satisfies AcpEvent[];
+    ] satisfies ShorthandEvent[];
 
-    async function* controlledStream(): AsyncIterable<AcpEvent> {
+    async function* controlledStream(): AsyncIterable<ShorthandEvent> {
       for (const event of eventsBeforeChildIdle) {
         yield event;
       }
@@ -1448,7 +1913,59 @@ describe('OpenCodeBridge', () => {
     expect(finalTaskIndex).toBeGreaterThanOrEqual(0);
 
     releaseStream();
-    await runPromise;
+    const result = await runPromise;
+    expect(result.completed).toBe(true);
+  });
+
+  it('returns an incomplete result when deferred idle times out', async () => {
+    vi.useFakeTimers();
+    const stream = mockStream();
+    const taskCallId = 'call_deferred_idle_timeout_task';
+    const childSessionId = 'ses_deferred_idle_timeout_child';
+    const pipelineType = OpenCodePipeline as unknown as {
+      DEFERRED_IDLE_TIMEOUT_MS: number;
+    };
+    const previousTimeout = pipelineType.DEFERRED_IDLE_TIMEOUT_MS;
+    pipelineType.DEFERRED_IDLE_TIMEOUT_MS = 25;
+
+    let releasePendingRead!: () => void;
+    const pendingRead = new Promise<void>(resolve => { releasePendingRead = resolve; });
+    async function* controlledStream(): AsyncIterable<ShorthandEvent> {
+      yield { type: 'part.updated', part: { type: 'text', text: 'spawn child', messageId: 'msg_u1', id: 'prt_timeout_u1' } };
+      yield {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_timeout_task',
+          callId: taskCallId,
+          state: {
+            status: 'running',
+            input: { description: 'never finishes' },
+            metadata: { parentSessionId: 'test-session', sessionId: childSessionId },
+          },
+        },
+      };
+      yield idleEvent();
+      await pendingRead;
+    }
+
+    try {
+      const runPromise = runBridge(
+        bridge,
+        { stream: controlledStream() },
+        stream,
+        mockToken(),
+      );
+      await vi.advanceTimersByTimeAsync(25);
+      const result = await runPromise;
+      expect(result.completed).toBe(false);
+      releasePendingRead();
+    } finally {
+      releasePendingRead();
+      pipelineType.DEFERRED_IDLE_TIMEOUT_MS = previousTimeout;
+      vi.useRealTimers();
+    }
   });
 
   it('uses the last child assistant markdown text as the subagent result', async () => {
@@ -1707,6 +2224,7 @@ describe('OpenCodeBridge', () => {
     try {
       const permissions = { reply: vi.fn(async () => ({ data: true, error: undefined })) };
       const stream = mockStream();
+      answerPermission(stream, 'once');
       stream.externalEdit = vi.fn(async (_target: vscode.Uri | vscode.Uri[], callback: () => Thenable<unknown>) => {
         await callback();
         await fs.writeFile(childFilePath, 'after\n', 'utf-8');
@@ -1726,13 +2244,10 @@ describe('OpenCodeBridge', () => {
         partId: 'user-full-chain',
       }));
 
-      const fullBridge = new OpenCodeProtocolBridge(
+      const fullBridge = new OpenCodePipeline(
         mockBackend({ permissions }),
-        'ses_root_full_chain',
-        tmpDir,
-        { sessionId: 'ses_root_full_chain' },
+        { sessionId: 'ses_root_full_chain', directory: tmpDir, stream: sss },
       );
-      fullBridge.setSSS(sss);
 
       const childSessionId = 'ses_child_full_chain';
       const taskCallId = 'call_task_full_chain';
@@ -1835,9 +2350,9 @@ describe('OpenCodeBridge', () => {
         },
         idleEventFor(childSessionId),
         idleEvent(),
-      ] satisfies AcpEvent[]);
+      ] satisfies ShorthandEvent[]);
 
-      await fullBridge.run(events.stream, mockToken());
+      await fullBridge.run(rawStream(events.stream), mockToken());
       await sss.flush();
       await sss.drain();
       sss.close();
@@ -1893,7 +2408,10 @@ describe('OpenCodeBridge', () => {
       expect(rootMeta.get('session')?.title).not.toBe('Child Full Chain');
       expect(rootMeta.get(writeCallId)).toBeUndefined();
 
-      const snapshots = await readAllSnapshots(path.join(sessionDir, 'session.jsonl'));
+      const rootSnapshots = await readAllSnapshots(path.join(sessionDir, 'session.jsonl'));
+      expect(rootSnapshots).toEqual([]);
+
+      const snapshots = await readAllSnapshots(sub.filePath);
       expect(snapshots).toEqual(expect.arrayContaining([
         expect.objectContaining({
           toolCallId: writeCallId,
@@ -2238,7 +2756,7 @@ describe('OpenCodeBridge', () => {
     const result = await runBridge(bridge,events, stream, mockToken());
 
     // Bridge should complete successfully (not cancel)
-    expect(result).toBe(true);
+    expect(result.completed).toBe(true);
 
     // Task completed part should have been pushed (via child session.idle)
     const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls;
@@ -2351,7 +2869,9 @@ describe('OpenCodeBridge', () => {
 
   it('should stop on session.idle matching target session', async () => {
     const stream = mockStream();
-    const scopedBridge = new OpenCodeProtocolBridge(mockBackend(), 'ses_a', undefined, { sessionId: 'ses_a' });
+    const scopedBridge = (sss: SerializableSessionStream) => new OpenCodePipeline(
+      mockBackend(), { sessionId: 'ses_a', stream: sss },
+    );
     const events = eventStream([
       { type: 'part.updated', part: { type: 'text', text: '', messageId: 'msg_a1', id: 'prt_ai1' } },
       deltaEvent('Yes'),
@@ -2365,7 +2885,9 @@ describe('OpenCodeBridge', () => {
 
   it('should ignore session.idle from a different session when target session is set', async () => {
     const stream = mockStream();
-    const scopedBridge = new OpenCodeProtocolBridge(mockBackend(), 'ses_target', undefined, { sessionId: 'ses_target' });
+    const scopedBridge = (sss: SerializableSessionStream) => new OpenCodePipeline(
+      mockBackend(), { sessionId: 'ses_target', stream: sss },
+    );
     const events = eventStream([
       {
         type: 'part.updated',
@@ -2390,13 +2912,13 @@ describe('OpenCodeBridge', () => {
   it('should return false when cancelled', async () => {
     const stream = mockStream();
     const r = await runBridge(bridge,eventStream(fullTurnEvents({})), stream, mockToken(true));
-    expect(r).toBe(false);
+    expect(r.completed).toBe(false);
   });
 
   it('should return true when completed normally', async () => {
     const stream = mockStream();
     const r = await runBridge(bridge,eventStream(fullTurnEvents({})), stream, mockToken());
-    expect(r).toBe(true);
+    expect(r.completed).toBe(true);
   });
 
   // --- Reset ---
@@ -2451,9 +2973,11 @@ describe('OpenCodeBridge', () => {
   // -----------------------------------------------------------------------
   // Permission.asked lifecycle — external edit tracking + auto-reply
   // -----------------------------------------------------------------------
+  type ShorthandPermissionAsked = Extract<ShorthandEvent, { type: 'permission.asked' }>;
+
   function permissionAskedEvent(
-    overrides?: Partial<AcpPermissionRequestEvent>,
-  ): AcpPermissionRequestEvent {
+    overrides?: Partial<ShorthandPermissionAsked>,
+  ): ShorthandPermissionAsked {
     return {
       type: 'permission.asked',
       permissionId: 'perm_42',
@@ -2475,7 +2999,10 @@ describe('OpenCodeBridge', () => {
     });
 
     function permissionBridge(directory?: string, questions?: { reply: ReturnType<typeof vi.fn>; reject?: ReturnType<typeof vi.fn> }) {
-      return new OpenCodeProtocolBridge(mockBackend({ permissions: mockPermissions, questions }), 'ses_target', directory);
+      return (sss: SerializableSessionStream) => new OpenCodePipeline(
+        mockBackend({ permissions: mockPermissions, questions }),
+        { sessionId: 'ses_target', directory, stream: sss },
+      );
     }
 
     function firstExternalEditTarget(stream: MockStream): vscode.Uri[] {
@@ -2484,6 +3011,7 @@ describe('OpenCodeBridge', () => {
 
     it('starts ExternalEditSSP with callId and filepath when both are present', async () => {
       const stream = mockStream();
+      answerPermission(stream, 'once');
       const events = eventStream([
         permissionAskedEvent(),
         idleEvent(),
@@ -2526,6 +3054,7 @@ describe('OpenCodeBridge', () => {
 
     it('does not start externalEdit when callId is missing', async () => {
       const stream = mockStream();
+      answerPermission(stream, 'once');
       const events = eventStream([
         permissionAskedEvent({ tool: undefined }),
         idleEvent(),
@@ -2539,6 +3068,7 @@ describe('OpenCodeBridge', () => {
 
     it('does not start externalEdit when filepath is missing', async () => {
       const stream = mockStream();
+      answerPermission(stream, 'once');
       const events = eventStream([
         permissionAskedEvent({ metadata: {} }),
         idleEvent(),
@@ -2548,6 +3078,157 @@ describe('OpenCodeBridge', () => {
 
       expect(stream.externalEdit).not.toHaveBeenCalled();
       expect(mockPermissions.reply).toHaveBeenCalledWith('ses_target', 'perm_42', 'once', undefined);
+    });
+
+    it('automatically allows permission requests in full-edit mode without rendering approval UI', async () => {
+      const stream = mockStream();
+      const sss = new SerializableSessionStream(stream as any, {
+        workspaceRoot: '',
+        backendName: 'test',
+        sessionId: 'test-session',
+        turnIndex: 0,
+        requestId: 'test-request',
+      });
+      const pipeline = new OpenCodePipeline(
+        mockBackend({ permissions: mockPermissions }),
+        { sessionId: 'ses_target', stream: sss, permissionMode: 'full-edit' },
+      );
+
+      await pipeline.run(
+        rawStream(eventStream([permissionAskedEvent(), idleEvent()]).stream),
+        mockToken(),
+      );
+      await sss.flush();
+
+      expect(mockPermissions.reply).toHaveBeenCalledWith('ses_target', 'perm_42', 'once', undefined);
+      expect(stream.externalEdit).toHaveBeenCalledTimes(1);
+      expect((stream as MockStream & { questionCarousel?: ReturnType<typeof vi.fn> }).questionCarousel).toBeUndefined();
+    });
+
+    it('automatically allows permissions for a non-interactive native LM turn', async () => {
+      const stream = mockStream();
+      const sss = new SerializableSessionStream(stream as any, {
+        workspaceRoot: '',
+        backendName: 'test',
+        sessionId: 'test-session',
+        turnIndex: 0,
+        requestId: 'test-request',
+      });
+      const pipeline = new OpenCodePipeline(
+        mockBackend({ permissions: mockPermissions }),
+        {
+          sessionId: 'ses_target',
+          stream: sss,
+          // Native LanguageModelChat has no permission carousel. The approval
+          // setting must not leave the backend permission request unresolved.
+          permissionMode: 'approval',
+          allowUserInteraction: false,
+        },
+      );
+
+      await pipeline.run(
+        rawStream(eventStream([permissionAskedEvent({ tool: undefined }), idleEvent()]).stream),
+        mockToken(),
+      );
+      await sss.flush();
+
+      expect(mockPermissions.reply).toHaveBeenCalledWith('ses_target', 'perm_42', 'once', undefined);
+      expect((stream as MockStream & { questionCarousel?: ReturnType<typeof vi.fn> }).questionCarousel).toBeUndefined();
+    });
+
+    it('keeps the ExternalEdit baseline barrier for non-interactive file edits', async () => {
+      const stream = mockStream();
+      let captureBaseline: (() => PromiseLike<unknown>) | undefined;
+      stream.externalEdit = vi.fn(async (_target, callback) => {
+        captureBaseline = callback;
+        return 'undo-stop';
+      });
+      const sss = new SerializableSessionStream(stream as any, {
+        workspaceRoot: '',
+        backendName: 'test',
+        sessionId: 'test-session',
+        turnIndex: 0,
+        requestId: 'test-request',
+      });
+      const pipeline = new OpenCodePipeline(
+        mockBackend({ permissions: mockPermissions }),
+        {
+          sessionId: 'ses_target',
+          stream: sss,
+          permissionMode: 'approval',
+          allowUserInteraction: false,
+        },
+      );
+
+      const runPromise = pipeline.run(
+        rawStream(eventStream([permissionAskedEvent(), idleEvent()]).stream),
+        mockToken(),
+      );
+      await new Promise<void>(resolve => setTimeout(resolve, 0));
+      await sss.flush();
+      expect(stream.externalEdit).toHaveBeenCalledTimes(1);
+      expect(mockPermissions.reply).not.toHaveBeenCalled();
+
+      expect(captureBaseline).toBeDefined();
+      void captureBaseline!();
+      await expect(runPromise).resolves.toMatchObject({ completed: true });
+      await sss.flush();
+      expect(mockPermissions.reply).toHaveBeenCalledWith('ses_target', 'perm_42', 'once', undefined);
+    });
+
+    it('automatically allows non-mutating permission requests in read-only mode', async () => {
+      const stream = mockStream();
+      const sss = new SerializableSessionStream(stream as any, {
+        workspaceRoot: '',
+        backendName: 'test',
+        sessionId: 'test-session',
+        turnIndex: 0,
+        requestId: 'test-request',
+      });
+      const pipeline = new OpenCodePipeline(
+        mockBackend({ permissions: mockPermissions }),
+        { sessionId: 'ses_target', stream: sss, permissionMode: 'read-only' },
+      );
+
+      await pipeline.run(
+        rawStream(eventStream([permissionAskedEvent({ permission: 'read' }), idleEvent()]).stream),
+        mockToken(),
+      );
+      await sss.flush();
+
+      expect(mockPermissions.reply).toHaveBeenCalledWith('ses_target', 'perm_42', 'once', undefined);
+      expect(stream.externalEdit).not.toHaveBeenCalled();
+      expect((stream as MockStream & { questionCarousel?: ReturnType<typeof vi.fn> }).questionCarousel).toBeUndefined();
+    });
+
+    it('rejects permission when the user selects Reject', async () => {
+      const stream = mockStream();
+      answerPermission(stream, 'reject');
+
+      await runBridge(
+        permissionBridge(),
+        eventStream([permissionAskedEvent({ tool: undefined }), idleEvent()]),
+        stream,
+        mockToken(),
+      );
+
+      expect(mockPermissions.reply).toHaveBeenCalledWith('ses_target', 'perm_42', 'reject', undefined);
+    });
+
+    it('rejects permission when the user skips the prompt', async () => {
+      const stream = mockStream();
+      (stream as MockStream & {
+        questionCarousel: ReturnType<typeof vi.fn>;
+      }).questionCarousel = vi.fn(async () => undefined);
+
+      await runBridge(
+        permissionBridge(),
+        eventStream([permissionAskedEvent({ tool: undefined }), idleEvent()]),
+        stream,
+        mockToken(),
+      );
+
+      expect(mockPermissions.reply).toHaveBeenCalledWith('ses_target', 'perm_42', 'reject', undefined);
     });
 
     it('bridge loop continues processing subsequent events after permission.asked', async () => {
@@ -2583,7 +3264,7 @@ describe('OpenCodeBridge', () => {
             options: [],
           },
         ],
-      } as AcpEvent;
+      } as ShorthandEvent;
 
       await runBridge(permissionBridge(undefined, questions), eventStream([questionEvent, idleEvent()]), stream, mockToken());
 
@@ -2696,6 +3377,7 @@ describe('OpenCodeBridge', () => {
 
     it('completes child-session ExternalEditSSP when a child write tool completes', async () => {
       const stream = mockStream();
+      answerPermission(stream, 'once');
       const taskCallId = 'call_child_edit_task';
       const childSessionId = 'ses_child_edit';
       const writeCallId = 'call_child_write';
@@ -2890,10 +3572,10 @@ describe('OpenCodeBridge', () => {
   });
 
   // -----------------------------------------------------------------------
-  // ACP-derived stream compatibility — regression tests
+  // Backend event coverage
   // -----------------------------------------------------------------------
 
-  describe('ACP-derived stream compatibility', () => {
+  describe('backend event coverage', () => {
     // --- session.diff gracefully handled (no MultiDiffPart in test mock) ---
 
     it('should gracefully handle session.diff without MultiDiffPart', async () => {

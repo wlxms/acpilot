@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from '
 import { dirname } from 'node:path';
 import { createHash } from 'node:crypto';
 import * as vscode from 'vscode';
-import type { FileSnapshotRecord } from '../serializable/types';
+import type { FileSnapshotRecord } from '../../ssp/types';
 
 export interface ReplayResult {
   applied: number;
@@ -688,7 +688,7 @@ function findUniqueLineBoundaryIndex(text: string, needle: string, fromIndex: nu
 function pairSnapshots(snapshots: readonly FileSnapshotRecord[]): SnapshotPair[] {
   const byKey = new Map<string, Partial<SnapshotPair>>();
   for (const snapshot of snapshots) {
-    if (!snapshot.toolCallId || !snapshot.uri) continue;
+    if (!snapshot.toolCallId || !snapshot.uri) {continue;}
     const key = `${snapshot.toolCallId}\n${normalizeSnapshotUriKey(snapshot.uri)}`;
     const entry = byKey.get(key) ?? {};
     if (snapshot.phase === 'after') {
@@ -709,7 +709,7 @@ function pairSnapshots(snapshots: readonly FileSnapshotRecord[]): SnapshotPair[]
 function pairSnapshotsByToolCall(snapshots: readonly FileSnapshotRecord[]): SnapshotPair[] {
   const byKey = new Map<string, Partial<SnapshotPair>>();
   for (const snapshot of snapshots) {
-    if (!snapshot.toolCallId || !snapshot.uri) continue;
+    if (!snapshot.toolCallId || !snapshot.uri) {continue;}
     const key = `${snapshot.toolCallId}\n${normalizeSnapshotUriKey(snapshot.uri)}`;
     const entry = byKey.get(key) ?? {};
     if (snapshot.phase === 'after') {
@@ -1036,12 +1036,12 @@ function diffLines(before: string[], after: string[]): DiffOp[] {
       ops.push({ type: 'insert', value: after[j++] });
     }
   }
-  while (i < m) ops.push({ type: 'delete', value: before[i++] });
-  while (j < n) ops.push({ type: 'insert', value: after[j++] });
+  while (i < m) {ops.push({ type: 'delete', value: before[i++] });}
+  while (j < n) {ops.push({ type: 'insert', value: after[j++] });}
   return ops;
 }
 
 function splitLines(text: string): string[] {
-  if (!text) return [];
+  if (!text) {return [];}
   return text.match(/[^\r\n]*(?:\r\n|\r|\n|$)/g)?.filter((line) => line.length > 0) ?? [];
 }

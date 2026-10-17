@@ -6,7 +6,7 @@
  * VS Code stream capabilities, so there is no separate ACP renderer path.
  */
 
-import * as vscode from 'vscode';
+import type * as vscode from 'vscode';
 import type { ExtensionState, BackendContext } from '../../types';
 import { createParticipantHandler } from '../../participant/handler';
 

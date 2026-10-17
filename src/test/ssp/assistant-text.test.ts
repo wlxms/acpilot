@@ -3,7 +3,7 @@ import type { SspStream } from '../../ssp/types';
 import { SerializableStreamPart, isMutable } from '../../ssp/types';
 import { AssistantTextSSP } from '../../ssp/impl/assistant-text';
 
-function mockStream(): SspStream & { markdown: ReturnType<typeof vi.fn> } {
+function mockStream(): SspStream {
   return {
     markdown: vi.fn(),
     progress: vi.fn(),

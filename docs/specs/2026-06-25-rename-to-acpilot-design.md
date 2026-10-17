@@ -1,8 +1,13 @@
 # 项目重命名为 ACPilot — 设计文档
 
 **日期**: 2026-06-25
-**状态**: 待实施
-**分支**: master(单次 commit + push)
+**状态**: 历史设计（已由阶段一多后端架构取代）
+**分支**: master（历史记录）
+
+> 本文记录项目从 OpenCode Copilot 更名为 ACPilot 的早期方案。重命名和多后端
+> 接入已经落地；当前领域边界、Vendor 规则和运行时契约以
+> [阶段一架构设计](../refactor/copilot-agent-sss-phase1-design.md) 及 README 为准。
+> 文中的旧路径、旧 Vendor 和提交步骤仅供历史追溯，不是当前实施清单。
 
 ## 1. 背景与动机
 
@@ -54,7 +59,8 @@ OpenCode 只是 `src/backends/opencode/` 下的一个 backend 实现。
 
 - `src/backends/opencode/` 目录及内部所有文件(`OpenCodeBackend` 类、`opencode-bridge.ts` 等)
 - `registerBackend('opencode', ...)` / `createBackend('opencode')` — backend 注册名
-- `languageModelChatProviders` 里的 vendor:`opencode-cli`、`opencode-zen` — 具体 backend 的 vendor 名
+- `languageModelChatProviders` 里的 backend Vendor — 早期方案曾使用多个 OpenCode Vendor；
+  当前每个 Backend 只注册一个 Vendor（例如 `opencode`、`acp`、`reasonix`）
 - session type 里的 `opencode` 部分:`acpilot.opencode`(前缀改 acpilot,backend 名 opencode 保留)
 - npm 依赖 `@opencode-ai/sdk`、`opencode-ai` — 上游包,非本项目
 - `.omo`、`.codex`、`.agents`、`.sisyphus`、`.vscode` 等工具配置目录

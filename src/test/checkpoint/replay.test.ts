@@ -5,7 +5,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { applyPatchSafely, replaySnapshotsToWorkspace, summarizeSnapshotLineDiff } from '../../backend/checkpoint/replay';
-import type { FileSnapshotRecord } from '../../backend/serializable/types';
+import type { FileSnapshotRecord } from '../../ssp/types';
 
 describe('checkpoint replay', () => {
   it('summarizes restored snapshot line diffs for edit bubble diagnostics', () => {
@@ -857,7 +857,7 @@ async function recordTrackedEdit(
   // Start externalEdit (baseline captured)
   await new Promise<void>(resolve => {
     const cb = async () => {
-      for (const s of beforeSnapshots) snapshots.push(s);
+      for (const s of beforeSnapshots) {snapshots.push(s);}
       resolve();
       await new Promise<void>(r => { resolveDeferred = r; });
     };
@@ -866,7 +866,7 @@ async function recordTrackedEdit(
       externalEdit(uris, cb);
     }
     // Fallback if no externalEdit: just resolve
-    if (!externalEdit) resolve();
+    if (!externalEdit) {resolve();}
   });
 
   mutate();

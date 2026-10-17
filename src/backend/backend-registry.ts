@@ -17,7 +17,7 @@ const registry = new Map<string, BackendFactory>();
  * Register a backend factory under the given ID.
  * Typically called as a side-effect import:
  * ```ts
- * import './backends/opencode'; // registers 'opencode'
+ * import './backends/example'; // registers 'example'
  * ```
  */
 export function registerBackend(id: string, factory: BackendFactory): void {
@@ -26,21 +26,14 @@ export function registerBackend(id: string, factory: BackendFactory): void {
 
 /**
  * Create a backend instance by ID.
- * Falls back to the first registered backend if `id` is not found.
- * Throws if no backends are registered.
+ * Unknown IDs are configuration errors and must never route to another backend.
  */
 export function createBackend(id: string): Backend {
   const factory = registry.get(id);
   if (factory) {
     return factory();
   }
-
-  // Fallback: use the first registered backend
-  const first = registry.values().next();
-  if (first.done) {
-    throw new Error(`No backends registered (requested: "${id}")`);
-  }
-  return first.value();
+  throw new Error(`Backend not registered: "${id}"`);
 }
 
 /**

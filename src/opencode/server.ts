@@ -5,6 +5,20 @@ import type { OpenCodeClient, OpenCodeServerController } from '../backends/openc
 
 export type ServerStatus = 'stopped' | 'starting' | 'running' | 'error';
 
+/**
+ * A server connection attempt must not hold shutdown (or a replacement
+ * runtime) open forever. The SDK has its own request timeout, but callers may
+ * provide a transport that never settles, so keep an adapter-level bound too.
+ */
+const START_DRAIN_TIMEOUT_MS = 2_000;
+
+class StartCancelledError extends Error {
+  constructor() {
+    super('OpenCode server start cancelled');
+    this.name = 'StartCancelledError';
+  }
+}
+
 /** Default opencode.json config that enables permission.edit="ask" for externalEdit tracking */
 const DEFAULT_OPENCODE_CONFIG = {
   $schema: 'https://opencode.ai/config.json',
@@ -73,6 +87,8 @@ export class OpenCodeServerManager implements OpenCodeServerController {
   private status: ServerStatus = 'stopped';
   private serverUrl: string | null = null;
   private startPromise: Promise<string> | null = null;
+  /** Incremented whenever a start is invalidated by stop(). */
+  private startGeneration = 0;
 
   /**
    * Start the OpenCode server.
@@ -90,19 +106,24 @@ export class OpenCodeServerManager implements OpenCodeServerController {
       return this.startPromise;
     }
 
-    this.startPromise = this.doStart(cwd);
+    const generation = ++this.startGeneration;
+    const pending = this.doStart(cwd, generation);
+    this.startPromise = pending;
     try {
-      return await this.startPromise;
+      return await pending;
     } finally {
-      this.startPromise = null;
+      if (this.startPromise === pending) {
+        this.startPromise = null;
+      }
     }
   }
 
-  private async doStart(cwd?: string): Promise<string> {
+  private async doStart(cwd: string | undefined, generation: number): Promise<string> {
     this.status = 'starting';
     this.serverUrl = null;
 
     const originalCwd = process.cwd();
+    let createdInstance: Awaited<ReturnType<typeof createOpencode>> | undefined;
     try {
       // Ensure opencode.json exists in the project directory.
       // This is required for permission.edit="ask" to work, which enables
@@ -116,9 +137,8 @@ export class OpenCodeServerManager implements OpenCodeServerController {
       delete process.env.OPENCODE_SERVER_PASSWORD;
 
       const previousPath = prependPackagedOpenCodeToPath();
-      let instance: Awaited<ReturnType<typeof createOpencode>>;
       try {
-        instance = await createOpencode({
+        createdInstance = await createOpencode({
           port: 0,
           timeout: 15_000,
         });
@@ -129,25 +149,62 @@ export class OpenCodeServerManager implements OpenCodeServerController {
           process.env.PATH = previousPath;
         }
       }
+      // stop() may have invalidated this start while the SDK was connecting.
+      // Close the just-created server instead of publishing a late running
+      // instance after the caller has requested shutdown.
+      if (generation !== this.startGeneration) {
+        const staleInstance = createdInstance;
+        createdInstance = undefined;
+        try {
+          staleInstance.server.close();
+        } catch {
+          // The stale transport may already have closed while stop() raced
+          // startup. Preserve the cancellation result either way.
+        }
+        throw new StartCancelledError();
+      }
+
       // Cast at the architectural boundary: SDK v2 OpencodeClient → our typed contract.
       // The shapes are compatible at runtime; the type mismatch is due to SDK's complex
       // ServerSentEventsResult / RequestResult generics vs our simpler SdkResponse wrapper.
       this.instance = {
-        server: instance.server,
-        client: instance.client as unknown as OpenCodeClient,
+        server: createdInstance.server,
+        client: createdInstance.client as unknown as OpenCodeClient,
       };
-      this.serverUrl = instance.server.url;
+      this.serverUrl = createdInstance.server.url;
       this.status = 'running';
       return this.serverUrl;
     } catch (err) {
+      // If the SDK resolved and then the generation was invalidated before
+      // publication, make sure no unowned server survives the failed start.
+      if (createdInstance) {
+        const lateInstance = createdInstance;
+        try {
+          lateInstance.server.close();
+        } catch {
+          // Best effort; preserve the original startup error.
+        }
+      }
+      if (generation !== this.startGeneration || err instanceof StartCancelledError) {
+        // A stale start can finish after a replacement has already published
+        // its own instance. Only mutate shared state when this start still
+        // owns the current generation.
+        if (generation === this.startGeneration) {
+          this.instance = null;
+          this.serverUrl = null;
+          this.status = 'stopped';
+        }
+        throw err instanceof StartCancelledError ? err : new StartCancelledError();
+      }
       this.status = 'error';
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes('ENOENT') || msg.includes('not found')) {
         throw new Error(
           'OpenCode CLI not found. Install with: npm i -g opencode-ai',
+          { cause: err },
         );
       }
-      throw new Error(`Failed to start OpenCode server: ${msg}`);
+      throw new Error(`Failed to start OpenCode server: ${msg}`, { cause: err });
     } finally {
       // Always restore original CWD
       if (cwd) {
@@ -157,11 +214,48 @@ export class OpenCodeServerManager implements OpenCodeServerController {
   }
 
   async stop(): Promise<void> {
-    if (this.instance) {
-      this.instance.server.close();
-      this.instance = null;
-      this.serverUrl = null;
-      this.status = 'stopped';
+    // Invalidate a start before awaiting it. The completion path checks the
+    // generation and closes any server created after shutdown was requested.
+    const stopGeneration = ++this.startGeneration;
+    const pending = this.startPromise;
+    if (pending) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const drained = await Promise.race([
+        // Convert rejection into a normal result so the stop path never
+        // replaces the original startup error seen by its caller.
+        pending.then(() => true, () => true),
+        new Promise<boolean>(resolveTimeout => {
+          timer = setTimeout(() => resolveTimeout(false), START_DRAIN_TIMEOUT_MS);
+        }),
+      ]);
+      if (timer !== undefined) {
+        clearTimeout(timer);
+      }
+      if (!drained && this.startPromise === pending) {
+        // Let a replacement start create its own promise. The stale doStart
+        // path retains the generation guard and will dispose a late server
+        // when the SDK eventually resolves.
+        this.startPromise = null;
+      }
+    }
+
+    // A new start may have been requested after the old start settled but
+    // before this stop continuation resumed. In that case this stop no longer
+    // owns the manager state and must leave the replacement runtime intact.
+    if (this.startGeneration !== stopGeneration) {
+      return;
+    }
+
+    const instance = this.instance;
+    this.instance = null;
+    this.serverUrl = null;
+    this.status = 'stopped';
+    if (instance) {
+      try {
+        instance.server.close();
+      } catch {
+        // Server close is best effort during extension shutdown.
+      }
     }
   }
 

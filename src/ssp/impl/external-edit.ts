@@ -9,16 +9,17 @@
  * Lifecycle:
  *   push (status='pending') → render() starts stream.externalEdit()
  *     → VS Code captures baseline
- *     → callback: onSnapshot(before), onBaselineCaptured(), block on deferred
+ *     → callback: emit before snapshot, onBaselineCaptured(), block on deferred
  *
  *   update (status='completed') → resolve deferred
  *     → VS Code returns undoStopId via onDidComplete
- *     → onSnapshot(after, undoStopId)
+ *     → emit after snapshot with undoStopId
  *     → store undoStopId → emitStateChange → SSS writes meta.jsonl
  *
  * Implements:
  *   IMutableStreamPart — update() merges status changes
  *   IMetadataProvider — exposes undoStopId for meta.jsonl
+ *   ISnapshotProvider — emits before/after snapshots for SSS persistence
  *
  * Guards:
  *   editStarted: prevents re-launching stream.externalEdit() on repeated render()
@@ -26,20 +27,18 @@
 
 import * as vscode from 'vscode';
 import { existsSync, readFileSync } from 'node:fs';
-import { SerializableStreamPart, IMutableStreamPart, IAsyncMetadataProvider } from '../types';
+import path from 'node:path';
+import { SerializableStreamPart, type IMutableStreamPart, type IAsyncMetadataProvider, type ISnapshotProvider } from '../types';
 import type { SspStream } from '../types';
-import type { ExternalEditStreamPartPayload, SerializableStreamPartMeta } from '../types';
-import type { FileSnapshotRecord } from '../../backend/serializable/types';
+import type { ExternalEditStreamPartPayload, FileSnapshotRecord, SerializableStreamPartMeta } from '../types';
 
 // ---------------------------------------------------------------------------
-// Callbacks (injected by Bridge — backend-specific logic lives here)
+// Backend callbacks
 // ---------------------------------------------------------------------------
 
 export interface ExternalEditSSPCallbacks {
-  /** Called when VS Code has captured the file baseline — Bridge auto-replies permission */
+  /** Called when VS Code has captured the file baseline. */
   onBaselineCaptured: () => void;
-  /** Called with file snapshots (before/after) — Bridge serializes via SSS.serializeSnapshot */
-  onSnapshot: (snapshot: FileSnapshotRecord) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -49,7 +48,7 @@ export interface ExternalEditSSPCallbacks {
 export class ExternalEditSSP extends SerializableStreamPart<
   'externalEdit',
   ExternalEditStreamPartPayload
-> implements IMutableStreamPart<ExternalEditStreamPartPayload>, IAsyncMetadataProvider {
+> implements IMutableStreamPart<ExternalEditStreamPartPayload>, IAsyncMetadataProvider, ISnapshotProvider {
 
   readonly kind = 'externalEdit' as const;
 
@@ -59,12 +58,14 @@ export class ExternalEditSSP extends SerializableStreamPart<
   private onDidComplete: Thenable<string> | null = null;
   private metadataSettled: Promise<void> | null = null;
   private _undoStopId: string | null = null;
+  private snapshotListeners: Array<(snapshot: FileSnapshotRecord) => void> = [];
 
   constructor(
     payload: ExternalEditStreamPartPayload,
     private readonly callbacks?: ExternalEditSSPCallbacks,
     meta?: Partial<SerializableStreamPartMeta>,
     id?: string,
+    private readonly directory?: string,
   ) {
     super(payload, {
       ...meta,
@@ -83,7 +84,7 @@ export class ExternalEditSSP extends SerializableStreamPart<
   get metaId(): string { return this.id; }
 
   getMetadata(): Record<string, unknown> | undefined {
-    if (!this._undoStopId) return undefined;
+    if (!this._undoStopId) {return undefined;}
     return { undoStopId: this._undoStopId };
   }
 
@@ -91,18 +92,27 @@ export class ExternalEditSSP extends SerializableStreamPart<
     await this.metadataSettled;
   }
 
+  // ── ISnapshotProvider ─────────────────────────────────────────────────
+
+  onSnapshot(cb: (snapshot: FileSnapshotRecord) => void): () => void {
+    this.snapshotListeners.push(cb);
+    return () => {
+      this.snapshotListeners = this.snapshotListeners.filter(listener => listener !== cb);
+    };
+  }
+
   // ── Render: start externalEdit lifecycle ───────────────────────────────
 
   render(stream: SspStream): void {
-    if (this.editStarted || this.payload.status !== 'pending') return;
-    if (!stream.externalEdit) return;
+    if (this.editStarted || this.payload.status !== 'pending') {return;}
+    if (!stream.externalEdit) {return;}
     this.editStarted = true;
 
     const uris = (this.payload.uris ?? []) as vscode.Uri[];
     if (uris.length === 0 && this.payload.uri) {
-      uris.push(buildFileUri(this.payload.uri));
+      uris.push(buildFileUri(this.payload.uri, this.directory));
     }
-    if (uris.length === 0) return;
+    if (uris.length === 0) {return;}
 
     const toolCallId = this.payload.toolCallId;
     const beforeSnapshots = uris.map((uri, i) =>
@@ -112,7 +122,7 @@ export class ExternalEditSSP extends SerializableStreamPart<
     const callback = async () => {
       if (!this.baselineCaptured) {
         this.baselineCaptured = true;
-        for (const s of beforeSnapshots) this.callbacks?.onSnapshot(s);
+        for (const s of beforeSnapshots) {this.emitSnapshot(s);}
         this.callbacks?.onBaselineCaptured();
       }
 
@@ -129,7 +139,7 @@ export class ExternalEditSSP extends SerializableStreamPart<
   update(data: Partial<ExternalEditStreamPartPayload>): void {
     Object.assign(this.payload, data);
 
-    if (data.status === 'completed' && this.deferred) {
+    if ((data.status === 'completed' || data.status === 'error') && this.deferred) {
       this.deferred.resolve();
 
       // Wait for VS Code to return undoStopId
@@ -146,12 +156,12 @@ export class ExternalEditSSP extends SerializableStreamPart<
             // Capture after-snapshots
             const uris = (this.payload.uris ?? []) as vscode.Uri[];
             if (this.payload.uri && uris.length === 0) {
-              uris.push(buildFileUri(this.payload.uri));
+              uris.push(buildFileUri(this.payload.uri, this.directory));
             }
             for (let i = 0; i < uris.length; i++) {
               const after = captureSnapshot(uris[i], this.payload.toolCallId, 'after', i, this.meta.turnIndex);
               after.undoStopId = undoStopId || undefined;
-              this.callbacks?.onSnapshot(after);
+              this.emitSnapshot(after);
             }
             this.emitStateChange();
           },
@@ -162,6 +172,10 @@ export class ExternalEditSSP extends SerializableStreamPart<
         );
       }
     }
+  }
+
+  private emitSnapshot(snapshot: FileSnapshotRecord): void {
+    for (const cb of this.snapshotListeners) {cb(snapshot);}
   }
 }
 
@@ -195,8 +209,11 @@ function captureSnapshot(
   };
 }
 
-function buildFileUri(filePath: string): vscode.Uri {
-  const rawUri = vscode.Uri.file(filePath);
+function buildFileUri(filePath: string, directory?: string): vscode.Uri {
+  const resolvedPath = path.isAbsolute(filePath)
+    ? filePath
+    : path.resolve(directory ?? '', filePath);
+  const rawUri = vscode.Uri.file(resolvedPath);
   const normalizedPath = /^\/[a-zA-Z]:(?=\/)/.test(rawUri.path)
     ? rawUri.path.toLowerCase()
     : rawUri.path;

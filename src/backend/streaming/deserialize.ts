@@ -8,6 +8,7 @@
  */
 
 import { promises as fs } from 'node:fs';
+import type { Dirent } from 'node:fs';
 import path from 'node:path';
 import {
   type StreamPartRecord,
@@ -15,7 +16,7 @@ import {
   type SerializableToolState,
   isMutableKind,
 } from '../../ssp/types';
-import type { FileSnapshotRecord } from '../serializable/types';
+import type { FileSnapshotRecord } from '../../ssp/types';
 import { parseLine } from '../serializable/serializer';
 import { AssistantTextSSP } from '../../ssp/impl/assistant-text';
 import { ReasoningSSP } from '../../ssp/impl/reasoning';
@@ -24,7 +25,8 @@ import { ToolInvocationSSP } from '../../ssp/impl/tool-invocation';
 import { QuestionSSP } from '../../ssp/impl/question';
 import { ExternalEditSSP } from '../../ssp/impl/external-edit';
 import { SessionLifecycleSSP, SessionDiffSSP } from '../../ssp/impl/session-lifecycle';
-import { RawAcpEventSSP } from '../../ssp/impl/raw-acp-event';
+import { OpaqueEventSSP } from '../../ssp/impl/opaque-event';
+import { InteractionRequestSSP, InteractionResponseSSP } from '../../ssp/impl/interaction';
 
 // ===========================================================================
 // Read functions
@@ -84,7 +86,7 @@ export async function readSubsessionRecords(sessionDir: string): Promise<Subsess
   const result: SubsessionRecordSet[] = [];
 
   async function walk(dir: string): Promise<void> {
-    let entries: import('node:fs').Dirent[];
+    let entries: Dirent[];
     try {
       entries = await fs.readdir(dir, { withFileTypes: true });
     } catch {
@@ -108,16 +110,15 @@ export async function readSubsessionRecords(sessionDir: string): Promise<Subsess
         ? subAgentPath[subAgentPath.length - 2]
         : undefined;
       const metaPath = path.join(path.dirname(entryPath), 'meta.jsonl');
+      const snapshots = await readAllSnapshots(entryPath);
       result.push({
         subAgentInvocationId,
         parentSubAgentInvocationId,
         subAgentPath,
         filePath: entryPath,
         metaPath,
-        records: (await readAllStreamParts(entryPath)).map(record =>
-          withSubsessionMeta(record, subAgentInvocationId, parentSubAgentInvocationId, subAgentPath),
-        ),
-        snapshots: await readAllSnapshots(entryPath),
+        records: await readAllStreamParts(entryPath),
+        snapshots,
         metaIndex: await readMetaIndex(metaPath),
       });
     }
@@ -125,32 +126,6 @@ export async function readSubsessionRecords(sessionDir: string): Promise<Subsess
 
   await walk(root);
   return result.sort((a, b) => a.filePath.localeCompare(b.filePath));
-}
-
-function withSubsessionMeta(
-  record: StreamPartRecord,
-  subAgentInvocationId: string,
-  parentSubAgentInvocationId: string | undefined,
-  subAgentPath: string[],
-): StreamPartRecord {
-  const payload = record.payload;
-  const nextPayload = payload && typeof payload === 'object' && !Array.isArray(payload)
-    ? {
-        ...(payload as Record<string, unknown>),
-        subAgentInvocationId: (payload as Record<string, unknown>).subAgentInvocationId ?? subAgentInvocationId,
-      }
-    : payload;
-
-  return {
-    ...record,
-    payload: nextPayload,
-    meta: {
-      ...record.meta,
-      subAgentInvocationId: record.meta.subAgentInvocationId ?? subAgentInvocationId,
-      parentSubAgentInvocationId: record.meta.parentSubAgentInvocationId ?? parentSubAgentInvocationId,
-      subAgentPath: record.meta.subAgentPath ?? subAgentPath,
-    },
-  };
 }
 
 export async function readMetaIndex(
@@ -165,7 +140,7 @@ export async function readMetaIndex(
   }
   for (const line of content.split('\n')) {
     const trimmed = line.trim();
-    if (!trimmed) continue;
+    if (!trimmed) {continue;}
     try {
       const parsed = JSON.parse(trimmed);
       const id = parsed.type === 'session' ? 'session' : (parsed.id ?? 'unknown');
@@ -262,8 +237,8 @@ function mergeToolState(
   prev: SerializableToolState | undefined,
   curr: SerializableToolState | undefined,
 ): SerializableToolState {
-  if (!curr) return prev ?? { status: 'pending', input: {} };
-  if (!prev) return curr;
+  if (!curr) {return prev ?? { status: 'pending', input: {} };}
+  if (!prev) {return curr;}
 
   // Error terminal: previous error is not overwritten
   if (prev.status === 'error') {
@@ -291,7 +266,7 @@ export function finalizeIncompleteStates(
   sessionStatus: string,
 ): StreamPartRecord[] {
   // In-progress sessions may have legitimately pending tools
-  if (sessionStatus === 'inProgress') return records;
+  if (sessionStatus === 'inProgress') {return records;}
 
   return records.map(record => {
     if (record.kind === 'toolInvocation') {
@@ -406,8 +381,13 @@ export function createSSPFromRecord(
     case 'externalEdit':
       return new ExternalEditSSP(payload as never, {
         onBaselineCaptured: () => {},
-        onSnapshot: () => {},
       }, record.meta, record.id);
+
+    case 'interactionRequest':
+      return new InteractionRequestSSP(payload as never, record.meta, record.id);
+
+    case 'interactionResponse':
+      return new InteractionResponseSSP(payload as never, record.meta, record.id);
 
     case 'sessionLifecycle':
       return new SessionLifecycleSSP(payload as never, record.meta, record.id);
@@ -415,11 +395,11 @@ export function createSSPFromRecord(
     case 'sessionDiff':
       return new SessionDiffSSP(payload as never, record.meta, record.id);
 
-    case 'rawAcpEvent':
-      return new RawAcpEventSSP(payload as never, record.meta, record.id);
+    case 'opaqueEvent':
+      return new OpaqueEventSSP(payload as never, record.meta, record.id);
 
     default:
-      // Unknown kind → wrap payload as raw event
-      return new RawAcpEventSSP({ event: record.payload }, record.meta, record.id);
+      // Unknown kind -> wrap payload as an opaque backend event.
+      return new OpaqueEventSSP({ event: record.payload }, record.meta, record.id);
   }
 }

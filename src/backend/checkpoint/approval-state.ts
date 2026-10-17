@@ -1,4 +1,5 @@
-import type { FileSnapshotRecord, SerializableSessionMeta } from '../serializable/types';
+import type { SerializableSessionMeta } from '../serializable/types';
+import type { FileSnapshotRecord } from '../../ssp/types';
 
 export interface CheckpointApproval {
   acceptedThroughTurn: number;

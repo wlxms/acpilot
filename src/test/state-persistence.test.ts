@@ -61,6 +61,7 @@ describe('state-persistence', () => {
       agent: 'coder',
       model: { providerID: 'anthropic', modelID: 'claude-sonnet-4' },
       modelDisplayName: 'Claude Sonnet 4',
+      permissionMode: 'read-only',
     };
 
     savePersistedSettingsState(context, 'opencode', state);
@@ -79,6 +80,7 @@ describe('state-persistence', () => {
       agent: undefined,
       model: { providerID: 'openai', modelID: 'gpt-4o' },
       modelDisplayName: undefined,
+      permissionMode: undefined,
     });
   });
 
@@ -99,6 +101,26 @@ describe('state-persistence', () => {
       agent: 'new-agent',
       model: { providerID: 'google', modelID: 'gemini-2.5-pro' },
       modelDisplayName: 'Gemini 2.5 Pro',
+    });
+  });
+
+  it('keeps ACP target selections in separate instance namespaces', () => {
+    savePersistedSettingsState(context, 'acp:target-a', {
+      agent: 'agent-a',
+      model: { providerID: 'provider-a', modelID: 'model-a' },
+    });
+    savePersistedSettingsState(context, 'acp:target-b', {
+      agent: 'agent-b',
+      model: { providerID: 'provider-b', modelID: 'model-b' },
+    });
+
+    expect(loadPersistedSettingsState(context, 'acp:target-a')).toMatchObject({
+      agent: 'agent-a',
+      model: { providerID: 'provider-a', modelID: 'model-a' },
+    });
+    expect(loadPersistedSettingsState(context, 'acp:target-b')).toMatchObject({
+      agent: 'agent-b',
+      model: { providerID: 'provider-b', modelID: 'model-b' },
     });
   });
 });

@@ -1,12 +1,15 @@
 import { promises as fs } from 'node:fs';
 import {
   type AnySerializableStreamPart,
+  type FileSnapshotRecord,
+  type FileSnapshotScope,
   type SerializableStreamPartMeta,
   type SspStream,
   type StreamPartRecord,
   isAsyncMetadataProvider,
   isMetadataProvider,
   isMutable,
+  isSnapshotProvider,
 } from '../../ssp/types';
 import { buildLine } from '../serializable/serializer';
 
@@ -32,6 +35,7 @@ export interface SessionStreamNode {
 }
 
 export interface SessionStreamNodeConfig {
+  sessionId: string;
   turnIndex: number;
   requestId: string;
   parentSessionId?: string;
@@ -83,7 +87,7 @@ export class SessionStreamScheduler {
   }
 
   setMode(mode: SessionStreamSchedulingMode): void {
-    if (this.mode === mode) return;
+    if (this.mode === mode) {return;}
     this.flush(`mode switch ${this.mode} -> ${mode}`);
     this.mode = mode;
     this.continuousLastMainRole = null;
@@ -189,7 +193,7 @@ export class SessionStreamScheduler {
   }
 
   private applyActivity(activity: SubagentActivity | undefined): void {
-    if (!activity) return;
+    if (!activity) {return;}
     if (activity.type === 'activate') {
       this.activeSubagents.add(activity.id);
       return;
@@ -214,7 +218,7 @@ export class SessionStreamScheduler {
   }
 
   private flushContinuousSubagentQueue(): void {
-    if (this.continuousSubagentQueue.length === 0) return;
+    if (this.continuousSubagentQueue.length === 0) {return;}
     const queued = [...this.continuousSubagentQueue].sort((a, b) => a.order - b.order);
     this.continuousSubagentQueue = [];
     for (const operation of queued) {
@@ -223,7 +227,7 @@ export class SessionStreamScheduler {
   }
 
   private flushToolFirstAppendQueue(): void {
-    if (this.toolFirstAppendQueue.length === 0) return;
+    if (this.toolFirstAppendQueue.length === 0) {return;}
     const queued = [...this.toolFirstAppendQueue].sort((a, b) => a.order - b.order);
     this.toolFirstAppendQueue = [];
     for (const operation of queued) {
@@ -271,7 +275,7 @@ implements SessionStreamNode {
   }
 
   push(ssp: AnySerializableStreamPart): void {
-    if (!this.isActive) return;
+    if (!this.isActive) {return;}
     this.preparePart(ssp);
     if (isCompleteAppendPart(ssp)) {
       this.flushAppendBuffer(`${ssp.kind} complete`);
@@ -285,7 +289,7 @@ implements SessionStreamNode {
   }
 
   update(id: string, data: Record<string, unknown>): void {
-    if (!this.isActive) return;
+    if (!this.isActive) {return;}
     const info = this.inferScheduleInfoForUpdate(id, data);
     this.scheduler.schedule(info, undefined, () => this.updateNow(id, data));
   }
@@ -307,13 +311,18 @@ implements SessionStreamNode {
   }
 
   private pushNow(ssp: AnySerializableStreamPart): void {
-    if (!this.isActive) return;
+    if (!this.isActive) {return;}
     this.scheduledPartIds.delete(ssp.id);
     this.scheduleInfos.set(ssp.id, this.inferScheduleInfo(ssp));
     this.parts.set(ssp.id, ssp);
     ssp.onStateChange((s) => {
       this.syncMetadata(s);
     });
+    if (isSnapshotProvider(ssp)) {
+      ssp.onSnapshot((snapshot) => {
+        this.persistSnapshot(snapshot);
+      });
+    }
     if (this.shouldRender(ssp)) {
       ssp.render(this.stream);
     }
@@ -322,7 +331,7 @@ implements SessionStreamNode {
   }
 
   private updateNow(id: string, data: Record<string, unknown>): void {
-    if (!this.isActive) return;
+    if (!this.isActive) {return;}
     const ssp = this.parts.get(id);
     if (!ssp) {
       console.warn(`${this.logPrefix} update: part ${id} not found`);
@@ -386,7 +395,7 @@ implements SessionStreamNode {
   }
 
   private inferStreamBoundary(ssp: AnySerializableStreamPart): StreamBoundary | undefined {
-    if (!isStreamBoundaryPart(ssp)) return undefined;
+    if (!isStreamBoundaryPart(ssp)) {return undefined;}
     return this.config.subAgentInvocationId ? 'subagent' : 'root';
   }
 
@@ -399,11 +408,11 @@ implements SessionStreamNode {
       return id ? { type: 'deactivate', id } : undefined;
     }
 
-    if (ssp.kind !== 'toolInvocation') return undefined;
-    if (this.config.subAgentInvocationId) return undefined;
+    if (ssp.kind !== 'toolInvocation') {return undefined;}
+    if (this.config.subAgentInvocationId) {return undefined;}
 
     const id = getSubagentIdentity(ssp);
-    if (!id) return undefined;
+    if (!id) {return undefined;}
 
     const status = getToolStatus(ssp, update);
     if (status === 'pending' || status === 'running') {
@@ -442,6 +451,20 @@ implements SessionStreamNode {
 
   protected abstract createSubsession(subAgentInvocationId: string): TChild;
 
+  private persistSnapshot(snapshot: FileSnapshotRecord): void {
+    if (!this.isActive) {return;}
+    const turnIndex = this.config.turnIndex;
+    const snapshotWithTurn: FileSnapshotRecord = {
+      ...snapshot,
+      turnIndex,
+      scope: buildSnapshotScope(snapshot, {
+        ...this.config,
+        turnIndex,
+      }),
+    };
+    this.appendStreamLine(buildLine('snapshot', snapshotWithTurn));
+  }
+
   protected setNodePaths(paths: SessionStreamNodePaths): void {
     this.nodeDir = paths.dir;
     this.streamPath = paths.streamPath;
@@ -454,14 +477,14 @@ implements SessionStreamNode {
 
   protected appendMeta(data: Record<string, unknown>): void {
     this.enqueueWrite(async () => {
-      if (!this.metaPath) return;
+      if (!this.metaPath) {return;}
       await fs.appendFile(this.metaPath, JSON.stringify({ v: 2, ...data }) + '\n');
     });
   }
 
   protected appendStreamLine(line: string): void {
     this.enqueueWrite(async () => {
-      if (!this.streamPath) return;
+      if (!this.streamPath) {return;}
       await this.beforeAppendStream();
       await fs.appendFile(this.streamPath, line);
     });
@@ -485,9 +508,10 @@ implements SessionStreamNode {
     const meta = ssp.meta as SerializableStreamPartMeta;
     meta.turnIndex = this.config.turnIndex;
     meta.requestId = this.config.requestId;
+    meta.sessionId = meta.sessionId ?? this.config.sessionId;
     meta.sequence = this.sequence++;
     meta.createdAt = meta.createdAt || new Date().toISOString();
-    meta.source = meta.source || 'acp-event';
+    meta.source = meta.source || 'backend-event';
     meta.parentSessionId = meta.parentSessionId ?? this.config.parentSessionId;
     meta.subAgentInvocationId = meta.subAgentInvocationId ?? this.config.subAgentInvocationId;
     meta.parentSubAgentInvocationId = meta.parentSubAgentInvocationId ?? this.config.parentSubAgentInvocationId;
@@ -505,7 +529,7 @@ implements SessionStreamNode {
 
   private prepareStreamablePart(ssp: AnySerializableStreamPart): void {
     const payload = ssp.payload as Record<string, unknown> | undefined;
-    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return;
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {return;}
 
     if (ssp.kind === 'reasoning') {
       const sourcePartId = typeof payload.partId === 'string' ? payload.partId : ssp.id;
@@ -535,9 +559,9 @@ implements SessionStreamNode {
   }
 
   private syncMetadata(ssp: AnySerializableStreamPart): void {
-    if (!isMetadataProvider(ssp)) return;
+    if (!isMetadataProvider(ssp)) {return;}
     const meta = ssp.getMetadata();
-    if (!meta) return;
+    if (!meta) {return;}
     this.appendMeta({ type: 'part-meta', id: ssp.metaId, ...meta });
   }
 
@@ -545,7 +569,7 @@ implements SessionStreamNode {
     const pending = [...this.parts.values()]
       .filter(isAsyncMetadataProvider)
       .map(part => part.whenMetadataSettled());
-    if (pending.length === 0) return;
+    if (pending.length === 0) {return;}
     await Promise.allSettled(pending);
   }
 }
@@ -589,13 +613,30 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function isCompleteAppendPart(ssp: AnySerializableStreamPart): boolean {
-  if (ssp.kind !== 'assistantText' && ssp.kind !== 'reasoning') return false;
+  if (ssp.kind !== 'assistantText' && ssp.kind !== 'reasoning') {return false;}
   const payload = ssp.payload as Record<string, unknown> | undefined;
   return payload?.isComplete === true;
 }
 
+function buildSnapshotScope(
+  snapshot: FileSnapshotRecord,
+  config: SessionStreamNodeConfig,
+): FileSnapshotScope {
+  return {
+    v: 1,
+    sessionId: config.sessionId,
+    requestId: config.requestId,
+    streamNode: config.subAgentInvocationId ? 'subsession' : 'root',
+    subAgentInvocationId: config.subAgentInvocationId,
+    parentSubAgentInvocationId: config.parentSubAgentInvocationId,
+    subAgentPath: config.subAgentPath,
+    turnIndex: config.turnIndex,
+    toolCallId: snapshot.toolCallId,
+  };
+}
+
 function isStreamBoundaryPart(ssp: AnySerializableStreamPart): boolean {
-  if (ssp.kind !== 'sessionLifecycle') return false;
+  if (ssp.kind !== 'sessionLifecycle') {return false;}
   const payload = ssp.payload as Record<string, unknown> | undefined;
   return payload?.eventType === 'session.idle'
     || payload?.eventType === 'session.status'

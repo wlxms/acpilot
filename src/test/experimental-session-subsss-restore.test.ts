@@ -9,7 +9,7 @@ import type { ExtensionState, BackendContext } from '../types';
 import { AppEventBus } from '../backend/app-event-bus';
 import { buildLine } from '../backend/serializable/serializer';
 import type { StreamPartRecord } from '../ssp/types';
-import type { FileSnapshotRecord } from '../backend/serializable/types';
+import type { FileSnapshotRecord } from '../ssp/types';
 
 function expectRestoredTextEditParts(pushed: readonly unknown[], editId: string | undefined) {
   const uriPart = pushed.find(part => part instanceof (vscode as any).ChatResponseCodeblockUriPart) as any;
@@ -20,6 +20,10 @@ function expectRestoredTextEditParts(pushed: readonly unknown[], editId: string 
   expect(textEditParts).toHaveLength(2);
   expect(textEditParts[0]?.editsOrDone).toEqual([]);
   expect(textEditParts[1]?.editsOrDone).toBe(true);
+}
+
+function getRestoredUriParts(pushed: readonly unknown[]): any[] {
+  return pushed.filter(part => part instanceof (vscode as any).ChatResponseCodeblockUriPart) as any[];
 }
 
 function getFirstResponseParts(session: vscode.ChatSession): unknown[] {
@@ -77,22 +81,21 @@ function makeState(sessionDir: string): { state: ExtensionState; ctx: BackendCon
         reply: vi.fn(),
         reject: vi.fn(),
       },
-      createBridge: vi.fn(() => ({
-        setSSS: vi.fn(),
+      createPipeline: vi.fn(() => ({
         setStream: vi.fn(),
         setCallbacks: vi.fn(),
         setTracker: vi.fn(),
-        run: vi.fn().mockResolvedValue(true),
-        getUserMessageId: vi.fn().mockReturnValue(null),
-        getSessionTitle: vi.fn().mockReturnValue(null),
-        getHadSubagentTasks: vi.fn().mockReturnValue(false),
-      })) as unknown as Backend['createBridge'],
+        run: vi.fn().mockResolvedValue({ completed: true, userMessageId: null, sessionTitle: null, sessionTitleSource: null, hadSubagentTasks: false }),
+      })) as unknown as Backend['createPipeline'],
   } as unknown as Backend;
 
   const ctx: BackendContext = {
     id: 'opencode',
+    instanceKey: 'opencode',
+    storageNamespace: 'opencode',
+    displayName: 'OpenCode',
     scheme: 'acpilot.opencode',
-    vendors: ['opencode-cli', 'opencode-zen'],
+    vendor: 'opencode',
     backend,
     sessions: {
       get: vi.fn((key: string) => sessionStore.get(key)),
@@ -108,7 +111,7 @@ function makeState(sessionDir: string): { state: ExtensionState; ctx: BackendCon
     } as unknown as BackendContext['selection'],
     sessionStore: {
       listSessions: vi.fn().mockResolvedValue([]),
-      getTurnsPath: vi.fn().mockReturnValue(path.join(sessionDir, 'turns.jsonl')),
+      getSessionPath: vi.fn().mockReturnValue(path.join(sessionDir, 'session.jsonl')),
       getSessionDir: vi.fn().mockReturnValue(sessionDir),
       initialize: vi.fn().mockResolvedValue(undefined),
       readMeta: vi.fn().mockResolvedValue({ id: 'ses_restore' }),
@@ -122,13 +125,12 @@ function makeState(sessionDir: string): { state: ExtensionState; ctx: BackendCon
     outputChannel: vscode.window.createOutputChannel('test'),
     statusBar: { update: vi.fn() } as unknown as ExtensionState['statusBar'],
     bus: new AppEventBus(),
-    acpModels: {
-      sync: vi.fn(async () => {}),
+    modelCatalog: {
+      list: vi.fn(() => []),
       resolve: vi.fn(() => ({ kind: 'not-found' as const })),
-      getModelsForCopilotRegistration: vi.fn(() => []),
       refresh: vi.fn(async () => {}),
       dispose: vi.fn(),
-    } as unknown as ExtensionState['acpModels'],
+    } as unknown as ExtensionState['modelCatalog'],
   } as unknown as ExtensionState;
 
   return { state, ctx };
@@ -155,7 +157,7 @@ function streamRecord(
       requestId: 'request-subsss-restore-0',
       sequence: 0,
       createdAt: '2026-06-17T00:00:00.000Z',
-      source: 'acp-event',
+      source: 'backend-event',
       ...meta,
     },
   };
@@ -356,6 +358,14 @@ describe('SubSSS externalEdit restore', () => {
           editIndex: 0,
           toolCallId: writeCallId,
           timestamp: '2026-06-17T00:00:01.000Z',
+          scope: {
+            v: 1,
+            sessionId: 'ses_restore',
+            requestId: 'request-subsss-restore-0',
+            streamNode: 'root',
+            turnIndex: 0,
+            toolCallId: writeCallId,
+          },
         },
         {
           uri,
@@ -365,6 +375,14 @@ describe('SubSSS externalEdit restore', () => {
           editIndex: 0,
           toolCallId: writeCallId,
           timestamp: '2026-06-17T00:00:02.000Z',
+          scope: {
+            v: 1,
+            sessionId: 'ses_restore',
+            requestId: 'request-subsss-restore-0',
+            streamNode: 'root',
+            turnIndex: 0,
+            toolCallId: writeCallId,
+          },
         },
       ];
       writeJsonl(path.join(sessionDir, 'session.jsonl'), [
@@ -457,6 +475,16 @@ describe('SubSSS externalEdit restore', () => {
           editIndex: 0,
           toolCallId: writeCallId,
           timestamp: '2026-06-17T00:00:01.000Z',
+          scope: {
+            v: 1,
+            sessionId: 'ses_restore',
+            requestId: 'request-subsss-restore-0',
+            streamNode: 'subsession',
+            subAgentInvocationId: childSubId,
+            subAgentPath: [childSubId],
+            turnIndex: 0,
+            toolCallId: writeCallId,
+          },
         },
         {
           uri,
@@ -466,6 +494,16 @@ describe('SubSSS externalEdit restore', () => {
           editIndex: 0,
           toolCallId: writeCallId,
           timestamp: '2026-06-17T00:00:02.000Z',
+          scope: {
+            v: 1,
+            sessionId: 'ses_restore',
+            requestId: 'request-subsss-restore-0',
+            streamNode: 'subsession',
+            subAgentInvocationId: childSubId,
+            subAgentPath: [childSubId],
+            turnIndex: 0,
+            toolCallId: writeCallId,
+          },
         },
       ];
       writeJsonl(path.join(sessionDir, 'session.jsonl'), [
@@ -527,6 +565,234 @@ describe('SubSSS externalEdit restore', () => {
 
       expectRestoredTextEditParts(getFirstResponseParts(session), 'undo-child-meta');
       expect(session.activeResponseCallback).toBeUndefined();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not mix restored diff snapshots when root and subsession reuse a tool call id', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'subsss-shared-call-restore-'));
+    try {
+      const sessionDir = path.join(tmpDir, '.acpilot', 'opencode', 'ses_restore');
+      const childSubId = 'subagent-child-shared-call';
+      const sharedCallId = 'shared-edit-call';
+      const rootFile = path.join(tmpDir, 'root.txt');
+      const childFile = path.join(tmpDir, 'child.txt');
+      fs.writeFileSync(rootFile, 'root after\n', 'utf-8');
+      fs.writeFileSync(childFile, 'child after\n', 'utf-8');
+      const rootUri = vscode.Uri.file(rootFile).toString();
+      const childUri = vscode.Uri.file(childFile).toString();
+
+      const rootRecords = [
+        streamRecord(
+          'userPrompt',
+          'userPrompt:0',
+          { text: 'restore shared call id edits' },
+          { sequence: 0, sourceType: 'part.updated', sourcePartId: 'user', sessionId: 'ses_restore' },
+        ),
+        streamRecord(
+          'toolInvocation',
+          'root-edit-tool',
+          {
+            partId: 'root-edit-tool',
+            toolName: 'write',
+            callId: sharedCallId,
+            state: { status: 'completed', input: { filePath: rootFile }, output: 'root done' },
+          },
+          {
+            sequence: 1,
+            sourceType: 'part.updated',
+            sourcePartId: 'root-edit-tool',
+            sessionId: 'ses_restore',
+          },
+        ),
+        streamRecord(
+          'externalEdit',
+          `externalEdit:${sharedCallId}:root`,
+          { toolCallId: sharedCallId, editId: '', status: 'pending', uri: rootFile },
+          {
+            sequence: 2,
+            source: 'synthetic',
+            sourceType: 'externalEdit',
+            toolCallId: sharedCallId,
+            sessionId: 'ses_restore',
+          },
+        ),
+        streamRecord(
+          'toolInvocation',
+          'call-root-task',
+          {
+            partId: 'call-root-task',
+            toolName: 'task',
+            callId: 'call-root-task',
+            state: { status: 'completed', input: { prompt: 'child edit' }, output: 'done' },
+            subAgentInvocationId: childSubId,
+          },
+          { sequence: 3, sourceType: 'part.updated', sourcePartId: 'call-root-task', sessionId: 'ses_restore' },
+        ),
+      ];
+
+      const rootSnapshots: FileSnapshotRecord[] = [
+        {
+          uri: rootUri,
+          content: 'root before\n',
+          phase: 'before',
+          turnIndex: 0,
+          editIndex: 0,
+          toolCallId: sharedCallId,
+          timestamp: '2026-06-17T00:00:01.000Z',
+          scope: {
+            v: 1,
+            sessionId: 'ses_restore',
+            requestId: 'request-subsss-restore-0',
+            streamNode: 'root',
+            turnIndex: 0,
+            toolCallId: sharedCallId,
+          },
+        },
+        {
+          uri: rootUri,
+          content: 'root after\n',
+          phase: 'after',
+          turnIndex: 0,
+          editIndex: 0,
+          toolCallId: sharedCallId,
+          timestamp: '2026-06-17T00:00:02.000Z',
+          scope: {
+            v: 1,
+            sessionId: 'ses_restore',
+            requestId: 'request-subsss-restore-0',
+            streamNode: 'root',
+            turnIndex: 0,
+            toolCallId: sharedCallId,
+          },
+        },
+      ];
+
+      writeJsonl(path.join(sessionDir, 'session.jsonl'), [
+        buildLine('version', '2.0'),
+        buildLine('turn-start', { turnIndex: 0, timestamp: '2026-06-17T00:00:00.000Z' }),
+        ...rootRecords.map(record => buildLine('stream-part', record)),
+        ...rootSnapshots.map(snapshot => buildLine('snapshot', snapshot)),
+        buildLine('turn-end', { turnIndex: 0, timestamp: '2026-06-17T00:00:03.000Z' }),
+      ]);
+      writeJsonl(path.join(sessionDir, 'meta.jsonl'), [
+        JSON.stringify({
+          v: 2,
+          type: 'part-meta',
+          id: `externalEdit:${sharedCallId}:root`,
+          undoStopId: 'undo-root-shared',
+        }) + '\n',
+      ]);
+
+      const childDir = path.join(sessionDir, 'subsessions', childSubId);
+      const childRecords = [
+        streamRecord(
+          'toolInvocation',
+          'child-edit-tool',
+          {
+            partId: 'child-edit-tool',
+            toolName: 'write',
+            callId: sharedCallId,
+            state: { status: 'completed', input: { filePath: childFile }, output: 'child done' },
+          },
+          {
+            sequence: 0,
+            sourceType: 'part.updated',
+            sourcePartId: 'child-edit-tool',
+            sessionId: 'ses_restore',
+            subAgentInvocationId: childSubId,
+            subAgentPath: [childSubId],
+          },
+        ),
+        streamRecord(
+          'externalEdit',
+          `externalEdit:${sharedCallId}:child`,
+          { toolCallId: sharedCallId, editId: '', status: 'pending', uri: childFile },
+          {
+            sequence: 1,
+            source: 'synthetic',
+            sourceType: 'externalEdit',
+            toolCallId: sharedCallId,
+            sessionId: 'ses_restore',
+            subAgentInvocationId: childSubId,
+            subAgentPath: [childSubId],
+          },
+        ),
+      ];
+      const childSnapshots: FileSnapshotRecord[] = [
+        {
+          uri: childUri,
+          content: 'child before\n',
+          phase: 'before',
+          turnIndex: 0,
+          editIndex: 0,
+          toolCallId: sharedCallId,
+          timestamp: '2026-06-17T00:00:04.000Z',
+          scope: {
+            v: 1,
+            sessionId: 'ses_restore',
+            requestId: 'request-subsss-restore-0',
+            streamNode: 'subsession',
+            subAgentInvocationId: childSubId,
+            subAgentPath: [childSubId],
+            turnIndex: 0,
+            toolCallId: sharedCallId,
+          },
+        },
+        {
+          uri: childUri,
+          content: 'child after\n',
+          phase: 'after',
+          turnIndex: 0,
+          editIndex: 0,
+          toolCallId: sharedCallId,
+          timestamp: '2026-06-17T00:00:05.000Z',
+          scope: {
+            v: 1,
+            sessionId: 'ses_restore',
+            requestId: 'request-subsss-restore-0',
+            streamNode: 'subsession',
+            subAgentInvocationId: childSubId,
+            subAgentPath: [childSubId],
+            turnIndex: 0,
+            toolCallId: sharedCallId,
+          },
+        },
+      ];
+      writeJsonl(path.join(childDir, 'subsession.jsonl'), [
+        buildLine('version', '2.0'),
+        ...childRecords.map(record => buildLine('stream-part', record)),
+        ...childSnapshots.map(snapshot => buildLine('snapshot', snapshot)),
+      ]);
+      writeJsonl(path.join(childDir, 'meta.jsonl'), [
+        JSON.stringify({
+          v: 2,
+          type: 'part-meta',
+          id: `externalEdit:${sharedCallId}:child`,
+          undoStopId: 'undo-child-shared',
+        }) + '\n',
+      ]);
+
+      (vscode.workspace as { workspaceFolders?: Array<{ uri: vscode.Uri; name: string; index: number }> }).workspaceFolders = [
+        { uri: vscode.Uri.file(tmpDir), name: 'test', index: 0 },
+      ];
+      const { state, ctx } = makeState(sessionDir);
+      const { provider } = createSessionContentProvider(
+        state,
+        ctx,
+        { subscriptions: [] } as unknown as vscode.ExtensionContext,
+      );
+
+      const session = await provider.provideChatSessionContent(
+        vscode.Uri.parse('acpilot.opencode:/ses_restore'),
+        { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
+        { inputState: {} as vscode.ChatSessionInputState },
+      );
+
+      const uriParts = getRestoredUriParts(getFirstResponseParts(session));
+      expect(uriParts.map(part => part.value.toString())).toEqual([rootUri, childUri]);
+      expect(uriParts.map(part => part.undoStopId)).toEqual(['undo-root-shared', 'undo-child-shared']);
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }

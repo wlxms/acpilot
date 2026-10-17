@@ -1,21 +1,15 @@
 /**
  * Stream-part utility helpers for the SSP persistence layer.
  *
- * Phase 4 removed the legacy event↔SSP serialization layer
- * (SerializableStreamPartEventHandler / serializeEvent /
- * projectStreamPartToAcpEvent) — SSP is now the sole persistence format and
- * backends push SSPs directly. This module retains the one production helper
- * that is still consumed by the session-history restore path:
+ * SSP is the sole persistence format and backends push SSPs directly. This
+ * module contains the request metadata derivation consumed by restore:
  * {@link requestDetailsFromStreamParts}.
  *
  * @module
  */
 
-import type {
-  ExternalEditStreamPartPayload,
-  SerializableRequestDetails,
-  SerializableStreamPart,
-} from './types';
+import type { SerializableRequestDetails } from './types';
+import type { ExternalEditStreamPartPayload, StreamPartRecord } from '../../ssp/types';
 
 /**
  * Extract per-request edit tool→editId mappings from external-edit stream-part
@@ -27,13 +21,13 @@ import type {
  * to the stream-part record itself — hence the metaIndex fallback.
  */
 export function requestDetailsFromStreamParts(
-  parts: readonly SerializableStreamPart[],
+  parts: readonly StreamPartRecord[],
   metaIndex?: ReadonlyMap<string, Record<string, unknown>>,
 ): SerializableRequestDetails[] {
   const byRequest = new Map<string, SerializableRequestDetails>();
 
   for (const part of parts) {
-    if (part.kind !== 'externalEdit' && part.kind !== 'externalEditMetadata') {
+    if (part.kind !== 'externalEdit') {
       continue;
     }
     const payload = part.payload as Partial<ExternalEditStreamPartPayload>;

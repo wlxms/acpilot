@@ -24,7 +24,6 @@ import type {
   SspStream,
 } from '../../ssp/types';
 import { SerializableStreamPart } from '../../ssp/types';
-import type { FileSnapshotRecord } from '../../backend/serializable/types';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -60,9 +59,9 @@ function getSessionDir(tmpDir: string): string {
 }
 
 class MetadataTestSSP
-  extends SerializableStreamPart<'rawAcpEvent', { event: unknown }>
+  extends SerializableStreamPart<'opaqueEvent', { event: unknown }>
   implements IMetadataProvider {
-  readonly kind = 'rawAcpEvent' as const;
+  readonly kind = 'opaqueEvent' as const;
   constructor(id: string, private readonly metadata: Record<string, unknown>) {
     super({ event: { test: true } }, undefined, id);
   }
@@ -536,27 +535,48 @@ describe('SerializableSessionStream', () => {
     expect(metaIndex.get(edit.id)?.undoStopId).toBe('undo-sub-async');
   });
 
-  // ── serializeSnapshot ──────────────────────────────────────────────────
+  // ── snapshot persistence ───────────────────────────────────────────────
 
-  it('serializeSnapshot writes snapshot line to session.jsonl', async () => {
+  it('persists ExternalEditSSP snapshots to session.jsonl', async () => {
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'sss-snap-'));
-    const sss = makeSSS(tmpDir);
+    const filePath = path.join(tmpDir, 'test.ts');
+    await fs.writeFile(filePath, 'file content', 'utf-8');
+    const stream = {
+      ...mockStream(),
+      externalEdit: vi.fn(async (_target: unknown, callback: () => PromiseLike<unknown>) => {
+        await callback();
+        return 'undo-root-snapshot';
+      }),
+    };
+    const sss = new SerializableSessionStream(stream as any, {
+      workspaceRoot: tmpDir,
+      backendName: 'test-backend',
+      sessionId: 'test-session',
+      turnIndex: 0,
+      requestId: 'req-0',
+    });
     await sss.initialize();
 
-    const snapshot: FileSnapshotRecord = {
-      uri: 'file:///test.ts',
-      content: 'file content',
-      phase: 'before',
-      editIndex: 0,
+    const edit = new ExternalEditSSP({
       toolCallId: 'tc1',
-      timestamp: new Date().toISOString(),
-    };
-    sss.serializeSnapshot(snapshot);
+      editId: '',
+      status: 'pending',
+      uri: filePath,
+      uris: [{ fsPath: filePath, toString: () => 'file:///test.ts' }],
+    } as never);
+    sss.push(edit);
+    sss.update(edit.id, { status: 'completed' });
     await sss.flush();
 
     const lines = await readLines(path.join(getSessionDir(tmpDir), 'session.jsonl'));
-    const snapshotLines = lines.filter(l => JSON.parse(l).t === 'snapshot');
-    expect(snapshotLines.length).toBe(1);
+    const snapshots = lines
+      .map(l => JSON.parse(l))
+      .filter(l => l.t === 'snapshot')
+      .map(l => l.d);
+    expect(snapshots).toEqual(expect.arrayContaining([
+      expect.objectContaining({ toolCallId: 'tc1', phase: 'before', content: 'file content' }),
+      expect.objectContaining({ toolCallId: 'tc1', phase: 'after', undoStopId: 'undo-root-snapshot' }),
+    ]));
   });
 
   // ── drain ──────────────────────────────────────────────────────────────

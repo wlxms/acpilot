@@ -8,7 +8,7 @@ interface LoggerLike {
 interface SessionChannel {
   push(event: OpenCodeStreamEvent): void;
   close(): void;
-  isIdle(): void;
+  isIdle(): boolean;
   stream(): AsyncIterable<OpenCodeStreamEvent>;
 }
 
@@ -43,6 +43,7 @@ class BufferedSessionChannel implements SessionChannel {
   }
 
   isIdle(): boolean {
+    this.idle = true;
     return this.idle;
   }
 
@@ -71,6 +72,10 @@ export class GlobalEventBroker {
   private connectPromise: Promise<void> | null = null;
   private pumpPromise: Promise<void> | null = null;
   private activeClient: OpenCodeClient | null = null;
+  private activeIterator: AsyncIterator<OpenCodeStreamEvent> | null = null;
+  private pendingReadyReject: ((error: unknown) => void) | null = null;
+  private generation = 0;
+  private stopped = false;
   private logger?: LoggerLike;
   private sessionChannels: Map<string, SessionChannel> = new Map();
   private partSessions: Map<string, string> = new Map();
@@ -83,6 +88,11 @@ export class GlobalEventBroker {
       this.logger = logger;
     }
 
+    if (this.connectPromise && this.activeClient !== client) {
+      await this.stop();
+    }
+
+    this.stopped = false;
     if (this.connectPromise && this.activeClient === client) {
       await this.connectPromise;
       return;
@@ -90,10 +100,44 @@ export class GlobalEventBroker {
 
     if (!this.connectPromise) {
       this.activeClient = client;
-      this.connectPromise = this.connect(client);
+      const generation = this.generation;
+      const pending = this.connect(client, generation);
+      this.connectPromise = pending;
     }
 
     await this.connectPromise;
+  }
+
+  /** Stop the global pump and invalidate all correlation state. */
+  async stop(): Promise<void> {
+    const generation = ++this.generation;
+    this.stopped = true;
+
+    const rejectReady = this.pendingReadyReject;
+    this.pendingReadyReject = null;
+    rejectReady?.(new Error('OpenCode event broker stopped'));
+
+    const iterator = this.activeIterator;
+    this.activeIterator = null;
+    if (iterator?.return) {
+      try {
+        // OpenCode's SSE stream is an async generator. If pumpWithReconnect is
+        // currently awaiting iterator.next(), async-generator return() is
+        // queued behind that read and awaiting it here deadlocks stop(). Start
+        // the cleanup, but let generation invalidation and channel closure make
+        // stop() complete immediately; observe any late rejection.
+        void Promise.resolve(iterator.return()).catch(() => undefined);
+      } catch {
+        // The underlying SSE transport may already be closed.
+      }
+    }
+
+    this.closeAllSessionStreams();
+    if (generation === this.generation) {
+      this.connectPromise = null;
+      this.pumpPromise = null;
+      this.activeClient = null;
+    }
   }
 
   openSessionStream(sessionId: string): OpenCodeEventStream {
@@ -123,12 +167,31 @@ export class GlobalEventBroker {
     this.log(`close session stream: sessionID=${sessionId}`);
   }
 
-  private async connect(client: OpenCodeClient): Promise<void> {
+  private async connect(client: OpenCodeClient, generation: number): Promise<void> {
     this.log('connecting to /global/event SSE stream');
-    this.pumpPromise = this.pumpWithReconnect(client).catch(() => {
+    let resolveReady!: () => void;
+    let rejectReady!: (error: unknown) => void;
+    const ready = new Promise<void>((resolve, reject) => {
+      resolveReady = resolve;
+      rejectReady = reject;
+    });
+    this.pendingReadyReject = rejectReady;
+
+    // `global.event()` returns a lazy SSE generator.  Start the first
+    // `iterator.next()` before resolving `ensureStarted()` so callers can
+    // safely send a prompt immediately after subscribing their session
+    // channel.  The pump owns all later reconnects.
+    this.pumpPromise = this.pumpWithReconnect(client, resolveReady, rejectReady, generation).catch(() => {
       // Rejection is expected when the client/stream throws (e.g. during tests or shutdown).
       // The error is logged inside pumpWithReconnect; no need to propagate further.
     });
+    try {
+      await ready;
+    } finally {
+      if (this.pendingReadyReject === rejectReady) {
+        this.pendingReadyReject = null;
+      }
+    }
   }
 
   /**
@@ -137,19 +200,77 @@ export class GlobalEventBroker {
    * after a short delay to continue receiving events (e.g. after question replies).
    * On error, close all session streams and reset state.
    */
-  private async pumpWithReconnect(client: OpenCodeClient): Promise<void> {
+  private async pumpWithReconnect(
+    client: OpenCodeClient,
+    onFirstReadStarted?: () => void,
+    onFirstReadFailed?: (error: unknown) => void,
+    generation = this.generation,
+  ): Promise<void> {
     let reconnectDelay = 1000; // start with 1s, exponential backoff
     const maxDelay = 30_000;
+    let firstReadPending = true;
 
     try {
-      while (true) {
-        const events = (await client.global.event()) as { stream: AsyncIterable<OpenCodeStreamEvent> };
-        this.log('subscribed to /global/event SSE stream');
-        reconnectDelay = 1000; // reset on successful connect
-
-        for await (const rawEvent of events.stream) {
-          this.dispatch(rawEvent);
+      while (!this.stopped && generation === this.generation) {
+        let events: { stream: AsyncIterable<OpenCodeStreamEvent> };
+        try {
+          events = (await client.global.event()) as { stream: AsyncIterable<OpenCodeStreamEvent> };
+          this.log('subscribed to /global/event SSE stream');
+          reconnectDelay = 1000; // reset on successful connect
+        } catch (error) {
+          if (firstReadPending) {
+            firstReadPending = false;
+            onFirstReadFailed?.(error);
+          }
+          throw error;
         }
+
+        let iterator: AsyncIterator<OpenCodeStreamEvent>;
+        let nextPromise: Promise<IteratorResult<OpenCodeStreamEvent>>;
+        try {
+          // Some SDK adapters construct the async iterator lazily and may
+          // throw synchronously here (for example when the response body is
+          // already unusable). Keep iterator creation inside the readiness
+          // guard; otherwise `ensureStarted()` would wait forever because no
+          // first-read callback could be delivered.
+          iterator = events.stream[Symbol.asyncIterator]();
+          this.activeIterator = iterator;
+          // Calling next() is what causes the SDK's lazy SSE generator to
+          // issue its fetch.  Resolve readiness after that call has started,
+          // while retaining the promise so the first event is still handled.
+          nextPromise = Promise.resolve(iterator.next());
+          if (firstReadPending) {
+            firstReadPending = false;
+            onFirstReadStarted?.();
+          }
+        } catch (error) {
+          if (firstReadPending) {
+            firstReadPending = false;
+            onFirstReadFailed?.(error);
+          }
+          throw error;
+        }
+
+        try {
+          while (!this.stopped && generation === this.generation) {
+            const result = await nextPromise;
+            // `stop()` can invalidate this pump while `next()` is pending.
+            // Do not dispatch an event that belongs to the invalidated SSE
+            // connection after its correlation indexes have been cleared.
+            if (this.stopped || generation !== this.generation) {
+              return;
+            }
+            if (result.done) {break;}
+            this.dispatch(result.value);
+            nextPromise = Promise.resolve(iterator.next());
+          }
+        } finally {
+          if (this.activeIterator === iterator) {
+            this.activeIterator = null;
+          }
+        }
+
+        if (this.stopped || generation !== this.generation) {return;}
 
         // Stream ended normally — server closed the connection.
         // Don't close session channels; instead reconnect to receive
@@ -168,12 +289,16 @@ export class GlobalEventBroker {
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       this.log(`global event stream error: ${msg}`);
-      this.closeAllSessionStreams();
+      if (!this.stopped && generation === this.generation) {
+        this.closeAllSessionStreams();
+      }
       throw error;
     } finally {
-      this.connectPromise = null;
-      this.pumpPromise = null;
-      this.activeClient = null;
+      if (generation === this.generation) {
+        this.connectPromise = null;
+        this.pumpPromise = null;
+        this.activeClient = null;
+      }
     }
   }
 
@@ -182,6 +307,25 @@ export class GlobalEventBroker {
     const sessionId = this.getSessionId(event);
     this.log(`dispatch: type=${event.type}, sessionId=${sessionId ?? 'none'}, channels=${this.sessionChannels.size}`);
     if (!sessionId) {
+      // OpenCode declares session.error.sessionID optional.  A single active
+      // channel is unambiguous, so route the error there.  With more than one
+      // active channel the event is a backend/global failure (there is no safe
+      // way to choose a session), therefore broadcast it so every waiting
+      // pipeline can terminate instead of hanging indefinitely.
+      if (event.type === 'session.error') {
+        const channels = [...this.sessionChannels.values()];
+        if (channels.length === 1) {
+          channels[0].push(rawEvent);
+          this.log('session.error without sessionID routed to the only active channel');
+        } else if (channels.length > 1) {
+          for (const channel of channels) {
+            channel.push(rawEvent);
+          }
+          this.log(`session.error without sessionID broadcast to ${channels.length} active channels`);
+        } else {
+          this.log('session.error without sessionID dropped because no channel is active');
+        }
+      }
       if (event.type === 'message.part.delta') {
         this.bufferPendingPartDelta(event.properties.partID, rawEvent);
       }
@@ -211,12 +355,12 @@ export class GlobalEventBroker {
       return; // truly no channel, drop event
     }
 
-    for (const eventToPush of this.eventsForDispatch(rawEvent, event)) {
+    for (const eventToPush of this.eventsForDispatch(rawEvent, event, sessionId)) {
       channel.push(eventToPush);
     }
     if (event.type === 'session.idle') {
       // Mark the channel as idle but do NOT close it. The consumer
-      // (StreamBridge) decides when to actually close the stream —
+      // (Pipeline) decides when to actually close the stream —
       // e.g. after all active subagent scopes are resolved.
       // This prevents losing events from still-running subagents.
       channel.isIdle();
@@ -227,14 +371,27 @@ export class GlobalEventBroker {
   private getSessionId(event: OpenCodeEvent): string | undefined {
     switch (event.type) {
       case 'message.part.updated': {
-        const sessionId = event.properties?.part?.sessionID;
-        if (sessionId) {
-          this.trackPart(event.properties.part.id, sessionId);
+        // OpenCode has emitted the session on the part, on the event
+        // properties, and with both ID spellings across server versions.
+        // Prefer the part-local value, then use the envelope as a fallback.
+        const part = event.properties?.part;
+        const sessionId = part?.sessionID
+          ?? part?.sessionId
+          ?? event.properties?.sessionID
+          ?? event.properties?.sessionId;
+        if (sessionId && part?.id) {
+          this.trackPart(part.id, sessionId);
         }
         return sessionId;
       }
       case 'message.part.delta':
-        return this.partSessions.get(event.properties.partID);
+        // Newer OpenCode versions include the session directly on the delta;
+        // older versions require the part-id correlation populated by a prior
+        // message.part.updated event. Prefer the explicit value and retain
+        // the correlation as a fallback for reordered events.
+        return event.properties.sessionID
+          ?? (event.properties as { sessionId?: string }).sessionId
+          ?? this.partSessions.get(event.properties.partID);
       case 'session.idle':
         return event.properties?.sessionID;
       case 'permission.asked':
@@ -287,9 +444,10 @@ export class GlobalEventBroker {
   private eventsForDispatch(
     rawEvent: OpenCodeStreamEvent,
     event: OpenCodeEvent,
+    sessionId: string,
   ): OpenCodeStreamEvent[] {
     if (event.type !== 'message.part.updated') {
-      return [rawEvent];
+      return [withInferredSessionId(rawEvent, event, sessionId)];
     }
 
     const partId = event.properties?.part?.id;
@@ -304,7 +462,9 @@ export class GlobalEventBroker {
 
     this.pendingPartDeltas.delete(partId);
     return [
-      ...pending,
+      ...pending.map(pendingEvent =>
+        withInferredSessionId(pendingEvent, unwrapStreamEvent(pendingEvent), sessionId),
+      ),
       rawEvent,
     ];
   }
@@ -324,6 +484,14 @@ export class GlobalEventBroker {
       this.clearSessionParts(sessionId);
     }
     this.sessionChannels.clear();
+    // A failed global stream invalidates every correlation collected from the
+    // old connection. Retaining these indexes across reconnects can route a
+    // reused child/part ID into a newly opened session or prepend a stale
+    // delta to a later part.
+    this.partSessions.clear();
+    this.sessionParts.clear();
+    this.pendingPartDeltas.clear();
+    this.childToParent.clear();
   }
 
   private log(message: string): void {
@@ -361,7 +529,7 @@ export class GlobalEventBroker {
 
   /**
    * Walk up the parent chain from `sessionId` and return the first session ID
-   * that appears in `candidateIds`. Used by StreamBridge to find which scope
+   * that appears in `candidateIds`. Used by the pipeline to find which scope
    * a grandchild event belongs to.
    */
   findAncestorIn(sessionId: string, candidateIds: Set<string>): string | undefined {
@@ -408,6 +576,27 @@ export class GlobalEventBroker {
 
 function unwrapStreamEvent(event: OpenCodeStreamEvent): OpenCodeEvent {
   return 'payload' in event ? event.payload : event;
+}
+
+function withInferredSessionId(
+  rawEvent: OpenCodeStreamEvent,
+  event: OpenCodeEvent,
+  sessionId: string,
+): OpenCodeStreamEvent {
+  if (event.type !== 'message.part.delta' || event.properties.sessionID) {
+    return rawEvent;
+  }
+  const payload: OpenCodeEvent = {
+    ...event,
+    properties: {
+      ...event.properties,
+      sessionID: sessionId,
+    },
+  };
+  if ('payload' in rawEvent) {
+    return { ...rawEvent, payload };
+  }
+  return payload;
 }
 
 function getEventSessionIdFromProperties(event: OpenCodeEvent): string | undefined {

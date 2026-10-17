@@ -3,14 +3,117 @@ import { routeCommand } from './commands';
 import { isEmptyPrompt, ErrorMessages } from './errors';
 import { SerializableSessionStream } from '../backend/streaming/session-stream';
 import { UserPromptSSP } from '../ssp/impl/user-prompt';
-import { applyProvisionalSessionTitle, applySessionTitle, isPlaceholderSessionTitle } from './session-title';
+import { SessionTitleService, isPlaceholderSessionTitle } from './session-title';
 
 import type { ExtensionState, TurnMapping, BackendContext } from '../types';
-import type { BackendChildSessionInfo, BackendSessionStatus, BackendResult, BackendModel, BackendAgent } from '../backend/types';
-import type { AcpEvent } from '../backend/types';
+import type { BackendAgent, PermissionMode } from '../backend/types';
+import { normalizePermissionMode } from '../backend/types';
+import type { BackendPipelineResult } from '../backend/backend';
 import type { SessionTitleSource } from '../backend/serializable/types';
-import { collectOpenFileUris } from './checkpoint';
 import { extractAttachmentsFromReferences } from './references';
+
+const HANDLER_DRAIN_TIMEOUT_MS = 2_000;
+
+/**
+ * Let a backend operation settle for a short grace period during cleanup.
+ * Cancellation must release Copilot even when a remote transport is wedged;
+ * the operation is still observed after the timeout so late failures do not
+ * become unhandled rejections.
+ */
+async function settleWithin(
+  operation: Promise<unknown>,
+  timeoutMs: number,
+  logger?: { appendLine(message: string): void },
+  label = 'operation',
+): Promise<void> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const observed = operation.then(
+    () => undefined,
+    (error: unknown) => {
+      logger?.appendLine(
+        `[handler] ${label} failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    },
+  );
+  try {
+    await Promise.race([
+      observed,
+      new Promise<void>(resolve => {
+        timeout = setTimeout(resolve, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout !== undefined) {
+      clearTimeout(timeout);
+    }
+  }
+}
+
+/**
+ * Clean up a backend session created for a request that lost the race to
+ * cancellation. The operation is deliberately best effort: cancellation
+ * must release Copilot even when a backend endpoint is slow or unavailable.
+ * Callers provide a runtime predicate so a target transition never routes a
+ * stale session id through a dynamically reconnected backend object.
+ */
+async function cleanupLateCreatedSession(
+  ctx: BackendContext,
+  sessionId: string,
+  directory: string | undefined,
+  isRuntimeCurrent: () => boolean,
+  logger: { appendLine(message: string): void },
+): Promise<void> {
+  const run = async (
+    label: string,
+    operation: () => Promise<unknown>,
+  ): Promise<void> => {
+    if (!isRuntimeCurrent()) {
+      return;
+    }
+    await settleWithin(
+      Promise.resolve().then(() => {
+        // Keep this check in the same microtask as the call. A transition can
+        // happen between cleanup stages, in which case later stages must be
+        // skipped rather than sent to the replacement connection.
+        if (!isRuntimeCurrent()) {
+          return undefined;
+        }
+        return operation();
+      }).then(result => {
+        if (result && typeof result === 'object' && 'error' in result) {
+          const error = (result as { error?: unknown }).error;
+          if (error !== undefined) {
+            throw new Error(String(error));
+          }
+        }
+      }),
+      HANDLER_DRAIN_TIMEOUT_MS,
+      logger,
+      label,
+    );
+  };
+
+  await run(
+    `Late session abort (${sessionId})`,
+    () => ctx.backend.sessions.abort(sessionId, directory),
+  );
+  if (!isRuntimeCurrent()) {
+    return;
+  }
+  if (ctx.backend.sessions.delete) {
+    await run(
+      `Late session delete (${sessionId})`,
+      () => ctx.backend.sessions.delete!(sessionId, directory),
+    );
+  }
+  if (!isRuntimeCurrent()) {
+    return;
+  }
+  await run(
+    `Late session release (${sessionId})`,
+    () => ctx.backend.sessions.release(sessionId, directory),
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Native model sync
@@ -29,26 +132,17 @@ import { extractAttachmentsFromReferences } from './references';
  * option groups) which can go stale when the user changes the *native*
  * picker without touching the extension's own model dropdown.
  *
- * Resolution order:
- *  1. If `request.model` is present, attempt a fuzzy match against the
- *     backend model catalogue (by `model.id`, then `model.family`, then
- *     `model.name`).
- *  2. On match, sync the match into `SelectionStore` so the custom UI
- *     (status bar, option groups) stays consistent with the native picker.
- *  3. On no match, fall back to the existing `SelectionStore` model.
- *
- * LIMITATION: `LanguageModelChat.id` is an opaque identifier assigned by
- * the model contributor (e.g. `"gpt-4o"`).  It does NOT carry a provider
- * prefix, so we cannot distinguish between identically-named models from
- * different providers.  The heuristic matches the first backend model whose
- * `id` or `name` overlaps.  If the heuristic cannot resolve a unique match
- * we keep the SelectionStore value unchanged rather than guessing.
+ * Native selections are resolved only through the current Copilot model catalog.
+ * A request without a native model uses the backend's SelectionStore; once a
+ * native model is present, an unregistered or foreign route is an error.
  */
 export async function resolvePromptModel(
   request: vscode.ChatRequest,
   state: ExtensionState,
   ctx: BackendContext,
+  runtimeGuard?: () => void,
 ): Promise<{ providerID: string; modelID: string } | undefined> {
+  runtimeGuard?.();
   const nativeModel = request.model;
 
   // Fast path: no native model - use custom store
@@ -56,182 +150,95 @@ export async function resolvePromptModel(
     return ctx.selection.get().model;
   }
 
-  // ACPModels primary resolution
+  // The catalog's canonical Copilot id is the only native routing identity.
   const vendor = (nativeModel as vscode.LanguageModelChat).vendor;
-  if (vendor && state.acpModels) {
-    // Strip our "vendor/modelId" prefix if present (the LM provider
-    // registers models as "opencode/big-pickle", but the resolver
-    // expects the bare modelId "big-pickle").
-    let modelId = nativeModel.id;
-    if (modelId.startsWith(vendor + '/')) {
-      modelId = modelId.substring(vendor.length + 1);
-    }
-    const resolution = state.acpModels.resolve(vendor, modelId);
-    if (resolution.kind === 'backend' && resolution.providerID && resolution.modelID) {
-      // Unique match - sync to SelectionStore and return
-      const sel = ctx.selection.get();
-      if (!sel.model ||
-          sel.model.providerID !== resolution.providerID ||
-          sel.model.modelID !== resolution.modelID) {
-        await ctx.selection.setModel(resolution.providerID, resolution.modelID);
-      }
-      return { providerID: resolution.providerID, modelID: resolution.modelID };
-    }
+  if (!vendor) {
+    throw new Error(`Unable to resolve native model "${nativeModel.id}": vendor is missing.`);
   }
-
-  // Legacy: fuzzy match against backend model catalogue
-  // Falls through if ACPModels didn't resolve (passthrough / not-found / no sync)
-
-  // Fetch the backend model catalogue for matching.
-  // Errors are non-fatal - fall back to SelectionStore on failure.
-  const modelsResult = await ctx.backend.config.models();
-  const backendModels: BackendModel[] = modelsResult.data ?? [];
-
-  if (backendModels.length === 0) {
-    // No catalogue to match against - use SelectionStore
-    return ctx.selection.get().model;
-  }
-
-  // Strip vendor prefix (e.g. "opencode-cli/") from nativeModel.id so that
-  // the legacy fuzzy match compares against the bare model identifier that
-  // backend models report (e.g. "deepseek-v4-flash-free").
-  const modelIdForMatch = vendor && nativeModel.id.startsWith(vendor + '/')
-    ? nativeModel.id.substring(vendor.length + 1)
-    : nativeModel.id;
-
-  // Attempt matching: native model.id to backend model.id
-  // LanguageModelChat.id is opaque but often matches the model's common ID.
-  // We also try .family and .name as fallbacks.
-  type ModelRef = { providerID: string; modelID: string };
-  const candidates: ModelRef[] = [];
-
-  for (const bm of backendModels) {
-    const providerID = bm.provider ?? 'default';
-    // Match by id (exact)
-    if (bm.id === modelIdForMatch) {
-      candidates.push({ providerID, modelID: bm.id });
+  const resolution = state.modelCatalog.resolve(
+    ctx.id,
+    vendor,
+    nativeModel.id,
+    ctx.instanceKey,
+  );
+  runtimeGuard?.();
+  if (resolution.kind !== 'backend'
+      || resolution.backendId !== ctx.id
+      || resolution.backendInstanceKey !== ctx.instanceKey
+      || !resolution.providerID
+      || !resolution.modelID) {
+    if (resolution.kind === 'backend' && resolution.backendId !== ctx.id) {
+      state.outputChannel.appendLine(
+        `[handler] Rejecting model route for backend ${resolution.backendId}; active backend is ${ctx.id}`,
+      );
+      throw new Error(
+        `Model "${nativeModel.id}" belongs to backend "${resolution.backendId}" and cannot be used by backend "${ctx.id}".`,
+      );
     }
-    // Match by name (exact, case-insensitive)
-    else if (bm.name && bm.name.toLowerCase() === modelIdForMatch.toLowerCase()) {
-      candidates.push({ providerID, modelID: bm.id });
+    if (resolution.kind === 'backend' && resolution.backendInstanceKey !== ctx.instanceKey) {
+      state.outputChannel.appendLine(
+        `[handler] Rejecting model route for backend instance ${resolution.backendInstanceKey}; `
+          + `active instance is ${ctx.instanceKey}`,
+      );
+      throw new Error(
+        `Model "${nativeModel.id}" belongs to backend instance "${resolution.backendInstanceKey}" `
+          + `and cannot be used by active instance "${ctx.instanceKey}".`,
+      );
     }
-    // Match by family (exact, case-insensitive)
-    else if (bm.id.toLowerCase() === (nativeModel as vscode.LanguageModelChat).family?.toLowerCase()) {
-      candidates.push({ providerID, modelID: bm.id });
-    }
-    // Partial match: native id is a substring of backend model id (or vice versa)
-    else if (
-      modelIdForMatch.length >= 3 &&
-      (bm.id.toLowerCase().includes(modelIdForMatch.toLowerCase()) ||
-       modelIdForMatch.toLowerCase().includes(bm.id.toLowerCase()))
-    ) {
-      candidates.push({ providerID, modelID: bm.id });
-    }
-  }
-
-  // Deduplicate candidates (same providerID + modelID)
-  const unique = new Map<string, ModelRef>();
-  for (const c of candidates) {
-    unique.set(`${c.providerID}/${c.modelID}`, c);
-  }
-
-  const uniqueCandidates = [...unique.values()];
-
-  if (uniqueCandidates.length === 1) {
-    // Unique match - sync to SelectionStore and return
-    const match = uniqueCandidates[0];
-    const sel = ctx.selection.get();
-    // Only sync if different from current selection
-    if (!sel.model || sel.model.providerID !== match.providerID || sel.model.modelID !== match.modelID) {
-      await ctx.selection.setModel(match.providerID, match.modelID);
-    }
-    return match;
-  }
-
-  if (uniqueCandidates.length > 1) {
-    // Ambiguous match - cannot safely pick one.
-    // Fall back to SelectionStore to avoid silently switching providers.
-    // Log for diagnostics.
-    state.outputChannel.appendLine(
-      `[handler] Native model "${nativeModel.id}" matched ${uniqueCandidates.length} backend models - ` +
-      `falling back to SelectionStore to avoid ambiguity`,
+    throw new Error(
+      `Model "${nativeModel.id}" is not registered for backend "${ctx.id}" and vendor "${vendor}".`,
     );
-    return ctx.selection.get().model;
   }
 
-  // No match at all - native model not in backend catalogue.
-  // Fall back to SelectionStore. This can happen when the native picker shows
-  // models that the backend doesn't serve (e.g. Copilot-only models).
-  return ctx.selection.get().model;
+  // Sync the backend-local selection only after canonical resolution succeeds.
+  const sel = ctx.selection.get();
+  if (!sel.model ||
+      sel.model.providerID !== resolution.providerID ||
+      sel.model.modelID !== resolution.modelID) {
+    runtimeGuard?.();
+    await ctx.selection.setModel(resolution.providerID, resolution.modelID);
+    runtimeGuard?.();
+  }
+  return { providerID: resolution.providerID, modelID: resolution.modelID };
 }
 
 /**
- * Normalize the persisted agent selection before it is sent to OpenCode.
- *
- * Older extension state and some picker payloads can contain a display name
- * instead of the backend agent id. OpenCode prompt expects the id, so resolve
- * against the backend catalogue and repair SelectionStore when possible.
+ * Validate the selected backend agent id before sending a prompt.
  */
 export async function resolvePromptAgent(
   state: ExtensionState,
   ctx: BackendContext,
   directory?: string,
+  runtimeGuard?: () => void,
 ): Promise<string | undefined> {
+  runtimeGuard?.();
   const selected = ctx.selection.get().agent?.trim();
   if (!selected) {
     return undefined;
   }
 
   try {
+    runtimeGuard?.();
     const result = await ctx.backend.config.agents(directory);
+    runtimeGuard?.();
     const agents = result.data ?? [];
     if (agents.length === 0) {
       return selected;
     }
 
-    const exactId = agents.find((agent) => agent.id === selected);
-    if (exactId) {
-      return exactId.id;
-    }
-
-    const byName = agents.filter((agent: BackendAgent) => agent.name?.trim() === selected);
-    if (byName.length === 1) {
-      const resolved = byName[0].id;
-      await ctx.selection.setAgent(resolved);
-      state.outputChannel.appendLine(
-        `[handler] Agent selection normalized from ${JSON.stringify(selected)} to ${JSON.stringify(resolved)}`,
-      );
-      return resolved;
-    }
-
-    const selectedLower = selected.toLowerCase();
-    const byCaseInsensitiveName = agents.filter(
-      (agent: BackendAgent) => agent.name?.trim().toLowerCase() === selectedLower,
+    if (agents.some((agent: BackendAgent) => agent.id === selected)) {return selected;}
+    state.outputChannel.appendLine(
+      `[handler] Agent id ${JSON.stringify(selected)} is not advertised by backend ${ctx.id}`,
     );
-    if (byCaseInsensitiveName.length === 1) {
-      const resolved = byCaseInsensitiveName[0].id;
-      await ctx.selection.setAgent(resolved);
-      state.outputChannel.appendLine(
-        `[handler] Agent selection normalized from ${JSON.stringify(selected)} to ${JSON.stringify(resolved)}`,
-      );
-      return resolved;
-    }
-
-    if (byName.length > 1 || byCaseInsensitiveName.length > 1) {
-      state.outputChannel.appendLine(
-        `[handler] Agent selection ${JSON.stringify(selected)} matched multiple backend agents; using stored value`,
-      );
-    } else {
-      state.outputChannel.appendLine(
-        `[handler] Agent selection ${JSON.stringify(selected)} was not found in backend agents; using stored value`,
-      );
-    }
-    return selected;
+    return undefined;
   } catch (err) {
+    // Preserve runtime-transition cancellation; only ordinary catalogue
+    // failures are normalized to an absent agent.
+    runtimeGuard?.();
     state.outputChannel.appendLine(
       `[handler] Agent selection normalization failed: ${err instanceof Error ? err.message : String(err)}`,
     );
-    return selected;
+    return undefined;
   }
 }
 
@@ -270,16 +277,21 @@ export async function ensureServer(
   state: ExtensionState,
   ctx: BackendContext,
   stream: vscode.ChatResponseStream,
+  runtimeGuard?: () => void,
 ): Promise<boolean> {
+  runtimeGuard?.();
   const status = ctx.backend.getStatus();
   if (status === 'running') {
     return true;
   }
 
   try {
-    stream.progress(status === 'starting' ? `${ctx.backend.name} is starting...` : `Starting ${ctx.backend.name} server...`);
+    runtimeGuard?.();
+    const backendName = ctx.displayName;
+    stream.progress(status === 'starting' ? `${backendName} is starting...` : `Starting ${backendName} backend...`);
     const workspacePath = getWorkspaceDirectory();
     const result = await ctx.backend.start(workspacePath);
+    runtimeGuard?.();
     if (result.error || !result.data) {
       const msg = typeof result.error === 'string' ? result.error : 'Unknown error';
       stream.markdown(`Failed to start backend: ${msg}`);
@@ -289,6 +301,9 @@ export async function ensureServer(
     stream.progress('Server ready');
     return true;
   } catch (err) {
+    // A runtime transition is a cancellation boundary, not a backend-start
+    // error to render into the new chat surface.
+    runtimeGuard?.();
     const msg = err instanceof Error ? err.message : 'Unknown error';
     stream.markdown(`Failed to start backend: ${msg}`);
     return false;
@@ -310,13 +325,14 @@ interface RecoveredHistory {
  * Scans from newest to oldest, returns the first match with valid data.
  * Used for session recovery after VSCode restart and rewind/fork detection.
  */
-function recoverFromHistory(context: vscode.ChatContext): RecoveredHistory {
+function recoverFromHistory(context: vscode.ChatContext, instanceKey: string): RecoveredHistory {
   const history = context.history ?? [];
   for (let i = history.length - 1; i >= 0; i--) {
     const turn = history[i];
     // ChatResponseTurn is a proposed API - access metadata via type assertion
     const metadata = (turn as unknown as { metadata?: Record<string, unknown> })?.metadata;
     if (!metadata) {continue;}
+    if (metadata.backendInstanceKey !== instanceKey) {continue;}
 
     const backendSessionId = (metadata.backendSessionId ?? metadata.sessionId) as string | undefined;
     const turnMapRaw = metadata.turnMap as Array<{ vscodeTurn: number; messageId: string }> | undefined;
@@ -356,21 +372,13 @@ function aliasSessionState(
   }
 }
 
-function getInitialSessionTitle(vscodeSessionId: string): string {
+function getInitialSessionTitle(ctx: BackendContext, vscodeSessionId: string): string {
+  const backendName = ctx.displayName;
   if (vscodeSessionId.includes('/untitled-')) {
-    return 'New OpenCode Session';
+    return `New ${backendName} Session`;
   }
 
-  return `OpenCode Session ${vscodeSessionId.slice(0, 8)}`;
-}
-
-function isProvisionalTitleEcho(
-  title: string | undefined,
-  chatState: { title?: string; provisionalTitle?: boolean } | undefined,
-): boolean {
-  return !!title
-    && !!chatState?.provisionalTitle
-    && title.trim() === chatState.title?.trim();
+  return `${backendName} Session ${vscodeSessionId.slice(0, 8)}`;
 }
 
 /**
@@ -390,7 +398,10 @@ async function resolveSession(
   stream: vscode.ChatResponseStream,
   vscodeSessionId: string,
   directory?: string,
+  runtimeGuard?: () => void,
+  isCancelled?: () => boolean,
 ): Promise<string | null> {
+  runtimeGuard?.();
   // Get or create per-VSCode-chat state
   let chatState = ctx.sessions.get(vscodeSessionId);
   if (!chatState) {
@@ -400,7 +411,7 @@ async function resolveSession(
 
   // Check for metadata recovery (VSCode restart / tab restore)
   if (!chatState.backendSessionId) {
-    const recovered = recoverFromHistory(context);
+    const recovered = recoverFromHistory(context, ctx.instanceKey);
     if (recovered.backendSessionId) {
       chatState.backendSessionId = recovered.backendSessionId;
       chatState.turnMap = recovered.turnMap;
@@ -418,55 +429,159 @@ async function resolveSession(
 
   // --- Case 1: New chat (no prior session) ---
   if (!chatState.backendSessionId) {
-    stream.progress('Creating new session...');
-    const result = await ctx.backend.sessions.create({
-      title: getInitialSessionTitle(vscodeSessionId),
-      directory,
-    });
-    if (result.error || !result.data) {
-      stream.markdown('Failed to create session.');
-      return null;
-    }
-    chatState.backendSessionId = result.data.id;
-    chatState.title = result.data.title;
-    chatState.titleSource = isPlaceholderSessionTitle(result.data.title) ? 'placeholder' : 'backend';
-    chatState.createdAt = result.data.createdAt;
-    stream.progress('Session ready');
-    // Write session metadata before title lifecycle patches can run. If this is
-    // left fire-and-forget, the initial placeholder write can race with the
-    // first-prompt provisional title update and overwrite it.
+    let createdSessionId: string | undefined;
+    let cleanupStarted = false;
+    const isRuntimeCurrent = (): boolean => {
+      try {
+        runtimeGuard?.();
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const clearAbandonedMapping = (): void => {
+      if (ctx.sessions.get(vscodeSessionId) !== chatState) {
+        return;
+      }
+      const remove = (ctx.sessions as unknown as {
+        delete?: (key: string) => void;
+      }).delete;
+      if (typeof remove === 'function') {
+        remove.call(ctx.sessions, vscodeSessionId);
+        return;
+      }
+      // Test doubles and older embedders may not expose SessionManager.delete.
+      // Reset the state in place so aliases cannot retain a usable stale id.
+      chatState.backendSessionId = '';
+      chatState.turnMap = [];
+      chatState.title = undefined;
+      chatState.titleSource = undefined;
+      chatState.provisionalTitle = undefined;
+      chatState.createdAt = undefined;
+    };
+    const cleanupAbandonedSession = async (): Promise<void> => {
+      if (!createdSessionId || cleanupStarted) {
+        return;
+      }
+      cleanupStarted = true;
+      try {
+        await cleanupLateCreatedSession(
+          ctx,
+          createdSessionId,
+          directory,
+          isRuntimeCurrent,
+          state.outputChannel,
+        );
+      } finally {
+        clearAbandonedMapping();
+      }
+    };
+
     try {
-      await ctx.sessionStore.writeMeta(result.data.id, {
-        id: result.data.id,
-        title: result.data.title ?? getInitialSessionTitle(vscodeSessionId),
-        titleSource: chatState.titleSource,
-        titleUpdatedAt: new Date().toISOString(),
-        createdAt: result.data.createdAt?.toISOString() ?? new Date().toISOString(),
-        backendName: ctx.backend.name,
+      runtimeGuard?.();
+      stream.progress('Creating new session...');
+      const initialTitle = getInitialSessionTitle(ctx, vscodeSessionId);
+      const result = await ctx.backend.sessions.create({
+        title: initialTitle,
+        directory,
       });
-    } catch (err) {
-      state.outputChannel.appendLine(`[handler] writeMeta failed: ${err}`);
+      // Retain a returned id even when the backend reports an error. A
+      // malformed/partial response still represents a resource we must try to
+      // dispose before surfacing the failure.
+      createdSessionId = result.data?.id;
+      runtimeGuard?.();
+      if (result.error || !result.data) {
+        stream.markdown('Failed to create session.');
+        await cleanupAbandonedSession();
+        return null;
+      }
+      if (isCancelled?.()) {
+        await cleanupAbandonedSession();
+        return null;
+      }
+      chatState.backendSessionId = result.data.id;
+      chatState.title = result.data.title;
+      chatState.titleSource = isPlaceholderSessionTitle(result.data.title) ? 'placeholder' : 'backend';
+      chatState.createdAt = result.data.createdAt;
+      // ACP backends advertise model and mode options when a session is created.
+      // Refresh the shared catalog now that those backend-scoped capabilities exist.
+      void Promise.resolve().then(async () => {
+        runtimeGuard?.();
+        await state.modelCatalog.refresh(directory);
+        runtimeGuard?.();
+        state.bus.emit('models-changed', { backendId: ctx.id });
+      })
+        .catch(err => {
+          state.outputChannel.appendLine(
+            `[handler] Model catalog refresh failed for ${ctx.id}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        });
+      stream.progress('Session ready');
+      // Write session metadata before title lifecycle patches can run. If this is
+      // left fire-and-forget, the initial placeholder write can race with the
+      // first-prompt provisional title update and overwrite it.
+      try {
+        runtimeGuard?.();
+        await ctx.sessionStore.writeMeta(result.data.id, {
+          id: result.data.id,
+          title: result.data.title ?? initialTitle,
+          titleSource: chatState.titleSource,
+          titleUpdatedAt: new Date().toISOString(),
+          createdAt: result.data.createdAt?.toISOString() ?? new Date().toISOString(),
+          backendName: ctx.id,
+          backendInstanceKey: ctx.instanceKey,
+        });
+        runtimeGuard?.();
+      } catch (err) {
+        // Do not turn a stale-runtime write into a successful session setup.
+        runtimeGuard?.();
+        state.outputChannel.appendLine(`[handler] writeMeta failed: ${err}`);
+      }
+      if (isCancelled?.()) {
+        await cleanupAbandonedSession();
+        return null;
+      }
+      runtimeGuard?.();
+      state.bus.emit('session-list-changed', { backendId: ctx.id });
+      state.outputChannel.appendLine(
+        `[handler] Created new session ${chatState.backendSessionId} for VSCode chat ${vscodeSessionId}`,
+      );
+      return chatState.backendSessionId;
+    } catch (error) {
+      // A runtime transition can happen while sessions.create() or metadata
+      // persistence is pending. The outer request race may already have
+      // returned, so cleanup must happen here when the late promise settles.
+      await cleanupAbandonedSession();
+      throw error;
     }
-    state.bus.emit('session-list-changed', { backendId: ctx.id });
-    state.outputChannel.appendLine(
-      `[handler] Created new session ${chatState.backendSessionId} for VSCode chat ${vscodeSessionId}`,
-    );
-    return chatState.backendSessionId;
   }
 
-  // --- Case 2: Continue (same turn count) ---
-  if (currentTurnIndex === chatState.turnMap.length) {
+  // A cancelled turn deliberately has no backend message mapping.  Count the
+  // highest explicit VS Code turn instead of relying on array length so a
+  // later request can continue across that gap without manufacturing a fake
+  // backend message id.
+  const recordedTurnCount = chatState.turnMap.reduce((count, entry) => {
+    return Number.isInteger(entry.vscodeTurn) && entry.vscodeTurn >= 0
+      ? Math.max(count, entry.vscodeTurn + 1)
+      : count;
+  }, 0);
+
+  // --- Case 2: Continue (same or later turn count) ---
+  if (currentTurnIndex >= recordedTurnCount) {
     stream.progress('Reusing existing session...');
     state.outputChannel.appendLine(
       `[handler] Reusing session ${chatState.backendSessionId} for VSCode chat ${vscodeSessionId} (turn ${currentTurnIndex}) ` +
-      `turnMap=${chatState.turnMap.length}`,
+      `turnMap=${chatState.turnMap.length}, recordedTurnCount=${recordedTurnCount}`,
     );
     return chatState.backendSessionId;
   }
 
   // --- Case 3: Rewind (fewer turns than recorded) - revert ---
-  if (currentTurnIndex < chatState.turnMap.length) {
-    const priorTurnMap = chatState.turnMap.slice(0, currentTurnIndex);
+  if (currentTurnIndex < recordedTurnCount) {
+    const priorTurnMap = chatState.turnMap.filter(entry => entry.vscodeTurn < currentTurnIndex);
+    const entriesToRevert = chatState.turnMap
+      .filter(entry => entry.vscodeTurn >= currentTurnIndex)
+      .sort((a, b) => b.vscodeTurn - a.vscodeTurn);
     if (currentTurnIndex > 0) {
       stream.progress('Rewinding conversation...');
       state.outputChannel.appendLine(
@@ -476,15 +591,16 @@ async function resolveSession(
       // Revert each extraneous message from back to front (oldest first)
       let allSucceeded = true;
       let revertCount = 0;
-      for (let i = chatState.turnMap.length - 1; i >= currentTurnIndex; i--) {
-        const entry = chatState.turnMap[i];
+      for (const entry of entriesToRevert) {
         if (entry?.messageId) {
+          runtimeGuard?.();
           const revertResult = await ctx.backend.sessions.revert(
             chatState.backendSessionId,
             entry.messageId,
             undefined,
             directory,
           );
+          runtimeGuard?.();
           revertCount++;
           if (revertResult.error) {
             state.outputChannel.appendLine(
@@ -499,12 +615,10 @@ async function resolveSession(
         `[handler] Reverted ${revertCount} messages, allSucceeded=${allSucceeded}`,
       );
       if (!allSucceeded) {
-        state.outputChannel.appendLine(
-          `[handler] Revert failure - creating new session as fallback`,
-        );
-        const createResult = await ctx.backend.sessions.create({
-          directory,
-        });
+        state.outputChannel.appendLine('[handler] Revert failure - creating new session as fallback');
+        runtimeGuard?.();
+        const createResult = await ctx.backend.sessions.create({ directory });
+        runtimeGuard?.();
         if (createResult.error || !createResult.data) {
           stream.markdown('Failed to create session after revert failure.');
           return null;
@@ -517,7 +631,6 @@ async function resolveSession(
         return chatState.backendSessionId;
       }
     } else {
-      // Rewound to the beginning - no prior message to revert to
       state.outputChannel.appendLine(
         `[handler] Full rewind for session ${chatState.backendSessionId} - no revert needed`,
       );
@@ -532,40 +645,135 @@ async function resolveSession(
 }
 
 /**
- * Creates the ChatRequestHandler for the @opencode chat participant.
+ * Options for creating a participant handler.
  *
- * Flow:
- *  1. Check cancellation
- *  2. Route slash command (if present)
- *  3. Check for empty prompt
- *  4. Start OpenCode server if not running
- *  5. Resolve or fork session (handles VSCode rewind)
- *  6. Subscribe to SSE events
- *  7. Send the user prompt
- *  7b. Hook cancellation - abort OpenCode backend
- *  8. Bridge events to VSCode chat stream (with per-edit externalEdit tracking)
- *  9. Record user message ID in turn map
+ * A surface callback can outlive a backend target transition. In that case
+ * the handler must keep using the context captured when the callback was
+ * created, while consulting the mutable owner context to notice that the
+ * captured runtime is no longer valid. The default owner is the context
+ * itself, which preserves the normal participant behaviour.
  */
+export interface ParticipantHandlerOptions {
+  readonly runtimeOwner?: BackendContext;
+}
+
+/** Create the shared request handler for one backend context. */
 export function createParticipantHandler(
   state: ExtensionState,
-  ctx: BackendContext,
+  backendContext: BackendContext,
+  options: ParticipantHandlerOptions = {},
 ): vscode.ChatRequestHandler {
+  const runtimeOwner = options.runtimeOwner ?? backendContext;
   return async (
     request: vscode.ChatRequest,
     context: vscode.ChatContext,
     stream: vscode.ChatResponseStream,
     token: vscode.CancellationToken,
   ): Promise<vscode.ChatResult> => {
-    let sss: SerializableSessionStream | undefined;
+    // Target switches replace runtime objects on the shared context. Keep one
+    // immutable snapshot for the lifetime of this request so old work cannot
+    // write into the newly selected target's stores.
+    const ctx: BackendContext = { ...backendContext };
+    let cancelDisposable: vscode.Disposable | undefined;
+    let resolvedBackendSessionId: string | undefined;
+    let cancelRequested = false;
+    let resolveCancellation!: () => void;
+    const cancellationSignal = new Promise<void>(resolve => {
+      resolveCancellation = resolve;
+    });
+    let closeActiveEventStream: () => void = () => {};
+    let abortSessionTree: (() => Promise<void>) | undefined;
+    let cancellationDrainPromise: Promise<void> | undefined;
+    let onSessionCancellation: (() => void) | undefined;
+
+    class HandlerCancellationError extends Error {
+      constructor() {
+        super('Turn cancelled');
+        this.name = 'HandlerCancellationError';
+      }
+    }
+
+    class HandlerRuntimeChangedError extends HandlerCancellationError {
+      constructor() {
+        super();
+        this.message = `Backend instance changed while the turn was running (${ctx.instanceKey}).`;
+        this.name = 'HandlerRuntimeChangedError';
+      }
+    }
+
+    const isHandlerCancellation = (error: unknown): boolean =>
+      error instanceof HandlerCancellationError;
+    const cancellationError = (): HandlerCancellationError => new HandlerCancellationError();
+    const isRequestRuntimeCurrent = (): boolean =>
+      runtimeOwner.acceptingRequests
+      && runtimeOwner.runtimeGeneration === ctx.runtimeGeneration
+      && runtimeOwner.instanceKey === ctx.instanceKey
+      && runtimeOwner.storageNamespace === ctx.storageNamespace
+      && runtimeOwner.backend === ctx.backend
+      && runtimeOwner.selection === ctx.selection
+      && runtimeOwner.sessions === ctx.sessions
+      && runtimeOwner.sessionStore === ctx.sessionStore;
+    const assertRequestRuntimeCurrent = (): void => {
+      if (!isRequestRuntimeCurrent()) {
+        throw new HandlerRuntimeChangedError();
+      }
+    };
+    const requestCancellation = (message: string): void => {
+      if (cancelRequested) {
+        return;
+      }
+      cancelRequested = true;
+      state.outputChannel.appendLine(message);
+      resolveCancellation();
+      onSessionCancellation?.();
+      closeActiveEventStream();
+    };
+    const raceCancellation = async <T>(operation: Promise<T>): Promise<T> => {
+      assertRequestRuntimeCurrent();
+      if (cancelRequested || token.isCancellationRequested) {
+        throw cancellationError();
+      }
+      const result = await Promise.race([
+        operation,
+        cancellationSignal.then(() => { throw cancellationError(); }),
+      ]);
+      assertRequestRuntimeCurrent();
+      return result;
+    };
+
+    // A target switch or extension shutdown must wake a request even when the
+    // backend promise itself never settles. The event is scoped by backend id
+    // and monotonically increasing runtime generation, so a stale notification
+    // cannot cancel a request created for a later runtime.
+    const disposeRuntimeChanging = state.bus.on('backend-runtime-changing', event => {
+      if (event.backendId !== ctx.id || event.runtimeGeneration <= ctx.runtimeGeneration) {
+        return;
+      }
+      requestCancellation(
+        `[handler] Backend runtime changing (${ctx.instanceKey} -> ${event.instanceKey}); cancelling turn`,
+      );
+    });
+
     try {
+      assertRequestRuntimeCurrent();
       // 1. Early cancellation check
       if (token.isCancellationRequested) {
         return { metadata: {} };
       }
 
+      // Promote this backend to the active one in the status bar so, with
+      // multiple backends assembled, the bar reflects the backend actually
+      // being used rather than whichever backend started last.
+      state.statusBar.setActiveBackend(ctx.id);
+
       // 2. Slash command routing
       if (request.command) {
-        return await routeCommand(request.command, state, ctx, stream, token);
+        return await raceCancellation(
+          Promise.resolve().then(() => {
+            assertRequestRuntimeCurrent();
+            return routeCommand(request.command!, state, ctx, stream, token);
+          }),
+        );
       }
 
       // 3. Empty prompt check
@@ -574,9 +782,31 @@ export function createParticipantHandler(
         return { metadata: {} };
       }
 
+      // Subscribe before starting the backend or resolving a session. The
+      // session-specific abort action is attached once resolveSession() gives
+      // us an id; cancellation during this early phase is still remembered and
+      // immediately acted on when that id becomes available.
+      cancelDisposable = token.onCancellationRequested(() => {
+        requestCancellation('[handler] Cancellation requested before session setup');
+      });
+      if (token.isCancellationRequested) {
+        requestCancellation('[handler] Cancellation was already requested before session setup');
+      }
+      if (cancelRequested) {
+        throw new HandlerCancellationError();
+      }
+
       // 4. Start server if needed
-      const ready = await ensureServer(state, ctx, stream);
+      const ready = await raceCancellation(
+        Promise.resolve().then(() => {
+          assertRequestRuntimeCurrent();
+          return ensureServer(state, ctx, stream, assertRequestRuntimeCurrent);
+        }),
+      );
       if (!ready) {return { metadata: {} };}
+      if (cancelRequested || token.isCancellationRequested) {
+        throw new HandlerCancellationError();
+      }
 
       // 4b. Compute workspace directory for session/prompt API calls
       const directory = getWorkspaceDirectory();
@@ -592,11 +822,94 @@ export function createParticipantHandler(
       // session instead of creating a detached one.
       aliasSessionState(state, ctx, sessionResourceKey, vscodeSessionId);
 
-      const backendSessionId = await resolveSession(state, ctx, context, stream, vscodeSessionId, directory);
+      const backendSessionId = await raceCancellation(
+        resolveSession(
+          state,
+          ctx,
+          context,
+          stream,
+          vscodeSessionId,
+          directory,
+          assertRequestRuntimeCurrent,
+          () => cancelRequested || token.isCancellationRequested,
+        ),
+      );
       if (!backendSessionId) {return { metadata: {} };}
+      resolvedBackendSessionId = backendSessionId;
+
+      // Install cancellation handling as soon as the backend session is known.
+      // This covers model/attachment resolution and SSS setup, not only the
+      // event-pipeline portion of a turn.
+      let abortPromise: Promise<void> | undefined;
+      const abortSessionTreeOnce = (): Promise<void> => {
+        if (abortPromise) {
+          return abortPromise;
+        }
+        // A target transition owns teardown of the old transport. Once the
+        // context generation changes, calling abort by session id could hit a
+        // newly connected target that happens to reuse that id.
+        if (!isRequestRuntimeCurrent()) {
+          return Promise.resolve();
+        }
+
+        let sessionIds: string[];
+        try {
+          // Capture descendants before closing the event stream. OpenCode's
+          // close operation clears the child-parent correlation index.
+          sessionIds = [backendSessionId, ...ctx.backend.sessions.descendants(backendSessionId)];
+        } catch (error: unknown) {
+          sessionIds = [backendSessionId];
+          state.outputChannel.appendLine(
+            `[handler] Descendant lookup failed during abort: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+
+        abortPromise = Promise.all(sessionIds.map(async (sessionId) => {
+          try {
+            const result = await ctx.backend.sessions.abort(sessionId, directory);
+            state.outputChannel.appendLine(
+              `[handler] Abort ${sessionId === backendSessionId ? 'parent' : 'descendant'} result: ${JSON.stringify(result?.data)}`,
+            );
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            state.outputChannel.appendLine(
+              `[handler] Abort ${sessionId === backendSessionId ? 'parent' : `descendant ${sessionId}`} error: ${msg}`,
+            );
+          }
+        })).then(() => undefined);
+        return abortPromise;
+      };
+      abortSessionTree = abortSessionTreeOnce;
+      const drainAbort = (): Promise<void> => {
+        if (cancellationDrainPromise) {
+          return cancellationDrainPromise;
+        }
+        cancellationDrainPromise = settleWithin(
+          abortSessionTreeOnce(),
+          HANDLER_DRAIN_TIMEOUT_MS,
+          state.outputChannel,
+          'Cancellation abort',
+        );
+        return cancellationDrainPromise;
+      };
+      onSessionCancellation = (): void => {
+        state.outputChannel.appendLine(
+          `[handler] Cancellation requested, aborting session ${backendSessionId} and descendants`,
+        );
+        // Start the abort while the hierarchy index is still intact, then
+        // close the active stream to wake any pipeline consumer immediately.
+        void drainAbort();
+        closeActiveEventStream();
+      };
+      if (cancelRequested) {
+        // The listener may have fired while resolveSession() was awaiting.
+        // Attach the id now and immediately perform the deferred cascade.
+        onSessionCancellation();
+      }
 
       aliasSessionState(state, ctx, vscodeSessionId, sessionResourceKey);
 
+      const titleService = new SessionTitleService(state, ctx);
       const activeChatState = ctx.sessions.get(vscodeSessionId);
       if (activeChatState) {
         activeChatState.createdAt = activeChatState.createdAt ?? new Date();
@@ -608,30 +921,89 @@ export function createParticipantHandler(
         (isPlaceholderSessionTitle(activeChatState.title) || !!activeChatState.provisionalTitle) &&
         !isPlaceholderSessionTitle(request.prompt);
       if (shouldInitializeTitle) {
+        if (cancelRequested) {
+          throw cancellationError();
+        }
         const provisionalTitle = request.prompt.length > 60
           ? `${request.prompt.slice(0, 57).trimEnd()}...`
           : request.prompt;
-        await applyProvisionalSessionTitle(state, ctx, {
+        await raceCancellation(titleService.applyProvisional({
           backendSessionId,
           vscodeSessionId,
           title: provisionalTitle,
           directory,
           updateBackend: true,
           createdAt: activeChatState.createdAt,
-        });
+        }));
+        if (cancelRequested) {
+          throw cancellationError();
+        }
         state.outputChannel.appendLine(
           `[handler] Applied provisional first-prompt title: "${provisionalTitle}"`,
         );
       }
 
-      const executeTurnWithBridge = async (): Promise<void> => {
-        stream.progress('Connecting to event stream...');
-        await ctx.backend.events.ensureStarted();
+      // Generate the final title while the first turn is running.  The
+      // provisional title above is intentional: External Edit and the
+      // backend event pipeline need a stable title immediately, while the LM
+      // request may take longer than the first response.  Applying the result
+      // through SessionTitleService keeps the backend, SSS metadata, and the
+      // Copilot session mapping in sync.
+      const earlyTitlePromise: Promise<string | undefined> = shouldInitializeTitle
+        ? (async (): Promise<string | undefined> => {
+          // The native picker model is authoritative for this turn. Prefer it
+          // directly because VS Code may not have refreshed the global model
+          // pool yet when title generation starts.
+          const generated = await titleService.generateFromPrompt(request.prompt, request.model);
+          if (!generated || isPlaceholderSessionTitle(generated)) {
+            state.outputChannel.appendLine(
+              `[handler] LM title unavailable for ${backendSessionId}; keeping provisional title`,
+            );
+            return undefined;
+          }
+          const applied = await titleService.applyFinal({
+            backendSessionId,
+            vscodeSessionId,
+            title: generated,
+            directory,
+            updateBackend: true,
+            overwrite: false,
+            source: 'copilot-style',
+          });
+          if (applied) {
+            state.outputChannel.appendLine(
+              `[handler] Applied generated first-prompt title: "${applied}"`,
+            );
+          }
+          return applied;
+        })().catch((err: unknown) => {
+          state.outputChannel.appendLine(
+            `[handler] Early title generation failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          return undefined;
+        })
+        : Promise.resolve(undefined);
 
-        // 7. Fire the user prompt WITHOUT awaiting (only once per turn)
-        stream.progress('Sending message...');
+      if (cancelRequested) {
+        return {
+          metadata: {
+            sessionId: backendSessionId,
+            backendSessionId,
+            backendInstanceKey: ctx.instanceKey,
+            turnMap: ctx.sessions.get(vscodeSessionId)?.turnMap ?? [],
+          },
+        };
+      }
+
+      const executeTurnWithPipeline = async (): Promise<void> => {
+        if (cancelRequested || token.isCancellationRequested) {
+          throw cancellationError();
+        }
+        // Resolve prompt inputs before opening the stream.  Once the stream is
+        // opened, the pipeline is started before the first prompt is sent.
+        stream.progress('Preparing message...');
         state.outputChannel.appendLine(
-          `[handler] Prompting session ${backendSessionId} with: ${request.prompt.substring(0, 50)}`,
+          `[handler] Preparing prompt for session ${backendSessionId}: ${request.prompt.substring(0, 50)}`,
         );
 
         // Debug: log available request properties and toolReferences for attachment debugging
@@ -684,14 +1056,28 @@ export function createParticipantHandler(
         const promptOptions: {
           model?: { providerID: string; modelID: string };
           agent?: string;
+          permissionMode: PermissionMode;
           attachments?: typeof attachments;
-        } = {};
-        const resolvedAgent = await resolvePromptAgent(state, ctx, directory);
+        } = {
+          permissionMode: normalizePermissionMode(ctx.selection.get().permissionMode),
+        };
+        const resolvedAgent = await raceCancellation(
+          Promise.resolve().then(() => {
+            assertRequestRuntimeCurrent();
+            return resolvePromptAgent(state, ctx, directory, assertRequestRuntimeCurrent);
+          }),
+        );
         if (resolvedAgent) {
           promptOptions.agent = resolvedAgent;
         }
-        // Resolve model: native VS Code picker -> backend match -> SelectionStore fallback
-        const resolvedModel = await resolvePromptModel(request, state, ctx);
+        // Resolve model: SelectionStore only when no native picker model exists;
+        // a present native model must resolve through the current backend catalog.
+        const resolvedModel = await raceCancellation(
+          Promise.resolve().then(() => {
+            assertRequestRuntimeCurrent();
+            return resolvePromptModel(request, state, ctx, assertRequestRuntimeCurrent);
+          }),
+        );
         if (resolvedModel) {
           promptOptions.model = resolvedModel;
         }
@@ -708,74 +1094,16 @@ export function createParticipantHandler(
           ? prependReferencedPaths(request.prompt, paths, state.outputChannel)
           : request.prompt;
 
-        const promptPromise = ctx.backend.sessions.prompt(
-          backendSessionId,
-          promptText,
-          directory,
-          promptOptions,
-        ).then((result: { error?: unknown; data?: unknown }) => {
-          if (result.error) {
-            state.outputChannel.appendLine(`[handler] Prompt error: ${String(result.error)}`);
-          } else {
-            state.outputChannel.appendLine('[handler] Prompt accepted by backend');
-          }
-        }).catch((err: unknown) => {
-          const msg = err instanceof Error ? err.message : 'Prompt failed';
-          state.outputChannel.appendLine(`[handler] Prompt error: ${msg}`);
-        });
-
-        // 7b. Cancel - abort OpenCode session + all descendant sessions
-        let aborted = false;
-        const cancelDisposable = token.onCancellationRequested(() => {
-          if (aborted) {return;}
-          aborted = true;
-          state.outputChannel.appendLine(
-            `[handler] Cancellation requested, aborting session ${backendSessionId} and descendants`,
-          );
-          // Abort the parent session
-          ctx.backend.sessions.abort(backendSessionId, directory).then((result: { data?: unknown }) => {
-            state.outputChannel.appendLine(
-              `[handler] Abort parent result: ${JSON.stringify(result?.data)}`,
-            );
-          }).catch((err: unknown) => {
-            const msg = err instanceof Error ? err.message : String(err);
-            state.outputChannel.appendLine(`[handler] Abort parent error: ${msg}`);
-          });
-          // Abort all descendant sessions (children, grandchildren, etc.)
-          const descendants = ctx.backend.sessions.descendants(backendSessionId);
-          for (const childId of descendants) {
-            ctx.backend.sessions.abort(childId, directory).then((result: { data?: unknown }) => {
-              state.outputChannel.appendLine(
-                `[handler] Abort descendant ${childId} result: ${JSON.stringify(result?.data)}`,
-              );
-            }).catch((err: unknown) => {
-              const msg = err instanceof Error ? err.message : String(err);
-              state.outputChannel.appendLine(`[handler] Abort descendant ${childId} error: ${msg}`);
-            });
-          }
-          if (descendants.length > 0) {
-            state.outputChannel.appendLine(
-              `[handler] Cascade-abort: ${descendants.length} descendant session(s) [${descendants.join(', ')}]`,
-            );
-          }
-        });
-
-        // Collect known file URIs for new-file detection (once per turn)
-        let knownFileUris: string[] = [];
-        try {
-          knownFileUris = collectOpenFileUris().map(u => u.toString());
-        } catch {
-          // vscode.workspace.textDocuments may not be available (e.g., test mock)
-        }
-
         // Continuation loop: after subagent tasks complete, the orchestrator needs
         // additional prompts to continue. We reopen the event stream and run the
-        // bridge again until no more subagent tasks are detected.
+        // pipeline again until no more subagent tasks are detected.
         let userMessageId: string | null = null;
         let needsContinue = true;
-        let sessionTitleFromBridge: string | undefined;
-        let sessionTitleSourceFromBridge: SessionTitleSource | undefined;
-        const liveTurnIndex = activeChatState?.turnMap.length ?? 0;
+        let sessionTitleFromPipeline: string | undefined;
+        let sessionTitleSourceFromPipeline: SessionTitleSource | undefined;
+        const liveTurnIndex = (context.history ?? []).filter(
+          (h): h is vscode.ChatRequestTurn => h instanceof vscode.ChatRequestTurn,
+        ).length;
         let titleUpdateChain: Promise<void> = Promise.resolve();
 
         // SSS persistence (v2 architecture)
@@ -784,19 +1112,25 @@ export function createParticipantHandler(
           `[handler] workspaceRoot="${workspaceRoot}" backend="${ctx.backend.name}" ` +
           `backendSessionId="${backendSessionId}" requestId="${request.id}" turn=${liveTurnIndex}`,
         );
-        sss = new SerializableSessionStream(stream, {
+        const sessionStream = new SerializableSessionStream(stream, {
           workspaceRoot,
-          backendName: ctx.backend.name,
+          backendName: ctx.storageNamespace,
           sessionId: backendSessionId,
           turnIndex: liveTurnIndex,
           requestId: request.id,
           onTitleChanged: (update) => {
-            sessionTitleFromBridge = update.title;
-            sessionTitleSourceFromBridge = update.source;
+            if (cancelRequested || token.isCancellationRequested || !isRequestRuntimeCurrent()) {
+              return;
+            }
+            sessionTitleFromPipeline = update.title;
+            sessionTitleSourceFromPipeline = update.source;
             titleUpdateChain = titleUpdateChain
               .catch(() => undefined)
               .then(async () => {
-                const applied = await applySessionTitle(state, ctx, {
+                if (cancelRequested || token.isCancellationRequested || !isRequestRuntimeCurrent()) {
+                  return;
+                }
+                const applied = await titleService.applyFinal({
                   backendSessionId,
                   vscodeSessionId,
                   title: update.title,
@@ -818,97 +1152,300 @@ export function createParticipantHandler(
               });
           },
         });
-        await sss.initialize();
-        state.outputChannel.appendLine(`[handler] SSS initialized`);
-        sss.recordFirstPrompt(request.prompt);
+        let sssInitialized = false;
 
-        // Push user message before bridge.run (first record of the turn)
-        sss.push(new UserPromptSSP({
-          text: request.prompt,
-          command: request.command,
-          partId: `user-${backendSessionId}`,
-        }));
-        sss.writeMeta({
-          id: backendSessionId,
-          title: getInitialSessionTitle(vscodeSessionId),
-          titleSource: 'placeholder',
-          createdAt: new Date().toISOString(),
-        });
-        state.outputChannel.appendLine(`[handler] UserPromptSSP pushed`);
-
+        let nextPromptText = promptText;
+        let nextPromptOptions: typeof promptOptions | undefined = promptOptions;
+        let turnCompleted = false;
+        let initializationPromise: Promise<void> | undefined;
         try {
-          while (needsContinue && !token.isCancellationRequested) {
-            state.outputChannel.appendLine(`[handler] bridge run start for session ${backendSessionId}`);
+          assertRequestRuntimeCurrent();
+          initializationPromise = sessionStream.initialize();
+          await raceCancellation(initializationPromise);
+          sssInitialized = true;
+          state.outputChannel.appendLine(`[handler] SSS initialized`);
+          assertRequestRuntimeCurrent();
+          sessionStream.recordFirstPrompt(request.prompt);
+
+          // Push user message before pipeline.run (first record of the turn)
+          assertRequestRuntimeCurrent();
+          sessionStream.push(new UserPromptSSP({
+            text: request.prompt,
+            command: request.command,
+            partId: `user-${backendSessionId}`,
+          }));
+          // SSS.initialize() already writes the session header. Title
+          // lifecycle methods persist their own metadata patches, so a second
+          // snapshot here would race with the provisional/generated title and
+          // replay the placeholder over it.
+          state.outputChannel.appendLine(`[handler] UserPromptSSP pushed`);
+
+          while (needsContinue && !token.isCancellationRequested && !cancelRequested) {
+            state.outputChannel.appendLine(`[handler] pipeline run start for session ${backendSessionId}`);
             stream.progress('Waiting for response...');
 
+            // Register the per-session channel before starting the backend
+            // transport.  This closes the fast-response gap where an event can
+            // otherwise be emitted before a consumer exists.
+            assertRequestRuntimeCurrent();
             const events = ctx.backend.events.openSessionStream(backendSessionId);
-
-            const bridge = ctx.backend.createBridge(backendSessionId, directory);
-            (bridge as any).setLogger?.(state.outputChannel);
-            bridge.setSSS(sss);
-            state.outputChannel.appendLine(`[handler] Bridge created, SSS set`);
-
-            state.outputChannel.appendLine('[handler] bridge.run() starting...');
-            await bridge.run(events.stream, token);
-            await sss.flush();
-            state.outputChannel.appendLine(`[handler] bridge.run() completed.`);
-
-            ctx.backend.events.closeSessionStream(backendSessionId);
-
-            // Capture userMessageId from the first bridge run
-            if (!userMessageId) {
-              userMessageId = bridge.getUserMessageId();
-            }
-
-            // Capture backend-generated session title from the first bridge run.
-            if (!sessionTitleFromBridge) {
-              const title = bridge.getSessionTitle();
-              state.outputChannel.appendLine(
-                `[handler] bridge.getSessionTitle() = ${JSON.stringify(title)}`,
-              );
-              if (title) {
-                sessionTitleFromBridge = title;
-                sessionTitleSourceFromBridge = bridge.getSessionTitleSource?.() ?? 'backend';
+            assertRequestRuntimeCurrent();
+            let eventStreamClosed = false;
+            const closeEventStream = (): void => {
+              if (eventStreamClosed) {return;}
+              eventStreamClosed = true;
+              if (!isRequestRuntimeCurrent()) {return;}
+              try {
+                ctx.backend.events.closeSessionStream(backendSessionId);
+              } catch (err: unknown) {
+                state.outputChannel.appendLine(
+                  `[handler] Event stream close failed: ${err instanceof Error ? err.message : String(err)}`,
+                );
               }
-            }
+            };
+            closeActiveEventStream = closeEventStream;
 
-            // After subagent tasks completed, send continuation prompt and loop
-            if (bridge.getHadSubagentTasks() && !token.isCancellationRequested) {
-              state.outputChannel.appendLine('[handler] Subagent tasks completed - sending continuation prompt');
-              await ctx.backend.sessions.prompt(backendSessionId, '', directory);
-            } else {
-              needsContinue = false;
+            let pipelinePromise: Promise<BackendPipelineResult> | undefined;
+            let promptPromise: Promise<{ error?: unknown; data?: unknown }> | undefined;
+            let ensurePromise: Promise<void> | undefined;
+            try {
+              stream.progress('Connecting to event stream...');
+              // ensureStarted is intentionally repeated for every iteration:
+              // a global transport can reconnect or be replaced between the
+              // initial prompt and a continuation prompt.
+              ensurePromise = Promise.resolve().then(() => {
+                assertRequestRuntimeCurrent();
+                return ctx.backend.events.ensureStarted();
+              });
+              await raceCancellation(ensurePromise);
+              if (token.isCancellationRequested || cancelRequested) {
+                throw cancellationError();
+              }
+
+              assertRequestRuntimeCurrent();
+              const pipeline = ctx.backend.createPipeline({
+                sessionId: backendSessionId,
+                directory,
+                stream: sessionStream,
+                logger: state.outputChannel,
+                permissionMode: nextPromptOptions?.permissionMode,
+              });
+              state.outputChannel.appendLine(`[handler] Pipeline created, SSS bound`);
+
+              // Start consuming before invoking prompt.  The backend may emit
+              // the first event synchronously from prompt(), so this ordering is
+              // part of the Copilot-to-Agent application contract.
+              state.outputChannel.appendLine('[handler] pipeline.run() starting...');
+              try {
+                pipelinePromise = Promise.resolve().then(() => {
+                  assertRequestRuntimeCurrent();
+                  return pipeline.run(events.stream, token);
+                });
+              } catch (err) {
+                pipelinePromise = Promise.reject(err);
+              }
+              // Observe an early pipeline rejection while prompt() is still
+              // in flight; the actual rejection is rethrown below.
+              void pipelinePromise.catch(() => undefined);
+
+              promptPromise = Promise.resolve().then(() => {
+                assertRequestRuntimeCurrent();
+                return ctx.backend.sessions.prompt(
+                  backendSessionId,
+                  nextPromptText,
+                  directory,
+                  nextPromptOptions,
+                );
+              });
+              let promptResult: { error?: unknown; data?: unknown };
+              try {
+                state.outputChannel.appendLine(
+                  `[handler] Prompting session ${backendSessionId} with: ${nextPromptText.substring(0, 50)}`,
+                );
+                promptResult = await raceCancellation(promptPromise);
+              } catch (err: unknown) {
+                const msg = err instanceof Error ? err.message : String(err);
+                state.outputChannel.appendLine(`[handler] Prompt error: ${msg}`);
+                throw err;
+              }
+              if (promptResult.error !== undefined) {
+                const msg = String(promptResult.error);
+                state.outputChannel.appendLine(`[handler] Prompt error: ${msg}`);
+                throw new Error(`Backend prompt failed: ${msg}`);
+              }
+              state.outputChannel.appendLine('[handler] Prompt accepted by backend');
+
+              const pipelineResult = await raceCancellation(pipelinePromise);
+              await raceCancellation(sessionStream.flush());
+              state.outputChannel.appendLine(`[handler] pipeline.run() completed.`);
+
+              if (!pipelineResult.completed && !token.isCancellationRequested && !cancelRequested) {
+                throw new Error(pipelineResult.error ?? 'Backend pipeline ended before the session became idle');
+              }
+              if (token.isCancellationRequested || cancelRequested) {
+                throw cancellationError();
+              }
+
+              // Capture userMessageId from the first pipeline run
+              if (!userMessageId) {
+                userMessageId = pipelineResult.userMessageId;
+              }
+
+              // Capture backend-generated session title from the first pipeline run.
+              if (!sessionTitleFromPipeline) {
+                const title = pipelineResult.sessionTitle;
+                state.outputChannel.appendLine(
+                  `[handler] pipeline result sessionTitle = ${JSON.stringify(title)}`,
+                );
+                if (title) {
+                  sessionTitleFromPipeline = title;
+                  sessionTitleSourceFromPipeline = pipelineResult.sessionTitleSource ?? 'backend';
+                }
+              }
+
+              // After subagent tasks completed, send a continuation prompt on a
+              // fresh pipeline iteration.  That iteration repeats the same
+              // channel-before-prompt ordering.
+              if (pipelineResult.hadSubagentTasks && !token.isCancellationRequested && !cancelRequested) {
+                state.outputChannel.appendLine('[handler] Subagent tasks completed - scheduling continuation prompt');
+                nextPromptText = '';
+                nextPromptOptions = { permissionMode: promptOptions.permissionMode };
+              } else {
+                needsContinue = false;
+                turnCompleted = pipelineResult.completed
+                  && !token.isCancellationRequested
+                  && !cancelRequested;
+              }
+          } catch (err) {
+            const cancelled = cancelRequested || token.isCancellationRequested || isHandlerCancellation(err);
+            // Start abort before closing so the descendant snapshot is taken
+            // while the event broker still knows the session hierarchy.
+            const pendingAbort = abortSessionTreeOnce();
+            closeEventStream();
+            const pendingOperations: Promise<unknown>[] = [pendingAbort];
+            if (ensurePromise) {pendingOperations.push(ensurePromise);}
+            if (promptPromise) {pendingOperations.push(promptPromise);}
+            if (pipelinePromise) {pendingOperations.push(pipelinePromise);}
+            if (cancelled) {void drainAbort();}
+            await settleWithin(
+              Promise.allSettled(pendingOperations).then(() => undefined),
+              HANDLER_DRAIN_TIMEOUT_MS,
+              state.outputChannel,
+              cancelled ? 'Cancellation drain' : 'Turn drain',
+            );
+            if (cancelled) {
+              throw cancellationError();
+            }
+              throw err;
+            } finally {
+              closeEventStream();
+              if (closeActiveEventStream === closeEventStream) {
+                closeActiveEventStream = () => {};
+              }
             }
           }
         } finally {
-          cancelDisposable.dispose();
-          ctx.backend.events.closeSessionStream(backendSessionId);
-          await sss.drain();
-          await titleUpdateChain;
-          sss.close();
-          await sss.flush();
+          closeActiveEventStream();
+          if (initializationPromise) {
+            await settleWithin(
+              initializationPromise,
+              HANDLER_DRAIN_TIMEOUT_MS,
+              state.outputChannel,
+              'SSS initialization',
+            );
+          }
+          await settleWithin(
+            sessionStream.drain(),
+            HANDLER_DRAIN_TIMEOUT_MS,
+            state.outputChannel,
+            'SSS drain',
+          );
+          await settleWithin(
+            titleUpdateChain,
+            HANDLER_DRAIN_TIMEOUT_MS,
+            state.outputChannel,
+            'Session title update',
+          );
+          // Do not leave a title request running after the turn has released
+          // its event stream.  It is still bounded so a provider that never
+          // settles cannot hold Copilot's response indefinitely.
+          await settleWithin(
+            earlyTitlePromise,
+            HANDLER_DRAIN_TIMEOUT_MS,
+            state.outputChannel,
+            'Early session title generation',
+          );
+          // Close even when initialize() failed part-way through. The stream
+          // implementation is idempotent and writes a matching turn boundary
+          // whenever its paths were established.
+          if (sssInitialized || sessionStream.getSessionPath() !== null) {
+            sessionStream.close();
+          }
+          await settleWithin(
+            sessionStream.flush(),
+            HANDLER_DRAIN_TIMEOUT_MS,
+            state.outputChannel,
+            'SSS flush',
+          );
         }
 
-        // 9. Ensure prompt promise settles
-        await promptPromise;
+        if (!turnCompleted || cancelRequested || token.isCancellationRequested) {
+          throw cancellationError();
+        }
+        assertRequestRuntimeCurrent();
 
-        // 10. Record user message ID
+        // Resolve titles before recording the backend message mapping. If title
+        // reconciliation is cancelled or fails, the turn remains unmapped and
+        // can be retried without asking the backend to revert a phantom entry.
         const chatState = ctx.sessions.get(vscodeSessionId);
+        // Resolve session title. Priority:
+        // 1. Backend auto-generates title (via session.updated event)
+        // 2. sessions.get() returns a meaningful title
+        // 3. Derive from first prompt + push to backend via sessions.update()
+        const reconciledTitle = await raceCancellation(titleService.resolveFinalTurnTitle({
+          backendSessionId,
+          directory,
+          pipelineTitle: sessionTitleFromPipeline,
+          pipelineTitleSource: sessionTitleSourceFromPipeline,
+          chatState,
+        }));
+
+        // Persist resolved title across backend/sessionMap/SessionStore.
+        if (reconciledTitle) {
+          await raceCancellation(titleService.applyFinal({
+            backendSessionId,
+            vscodeSessionId,
+            title: reconciledTitle.title,
+            directory,
+            updateBackend: false,
+            overwrite: false,
+            source: reconciledTitle.source,
+          }));
+          state.outputChannel.appendLine(
+            `[handler] Applied reconciled session title (${reconciledTitle.source}): "${reconciledTitle.title}"`,
+          );
+        }
+
+        if (!turnCompleted || cancelRequested || token.isCancellationRequested) {
+          throw cancellationError();
+        }
+        assertRequestRuntimeCurrent();
+
+        // Record user message ID only after all turn-level asynchronous work
+        // has completed successfully.
         state.outputChannel.appendLine(
           `[handler] User message ID for turn: ${!!chatState && !!userMessageId} (${userMessageId})`,
         );
-        let wasFirstTurn = false;
         if (chatState && userMessageId) {
-          wasFirstTurn = chatState.turnMap.length === 0;
+          const wasFirstTurn = chatState.turnMap.length === 0 && liveTurnIndex === 0;
           chatState.turnMap.push({
-            vscodeTurn: chatState.turnMap.length,
+            vscodeTurn: liveTurnIndex,
             messageId: userMessageId,
           });
           state.outputChannel.appendLine(
             `[handler] Recorded turn ${chatState.turnMap.length - 1}: messageID=${userMessageId} (total turns=${chatState.turnMap.length})`,
           );
 
-          // Derive session title from first prompt (matches experimental-session logic)
           if (wasFirstTurn) {
             state.outputChannel.appendLine(
               `[handler] First turn completed for session ${backendSessionId}`,
@@ -916,117 +1453,64 @@ export function createParticipantHandler(
           }
         }
 
-        // Resolve session title. Priority:
-        // 1. Backend auto-generates title (via session.updated event)
-        // 2. sessions.get() returns a meaningful title
-        // 3. Derive from first prompt + push to backend via sessions.update()
-        let resolvedTitle = sessionTitleFromBridge;
-        let resolvedTitleSource: SessionTitleSource | undefined = sessionTitleSourceFromBridge;
-        if (isProvisionalTitleEcho(resolvedTitle, chatState)) {
-          state.outputChannel.appendLine(
-            `[handler] Ignoring provisional session title echo: "${resolvedTitle}"`,
-          );
-          resolvedTitle = undefined;
-          resolvedTitleSource = undefined;
-        }
-
-        if (!resolvedTitle || isPlaceholderSessionTitle(resolvedTitle)) {
-          try {
-            const sessionInfo = await ctx.backend.sessions.get(backendSessionId, directory);
-            const backendTitle = sessionInfo.data?.title?.trim() ?? '';
-            if (isProvisionalTitleEcho(backendTitle, chatState)) {
-              state.outputChannel.appendLine(
-                `[handler] Ignoring provisional backend title echo: "${backendTitle}"`,
-              );
-            } else if (backendTitle && !isPlaceholderSessionTitle(backendTitle)) {
-              resolvedTitle = backendTitle;
-              resolvedTitleSource = 'backend';
-              state.outputChannel.appendLine(
-                `[handler] Title from sessions.get(): "${backendTitle}"`,
-              );
-            }
-          } catch (err: unknown) {
-            state.outputChannel.appendLine(
-              `[handler] sessions.get() for title failed: ${err instanceof Error ? err.message : String(err)}`,
-            );
-          }
-        }
-
-        // Turn-end naming is only reconciliation. Bridge owns raw event title
-        // adaptation and SSS writes the live stream metadata.
-        const shouldApplyReconciledTitle = !!resolvedTitle
-          && !isPlaceholderSessionTitle(resolvedTitle);
-
-        // Persist resolved title across backend/sessionMap/SessionStore.
-        if (shouldApplyReconciledTitle) {
-          await applySessionTitle(state, ctx, {
-            backendSessionId,
-            vscodeSessionId,
-            title: resolvedTitle,
-            directory,
-            updateBackend: false,
-            overwrite: false,
-            source: resolvedTitleSource ?? 'backend',
-          });
-          state.outputChannel.appendLine(
-            `[handler] Applied reconciled session title (${resolvedTitleSource ?? 'backend'}): "${resolvedTitle}"`,
-          );
-        }
-
         state.outputChannel.appendLine(`[handler] Refreshing Session list for session ${backendSessionId}`);
         state.bus.emit('session-list-changed', { backendId: ctx.id });
       };
 
       // 11. Execute turn
-      await executeTurnWithBridge();
+      await executeTurnWithPipeline();
+      assertRequestRuntimeCurrent();
 
       // 12. Return metadata for future turn recovery
       return {
         metadata: {
           sessionId: backendSessionId,
           backendSessionId,
+          backendInstanceKey: ctx.instanceKey,
           turnMap: ctx.sessions.get(vscodeSessionId)?.turnMap ?? [],
         },
       };
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Unexpected error';
-      stream.markdown(msg);
-      state.outputChannel.appendLine(`[handler] Error: ${msg}`);
-      return { metadata: {} };
+      const cancelled = cancelRequested || token.isCancellationRequested || isHandlerCancellation(err);
+      if (!cancelled) {
+        stream.markdown(msg);
+        state.outputChannel.appendLine(`[handler] Error: ${msg}`);
+      } else {
+        state.outputChannel.appendLine('[handler] Turn cancellation completed');
+      }
+      // Preserve the session binding after a failed turn so Copilot can retry
+      // or restore the same Agent Session instead of silently detaching it.
+      return {
+        metadata: resolvedBackendSessionId
+          ? {
+              sessionId: resolvedBackendSessionId,
+              backendSessionId: resolvedBackendSessionId,
+              backendInstanceKey: ctx.instanceKey,
+              turnMap: ctx.sessions.get(request.sessionId ?? 'unknown')?.turnMap ?? [],
+            }
+          : {},
+      };
     } finally {
-      // SSS cleanup handled in executeTurnWithBridge's own finally block
+      // A cancellation can happen while resolving model inputs or initializing
+      // SSS, before the per-iteration cleanup path exists. Wait briefly for
+      // the shared abort promise so the backend receives the cancellation while
+      // still guaranteeing that Copilot is released.
+      if (cancelRequested && abortSessionTree) {
+        // `drainAbort` is normally exercised by the cancellation callback or
+        // the per-iteration catch. This fallback covers tokens that expose a
+        // changed flag without firing their event.
+        cancellationDrainPromise ??= settleWithin(
+          abortSessionTree(),
+          HANDLER_DRAIN_TIMEOUT_MS,
+          state.outputChannel,
+          'Cancellation abort',
+        );
+        await cancellationDrainPromise;
+      }
+      cancelDisposable?.dispose();
+      disposeRuntimeChanging();
     }
   };
-}
-
-/**
- * Recursively check if any descendant session (child, grandchild, etc.)
- * of `parentId` is still busy. Used by the bridge's polling callback
- * to prevent premature stop when nested background tasks exist.
- */
-async function hasBusyDescendant(
-  parentId: string,
-  directory: string | undefined,
-  visited: Set<string>,
-  statuses: Record<string, BackendSessionStatus>,
-  childrenFn: (id: string, dir?: string) => Promise<BackendResult<BackendChildSessionInfo[]>>,
-): Promise<boolean> {
-  if (visited.has(parentId)) {return false;}
-  visited.add(parentId);
-
-  const childrenResult = await childrenFn(parentId, directory);
-  if (childrenResult.error || !childrenResult.data) {return false;}
-
-  for (const child of childrenResult.data) {
-    if (visited.has(child.id)) {continue;}
-
-    const status = statuses[child.id];
-    if (status?.type === 'busy') {return true;}
-
-    if (await hasBusyDescendant(child.id, directory, visited, statuses, childrenFn)) {
-      return true;
-    }
-  }
-  return false;
 }
 

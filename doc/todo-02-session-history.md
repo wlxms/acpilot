@@ -1,5 +1,13 @@
 # TODO 知识储备：还原会话历史 (provideChatSessionContent)
 
+> **历史调研归档**：会话恢复现在从 v2 SSP/SSS 记录重放，不再按正文中的旧
+> `src/acp/*` 路径或后端消息投影方案实现。现行设计见
+> [阶段一架构设计](../docs/refactor/copilot-agent-sss-phase1-design.md)。
+>
+> **完成状态（2026-09）**：会话历史已由 `experimental-session.ts` 从
+> `session.jsonl`/`meta.jsonl` 的 SSP/SSS 记录恢复；本文的 SDK messages 方案仅作
+> 历史调研。
+
 > 对应 TODO 条目：**还原会话历史** — 使 `provideChatSessionContent` 返回真实的会话历史，支持从已注册的 session target 恢复之前的对话。
 >
 > 本文档在开始实现之前编写，目的是收集所有必要的 API 知识、架构上下文和实现指引。
@@ -8,7 +16,7 @@
 
 ## 1. TODO 目标描述
 
-**现状**：`src/surfaces/vscode/experimental-session.ts` 中的 `createSessionContentProvider()` 已注册为 VS Code 的 `ChatSessionContentProvider`，但 `provideChatSessionContent` 返回的 `history` 目前是**空数组 `[]`**（见第 332 行）。
+**历史现状**：本文编写时 `createSessionContentProvider()` 返回的 `history` 是**空数组 `[]`**（见第 332 行）；现行实现已从 SSP/SSS 记录重建历史。
 
 **目标**：当用户选择 OpenCode session target 并切换到一个已有 session 时，VS Code 会调用 `provideChatSessionContent`。我们的实现需要：
 
@@ -402,7 +410,7 @@ function recoverFromHistory(context: vscode.ChatContext): RecoveredHistory {
 // src/surfaces/vscode/experimental-session.ts (第 321-472 行)
 provideChatSessionContent(resource, _token, _context): ChatSession {
     return {
-        history: [],  // ← 当前为空数组！
+        history: [],  // ← 历史实现曾为空数组；现行实现走 SSP/SSS 重放
         requestHandler: async (request, _context, stream, token) => {
             // 处理新消息的逻辑已经实现
             // ...

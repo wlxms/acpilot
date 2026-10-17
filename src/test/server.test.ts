@@ -183,6 +183,88 @@ describe('OpenCodeServerManager', () => {
     expect(manager.getStatus()).toBe('stopped');
   });
 
+  it('should cancel an in-flight start and close a late-created server', async () => {
+    let resolveStart: ((value: typeof mockInstance) => void) | undefined;
+    (createOpencode as unknown as ReturnType<typeof vi.fn>).mockReturnValue(
+      new Promise((resolve) => { resolveStart = resolve; }),
+    );
+
+    const start = manager.start('D:\\Temp');
+    const stop = manager.stop();
+    resolveStart!(mockInstance);
+
+    await stop;
+    await expect(start).rejects.toThrow('start cancelled');
+    expect(mockServer.close).toHaveBeenCalledOnce();
+    expect(manager.getStatus()).toBe('stopped');
+    expect(manager.getClient()).toBeNull();
+  });
+
+  it('bounds stop while startup is deferred, then cleans a late-created server', async () => {
+    vi.useFakeTimers();
+    try {
+      let resolveStart: ((value: typeof mockInstance) => void) | undefined;
+      (createOpencode as unknown as ReturnType<typeof vi.fn>).mockReturnValue(
+        new Promise((resolve) => { resolveStart = resolve; }),
+      );
+
+      const start = manager.start();
+      await Promise.resolve();
+      const stop = manager.stop();
+      await Promise.resolve();
+
+      let stopSettled = false;
+      void stop.then(() => { stopSettled = true; });
+      await Promise.resolve();
+      expect(stopSettled).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(2_000);
+      await stop;
+      expect(stopSettled).toBe(true);
+      expect(manager.getStatus()).toBe('stopped');
+
+      resolveStart!(mockInstance);
+      await expect(start).rejects.toThrow('start cancelled');
+      expect(mockServer.close).toHaveBeenCalledOnce();
+      expect(manager.getClient()).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not let a late cancelled start clear a replacement instance', async () => {
+    vi.useFakeTimers();
+    const replacementServer = {
+      url: 'http://127.0.0.1:52334',
+      close: vi.fn(),
+    };
+    const replacementClient = { ...mockClient };
+    try {
+      let resolveFirstStart: ((value: typeof mockInstance) => void) | undefined;
+      (createOpencode as unknown as ReturnType<typeof vi.fn>)
+        .mockReturnValueOnce(new Promise(resolve => { resolveFirstStart = resolve; }))
+        .mockResolvedValueOnce({ server: replacementServer, client: replacementClient });
+
+      const firstStart = manager.start();
+      await Promise.resolve();
+      const stop = manager.stop();
+      await vi.advanceTimersByTimeAsync(2_000);
+      await stop;
+
+      await expect(manager.start()).resolves.toBe(replacementServer.url);
+
+      resolveFirstStart!(mockInstance);
+      await expect(firstStart).rejects.toThrow('start cancelled');
+      expect(manager.getStatus()).toBe('running');
+      expect(manager.getClient()).toBe(replacementClient);
+      expect(replacementServer.close).not.toHaveBeenCalled();
+
+      await manager.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   // -----------------------------------------------------------------------
   // Start – error handling
   // -----------------------------------------------------------------------

@@ -11,7 +11,12 @@
 import type { Backend } from './backend';
 import type { AppEventBus } from './app-event-bus';
 import type { SelectionState } from './app-event-bus';
-import type { BackendAgent } from './types';
+import {
+  DEFAULT_PERMISSION_MODE,
+  normalizePermissionMode,
+  type BackendAgent,
+  type PermissionMode,
+} from './types';
 
 // ===========================================================================
 // Persistence abstraction
@@ -75,6 +80,13 @@ export class SelectionStore {
     this.bus.emit('selection-changed', { ...this.state, backendId: this.backendId });
   }
 
+  /** Set the permission scope used by the next request. */
+  async setPermissionMode(permissionMode: PermissionMode): Promise<void> {
+    this.state = { ...this.state, permissionMode: normalizePermissionMode(permissionMode) };
+    this.persist();
+    this.bus.emit('selection-changed', { ...this.state, backendId: this.backendId });
+  }
+
   /**
    * Set the current model by provider and model ID.
    * Resolves the display name from the backend's model list,
@@ -119,6 +131,9 @@ export class SelectionStore {
       next.model = persisted.model;
       next.modelDisplayName = persisted.modelDisplayName;
     }
+    if (next.permissionMode === undefined && persisted.permissionMode !== undefined) {
+      next.permissionMode = normalizePermissionMode(persisted.permissionMode);
+    }
     this.state = next;
   }
 
@@ -147,7 +162,8 @@ export class SelectionStore {
     const config = configResult.data;
     const agents = agentsResult.data ?? [];
 
-    let { agent, model } = this.state;
+    let { agent, model, permissionMode } = this.state;
+    permissionMode ??= DEFAULT_PERMISSION_MODE;
 
     // --- Resolve model from config ---------------------------------------
     if (!model && config?.model) {
@@ -199,7 +215,7 @@ export class SelectionStore {
     }
 
     // --- Build & persist resolved state ----------------------------------
-    this.state = { agent, model };
+    this.state = { agent, model, permissionMode };
     this.persist();
     return { ...this.state };
   }

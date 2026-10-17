@@ -1,29 +1,15 @@
 /**
- * ACP persistence types (session metadata, file snapshots).
+ * Backend persistence types (session metadata).
  *
- * SSP-specific types (StreamPartRecord, payloads, SerializableStreamPart class)
- * have been migrated to src/ssp/types.ts — ACP re-exports them for backward
- * compatibility.
+ * SSP-specific types are owned by src/ssp/types.ts.
  */
 
 // ===========================================================================
-// ACP-specific persistence types
+// Backend persistence types
 // ===========================================================================
 
-export interface FileSnapshotRecord {
-  uri: string;
-  content: string;
-  phase?: 'before' | 'after';
-  turnIndex?: number;
-  editIndex: number;
-  toolCallId: string;
-  timestamp: string;
-  missing?: boolean;
-  undoStopId?: string;
-}
-
 export interface SerializableRequestDetails {
-  turnIndex?: number;
+  turnIndex: number;
   vscodeRequestId: string;
   backendRequestId?: string;
   toolIdEditMap: Record<string, string>;
@@ -35,11 +21,12 @@ export type SessionTitleSource =
   | 'backend'
   | 'history'
   | 'placeholder'
-  | 'restore'
-  | 'legacy';
+  | 'restore';
 
 export interface SerializableSessionMeta {
   id: string;
+  /** Backend instance that owns this session (for example `acp:<targetId>`). */
+  backendInstanceKey?: string;
   title?: string;
   titleSource?: SessionTitleSource;
   titleUpdatedAt?: string;
@@ -70,30 +57,3 @@ export interface SerializableSessionMeta {
   };
   requestDetails?: SerializableRequestDetails[];
 }
-
-// ===========================================================================
-// Re-export SSP-owned types for backward compatibility
-// (Existing code importing from 'acp/serializable/types' still works.
-//  New code should import directly from 'ssp/types'.)
-// ===========================================================================
-
-export type {
-  StreamPartRecord as SerializableStreamPart,
-  SerializableStreamPartKind,
-  SerializableStreamPartMeta,
-  KnownSerializableStreamPart,
-  RawAcpEventStreamPartPayload,
-  RawAcpEventStreamPart,
-  UserPromptStreamPartPayload,
-  AssistantTextStreamPartPayload,
-  AssistantTextDeltaStreamPartPayload,
-  ReasoningStreamPartPayload,
-  ReasoningDeltaStreamPartPayload,
-  SerializableToolState,
-  ToolInvocationStreamPartPayload,
-  SessionLifecycleStreamPartPayload,
-  SessionDiffStreamPartPayload,
-  InteractionRequestStreamPartPayload,
-  InteractionResponseStreamPartPayload,
-  ExternalEditStreamPartPayload,
-} from '../../ssp/types';

@@ -1,23 +1,24 @@
 /**
  * Unified session mapping between VSCode chat sessions and backend sessions.
  *
- * Consolidates the `sessionMap` and session create/rewind/migrate logic
+ * Consolidates the `sessionMap` and session create/rewind logic
  * from handler.ts and stable-participant.ts into a single class.
  *
- * Phase 1 provides basic session CRUD and creation. Phase 2 will integrate
- * the full rewind/recovery logic from handler.ts.
+ * Rewind and restore orchestration stays in the Copilot integration layer;
+ * this class owns only the durable Copilot-session to backend-session binding.
  */
 
 import type { Backend } from './backend';
 import type { AppEventBus } from './app-event-bus';
 import type { TurnMapping } from '../types';
+import type { SessionTitleSource } from './serializable/types';
 
 // ===========================================================================
 // Session state (per VSCode chat panel)
 // ===========================================================================
 
 export interface SessionState {
-  /** Real backend session ID, e.g. an OpenCode session ID. */
+  /** Real backend-native session ID. */
   backendSessionId: string;
   /** Mapping of VSCode chat turns to backend message IDs */
   turnMap: TurnMapping[];
@@ -26,7 +27,7 @@ export interface SessionState {
   /** When the session was created */
   createdAt?: Date;
   /** Where the current title came from. */
-  titleSource?: import('./serializable/types').SessionTitleSource;
+  titleSource?: SessionTitleSource;
   /** True when the title is only a UI placeholder derived before generation. */
   provisionalTitle?: boolean;
 }
@@ -88,6 +89,11 @@ export class SessionManager {
     this.sessionMap.set(vscodeSessionId, state);
   }
 
+  /** Remove a VS Code session mapping when backend session creation is abandoned. */
+  delete(vscodeSessionId: string): void {
+    this.sessionMap.delete(vscodeSessionId);
+  }
+
   /**
    * Bind a second VS Code/resource key to an existing session state.
    * This keeps target switches from creating detached backend sessions.
@@ -136,7 +142,7 @@ export class SessionManager {
       backendSessionId: string | null;
       turnMap: TurnMapping[];
     },
-    currentTurnIndex?: number,
+    _currentTurnIndex?: number,
   ): Promise<string | null> {
     // 1. If we already have a mapping for this VSCode session, return it.
     const existing = this.sessionMap.get(vscodeSessionId);
@@ -172,17 +178,4 @@ export class SessionManager {
     return state.backendSessionId;
   }
 
-  /**
-   * Migrate a session mapping from one VSCode session ID to another.
-   * Used when the session target changes (e.g., a new chat panel takes over).
-   * The source key is removed after migration.
-   */
-  migrate(fromKey: string, toKey: string): void {
-    const state = this.sessionMap.get(fromKey);
-    if (state) {
-      this.sessionMap.set(toKey, state);
-      this.sessionMap.delete(fromKey);
-      this.bus.emit('session-list-changed', { backendId: this.backendId });
-    }
-  }
 }

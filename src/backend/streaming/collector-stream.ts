@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 
 /**
  * CollectorStream — captures all rendered `ChatResponseStream` parts into an array,
- * enabling bridge event replay during session restore.
+ * enabling pipeline event replay during session restore.
  *
  * Each method mirrors the corresponding `vscode.ChatResponseStream` method,
  * pushing the created part into an internal array. Proposed API methods
@@ -153,7 +153,7 @@ export class CollectorStream {
    * shape when available so proposed/extended response parts take VS Code's
    * session-provider restore path, then fall back for older test/runtime shims.
    */
-  buildTurn(metadata: Record<string, unknown> = {}, participantId: string = 'acpilot.opencode'): vscode.ChatResponseTurn | vscode.ChatResponseTurn2 {
+  buildTurn(metadata: Record<string, unknown> = {}, participantId: string = 'acpilot'): vscode.ChatResponseTurn | vscode.ChatResponseTurn2 {
     const result: vscode.ChatResult = { metadata };
     const Turn2Ctor = (vscode as unknown as {
       ChatResponseTurn2?: new (

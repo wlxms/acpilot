@@ -1,7 +1,7 @@
 /**
- * Tests for the ACP event-stream serializer (v2 JSONL format).
+ * Tests for the SSP stream serializer (v2 JSONL format).
  *
- * Covers both v1 (version header, metadata) and v2 (events, snapshots)
+ * Covers the v2 stream contract (version header, turn envelopes, SSPs, and snapshots)
  * serialization functions. Uses temporary directories for file I/O isolation.
  */
 
@@ -12,22 +12,15 @@ import * as path from 'node:path';
 import {
   buildLine,
   parseLine,
-  writeVersionHeader,
-  writeMeta,
-  readSessionMeta,
-  writeSessionMeta,
-  writeTurnStart,
+  writeVersionHeader,  writeTurnStart,
   writeTurnEnd,
-  writeLegacyEvent,
   writeStreamPart,
   writeSnapshotLine,
-  readLegacySessionEvents,
-  readLegacySessionTurnEvents,
   readSessionStreamParts,
   readSessionTurnStreamParts,
   readSessionSnapshots,
 } from '../../backend/serializable/serializer';
-import type { FileSnapshotRecord, SerializableStreamPart } from '../../backend/serializable/types';
+import type { FileSnapshotRecord, StreamPartRecord as SerializableStreamPart } from '../../ssp/types';
 
 // ===========================================================================
 // Helpers
@@ -60,7 +53,6 @@ afterEach(async () => {
     });
   }
 });
-
 // ===========================================================================
 // buildLine / parseLine
 // ===========================================================================
@@ -112,7 +104,6 @@ describe('buildLine / parseLine', () => {
     expect(parsed!.t).toBe('meta');
   });
 });
-
 // ===========================================================================
 // v1: Version header
 // ===========================================================================
@@ -156,119 +147,12 @@ describe('writeVersionHeader', () => {
 // v1: Metadata
 // ===========================================================================
 
-describe('writeMeta / readSessionMeta / writeSessionMeta', () => {
-  it('writeMeta appends a meta line', async () => {
-    const dir = await getTmpDir();
-    const fp = testFile();
-
-    await writeVersionHeader(fp);
-    await writeMeta(fp, { key: 'value', count: 42 });
-
-    const content = await fs.readFile(fp, 'utf-8');
-    const lines = content.trim().split('\n');
-    expect(lines).toHaveLength(2);
-
-    const parsed = parseLine(lines[1]);
-    expect(parsed).not.toBeNull();
-    expect(parsed!.t).toBe('meta');
-    expect(parsed!.d).toEqual({ key: 'value', count: 42 });
-  });
-
-  it('writeSessionMeta delegates to writeMeta', async () => {
-    const dir = await getTmpDir();
-    const fp = testFile();
-
-    await writeVersionHeader(fp);
-    await writeSessionMeta(fp, { sessionId: 'ses_001' });
-
-    const meta = await readSessionMeta(fp);
-    expect(meta).toHaveLength(1);
-    expect(meta[0]).toEqual({ sessionId: 'ses_001' });
-  });
-
-  it('readSessionMeta returns all meta records', async () => {
-    const dir = await getTmpDir();
-    const fp = testFile();
-
-    await writeVersionHeader(fp);
-    await writeMeta(fp, { step: 1 });
-    await writeMeta(fp, { step: 2 });
-    await writeMeta(fp, { step: 3 });
-
-    const meta = await readSessionMeta(fp);
-    expect(meta).toHaveLength(3);
-    expect(meta[0]).toEqual({ step: 1 });
-    expect(meta[1]).toEqual({ step: 2 });
-    expect(meta[2]).toEqual({ step: 3 });
-  });
-
-  it('readSessionMeta ignores non-meta lines', async () => {
-    const dir = await getTmpDir();
-    const fp = testFile();
-
-    await writeVersionHeader(fp);
-    await writeMeta(fp, { only: 'meta' });
-    // Manually append an event line to test filtering
-    await fs.appendFile(
-      fp,
-      buildLine('event', { type: 'test' }),
-      'utf-8',
-    );
-
-    const meta = await readSessionMeta(fp);
-    expect(meta).toHaveLength(1);
-    expect(meta[0]).toEqual({ only: 'meta' });
-  });
-
-  it('readSessionMeta returns empty array for missing file', async () => {
-    const dir = await getTmpDir();
-    const fp = testFile('nonexistent.jsonl');
-
-    const meta = await readSessionMeta(fp);
-    expect(meta).toEqual([]);
-  });
-
-  it('readSessionMeta returns empty array for empty file', async () => {
-    const dir = await getTmpDir();
-    const fp = testFile();
-
-    await fs.writeFile(fp, '', 'utf-8');
-
-    const meta = await readSessionMeta(fp);
-    expect(meta).toEqual([]);
-  });
-});
-
-
 describe('turn envelope serialization', () => {
-  it('groups events by persisted turn-start and turn-end records', async () => {
-    const dir = await getTmpDir();
-    const fp = testFile('turn-events.jsonl');
-
-    await writeVersionHeader(fp);
-    await writeTurnStart(fp, { turnIndex: 0, prompt: 'first', timestamp: '2026-06-07T00:00:00.000Z' });
-    await writeLegacyEvent(fp, { type: 'part.updated', part: { type: 'text', id: 'u1', text: 'first' } });
-    await writeLegacyEvent(fp, { type: 'part.updated', part: { type: 'text', id: 'a1', text: '' } });
-    await writeTurnEnd(fp, { turnIndex: 0, timestamp: '2026-06-07T00:00:01.000Z' });
-    await writeTurnStart(fp, { turnIndex: 1, prompt: 'second', timestamp: '2026-06-07T00:00:02.000Z' });
-    await writeLegacyEvent(fp, { type: 'part.updated', part: { type: 'text', id: 'u2', text: 'second' } });
-    await writeTurnEnd(fp, { turnIndex: 1, timestamp: '2026-06-07T00:00:03.000Z' });
-
-    const turns = await readLegacySessionTurnEvents(fp);
-    expect(turns).toHaveLength(2);
-    expect(turns[0].turnIndex).toBe(0);
-    expect((turns[0].start as any).prompt).toBe('first');
-    expect(turns[0].events).toHaveLength(2);
-    expect(turns[1].turnIndex).toBe(1);
-    expect((turns[1].start as any).prompt).toBe('second');
-    expect(turns[1].events).toHaveLength(1);
-  });
-
   it('groups stream parts by persisted turn-start and part metadata', async () => {
     const dir = await getTmpDir();
     const fp = testFile('turn-stream-parts.jsonl');
     const part0: SerializableStreamPart = {
-      kind: 'rawAcpEvent',
+      kind: 'opaqueEvent',
       version: 1,
       id: 'ssp-0-0',
       payload: { event: { type: 'part.updated' } },
@@ -277,12 +161,12 @@ describe('turn envelope serialization', () => {
         requestId: 'req-0',
         sequence: 0,
         createdAt: '2026-06-13T00:00:00.000Z',
-        source: 'acp-event',
+        source: 'backend-event',
         sourceType: 'part.updated',
       },
     };
     const part1: SerializableStreamPart = {
-      kind: 'rawAcpEvent',
+      kind: 'opaqueEvent',
       version: 1,
       id: 'ssp-1-0',
       payload: { event: { type: 'session.idle' } },
@@ -291,7 +175,7 @@ describe('turn envelope serialization', () => {
         requestId: 'req-1',
         sequence: 0,
         createdAt: '2026-06-13T00:00:01.000Z',
-        source: 'acp-event',
+        source: 'backend-event',
         sourceType: 'session.idle',
       },
     };
@@ -389,10 +273,20 @@ describe('writeSnapshotLine / readSessionSnapshots', () => {
     // Write version, snapshot, event, snapshot, meta — only snapshots returned
     await writeVersionHeader(fp);
     await writeSnapshotLine(fp, makeSnapshot('file:///a.ts', '// a'));
-    await writeLegacyEvent(fp, { type: 'session.created' });
+    await writeStreamPart(fp, {
+      kind: 'opaqueEvent',
+      version: 1,
+      id: 'opaque-1',
+      payload: { event: { type: 'session.created' } },
+      meta: {
+        turnIndex: 0,
+        requestId: 'request-1',
+        sequence: 0,
+        createdAt: '2026-06-07T00:00:00.000Z',
+        source: 'synthetic',
+      },
+    });
     await writeSnapshotLine(fp, makeSnapshot('file:///b.ts', '// b'));
-    await writeMeta(fp, { info: 'test' });
-
     const snapshots = await readSessionSnapshots<FileSnapshotRecord>(fp);
     expect(snapshots).toHaveLength(2);
     expect(snapshots[0].uri).toBe('file:///a.ts');

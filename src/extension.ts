@@ -20,6 +20,7 @@ import {
   DEFAULT_DSH_COMMAND,
   DEFAULT_DSH_PACKAGE_SPEC,
 } from "./backends/dsh/target";
+import { resolveDshLaunch } from "./backends/dsh/resolver";
 import {
   commandAfterDshInstall,
   defaultDshArgs,
@@ -417,22 +418,31 @@ async function resolveSelectedAcpBackendOptions(
 async function resolveSelectedDshBackendOptions(
   context: vscode.ExtensionContext,
 ): Promise<AcpBackendOptions | undefined> {
-  const target = getActiveDshTarget(context);
-  if (!target) {
-    return undefined;
+  const target = getActiveDshTarget(context)
+    ?? getDshSettingsTarget(context, getWorkspaceDirectory());
+  const resolution = resolveDshLaunch(target);
+  if (resolution.kind === 'unresolved') {
+    throw new Error(`${resolution.message} Checked: ${resolution.attempted.join(', ')}.`);
+  }
+  if (resolution.kind === 'remote') {
+    return {
+      remote: {
+        url: resolution.url,
+      },
+    };
   }
   const nonce = createDshBridgeLaunchNonce();
   return {
     local: {
-      command: target.command,
-      args: target.args,
-      cwd: target.launchCwd,
+      command: resolution.command,
+      args: resolution.args,
+      cwd: resolution.cwd,
       // The bridge is optional. A user's normal `dsh --profile acp` process
       // speaks ACP directly; an installed ACPilot bridge can use this nonce to
       // publish its readiness marker for future protocol extensions.
       env: { ACPILOT_DSH_BRIDGE_NONCE: nonce },
       stderr: 'pipe',
-      shell: process.platform === 'win32',
+      shell: resolution.shell,
       onStderrLine: (line) => {
         // Consume only the ACPilot bridge marker as a recognized extension
         // signal. Ordinary DSH diagnostics remain out-of-band and are ignored.
@@ -475,9 +485,12 @@ function getBackendTargets(
       id: `dsh:${target.id}`,
       kind: "dsh" as const,
       name: target.name,
-      description: `${target.command} (${target.launchCwd})`,
+      description: target.endpoint
+        ? `Connected ACP endpoint (${target.endpoint})`
+        : `${target.command} (${target.launchCwd})`,
       command: target.command,
       args: target.args,
+      endpoint: target.endpoint,
       launchCwd: target.launchCwd,
       installDirectory: target.installDirectory,
       packageSpec: target.packageSpec,
@@ -1052,10 +1065,15 @@ export function activate(context: vscode.ExtensionContext) {
       ...runtime,
     };
 
+    const dshDefaultResolution = desc.id === "dsh"
+      ? resolveDshLaunch(getDshSettingsTarget(context, workspacePath))
+      : undefined;
     const shouldAutoStart =
       desc.autoStart !== false &&
       !(desc.id === "acp" && !getActiveAcpTarget(context)) &&
-      !(desc.id === "dsh" && !getActiveDshTarget(context));
+      !(desc.id === "dsh"
+        && !getActiveDshTarget(context)
+        && dshDefaultResolution?.kind === "unresolved");
     if (!shouldAutoStart) {
       outputChannel.appendLine(
         `[extension] Backend '${desc.id}' registered (lazy start)`,
@@ -1385,6 +1403,7 @@ export function activate(context: vscode.ExtensionContext) {
                     command: message.command,
                     args: message.args,
                     launchCwd: message.launchCwd,
+                    endpoint: message.endpoint,
                     installDirectory: message.installDirectory,
                     packageSpec: message.packageSpec,
                   },
@@ -1407,6 +1426,7 @@ export function activate(context: vscode.ExtensionContext) {
                 command: message.command,
                 args: message.args,
                 launchCwd: message.launchCwd,
+                endpoint: message.endpoint,
                 installDirectory: message.installDirectory,
                 packageSpec: message.packageSpec,
               };
@@ -1464,6 +1484,7 @@ export function activate(context: vscode.ExtensionContext) {
                 ),
                 args,
                 launchCwd: message.launchCwd,
+                endpoint: message.endpoint,
                 installDirectory: installed.installDirectory,
                 packageSpec: installed.packageSpec,
               };

@@ -90,6 +90,22 @@ describe('DeepSeek Harness target state', () => {
     expect(next.targets).toHaveLength(1);
   });
 
+  it('preserves a configured running ACP endpoint', () => {
+    expect(normalizeDshTarget({ ...base, endpoint: 'ws://127.0.0.1:4318' })).toMatchObject({
+      endpoint: 'ws://127.0.0.1:4318',
+    });
+  });
+
+  it('rejects an endpoint that is not a WebSocket URL', () => {
+    expect(() => normalizeDshTarget({ ...base, endpoint: 'http://127.0.0.1:4318' }))
+      .toThrow('DSH endpoint must use ws:// or wss://');
+  });
+
+  it('clears an existing endpoint when the settings field is emptied', () => {
+    const existing = normalizeDshTarget({ ...base, id: 'dsh-existing', endpoint: 'ws://127.0.0.1:4318' });
+    expect(normalizeDshTarget({ ...base, id: existing.id, endpoint: '' }, existing).endpoint).toBeUndefined();
+  });
+
   it('uses the official ACP profile when args are omitted', () => {
     expect(normalizeDshTarget({ ...base, args: undefined }).args).toEqual(['--profile', 'acp']);
   });

@@ -28,11 +28,11 @@ export type SettingsMessage =
   | { type: 'createAcpTarget'; name?: string; endpoint: string; authToken?: string }
   | { type: 'updateAcpTarget'; targetId: string; name?: string; endpoint: string; authToken?: string }
   | { type: 'deleteAcpTarget'; targetId: string }
-  | { type: 'createDshTarget'; name?: string; command: string; args: string[]; launchCwd: string; installDirectory?: string; packageSpec?: string }
-  | { type: 'updateDshTarget'; targetId: string; name?: string; command: string; args: string[]; launchCwd: string; installDirectory?: string; packageSpec?: string }
+  | { type: 'createDshTarget'; name?: string; command: string; args: string[]; launchCwd: string; endpoint?: string; installDirectory?: string; packageSpec?: string }
+  | { type: 'updateDshTarget'; targetId: string; name?: string; command: string; args: string[]; launchCwd: string; endpoint?: string; installDirectory?: string; packageSpec?: string }
   | { type: 'deleteDshTarget'; targetId: string }
-  | { type: 'installDsh'; targetId?: string; name?: string; command: string; args: string[]; launchCwd: string; installDirectory: string; packageSpec?: string }
-  | { type: 'updateDsh'; targetId?: string; name?: string; command: string; args: string[]; launchCwd: string; installDirectory: string; packageSpec?: string }
+  | { type: 'installDsh'; targetId?: string; name?: string; command: string; args: string[]; launchCwd: string; endpoint?: string; installDirectory: string; packageSpec?: string }
+  | { type: 'updateDsh'; targetId?: string; name?: string; command: string; args: string[]; launchCwd: string; endpoint?: string; installDirectory: string; packageSpec?: string }
   | { type: 'connectProvider'; providerId: string; apiKey: string; baseURL?: string; displayName?: string }
   | { type: 'disconnectProvider'; configKey: string }
   | { type: 'updateProvider'; configKey: string; apiKey: string; baseURL?: string };
@@ -97,6 +97,7 @@ export interface SettingsData {
     command: string;
     args: string[];
     launchCwd: string;
+    endpoint?: string;
     installDirectory: string;
     packageSpec: string;
   };
@@ -765,6 +766,11 @@ export class SettingsPanel {
             <div class="setting-control"><input type="text" id="dsh-command" placeholder="dsh"></div>
           </div>
           <div class="setting-item">
+            <div class="setting-label">Running DSH ACP endpoint</div>
+            <div class="setting-desc">Optional ws:// or wss:// endpoint for a DSH ACP server that is already running. This connects directly and does not require a local DSH plugin. A plain dsh --profile acp process uses stdio and cannot be attached after it was started elsewhere.</div>
+            <div class="setting-control"><input type="text" id="dsh-endpoint" placeholder="ws://127.0.0.1:4318"></div>
+          </div>
+          <div class="setting-item">
             <div class="setting-label">Arguments</div>
             <div class="setting-desc">One argument per line. The official ACP profile is --profile acp.</div>
             <div class="setting-control"><textarea id="dsh-args" rows="3" placeholder="--profile&#10;acp"></textarea></div>
@@ -1100,6 +1106,7 @@ export class SettingsPanel {
       document.getElementById('btn-dsh-delete').classList.toggle('hidden', !targetId);
       document.getElementById('dsh-target-name').value = value.name || 'DeepSeek Harness';
       document.getElementById('dsh-command').value = value.command || 'dsh';
+      document.getElementById('dsh-endpoint').value = value.endpoint || '';
       document.getElementById('dsh-args').value = (value.args || ['--profile', 'acp']).join('\\n');
       document.getElementById('dsh-launch-cwd').value = value.launchCwd || '';
       document.getElementById('dsh-install-directory').value = value.installDirectory || '';
@@ -1122,6 +1129,7 @@ export class SettingsPanel {
         targetId: document.getElementById('dsh-target-id').value.trim() || undefined,
         name: document.getElementById('dsh-target-name').value.trim() || undefined,
         command: document.getElementById('dsh-command').value.trim(),
+        endpoint: document.getElementById('dsh-endpoint').value.trim(),
         args: document.getElementById('dsh-args').value.split(/\\r?\\n/).map(value => value.trim()).filter(Boolean),
         launchCwd: document.getElementById('dsh-launch-cwd').value.trim(),
         installDirectory: document.getElementById('dsh-install-directory').value.trim(),
@@ -1142,6 +1150,7 @@ export class SettingsPanel {
         command: value.command,
         args: value.args,
         launchCwd: value.launchCwd,
+        endpoint: value.endpoint,
         installDirectory: value.installDirectory || undefined,
         packageSpec: value.packageSpec,
       });
@@ -1169,6 +1178,7 @@ export class SettingsPanel {
         command: value.command || 'dsh',
         args: value.args,
         launchCwd: value.launchCwd,
+        endpoint: value.endpoint,
         installDirectory: value.installDirectory,
         packageSpec: value.packageSpec,
       });
@@ -1227,7 +1237,7 @@ export class SettingsPanel {
     function renderDshSettings(data) {
       if (!data?.dshTarget) return;
       const activeElement = document.activeElement;
-      const dshIds = ['dsh-target-id', 'dsh-target-name', 'dsh-command', 'dsh-args', 'dsh-launch-cwd', 'dsh-install-directory', 'dsh-package-spec'];
+      const dshIds = ['dsh-target-id', 'dsh-target-name', 'dsh-command', 'dsh-endpoint', 'dsh-args', 'dsh-launch-cwd', 'dsh-install-directory', 'dsh-package-spec'];
       if (activeElement && dshIds.includes(activeElement.id)) return;
       fillDshSettings(data.dshTarget);
     }

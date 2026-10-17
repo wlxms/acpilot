@@ -10,6 +10,8 @@ export interface DshTarget {
   command: string;
   args: string[];
   launchCwd: string;
+  /** Optional remote ACP endpoint for a DSH instance already running elsewhere. */
+  endpoint?: string;
   installDirectory?: string;
   packageSpec: string;
   createdAt: string;
@@ -22,6 +24,7 @@ export interface DshTargetInput {
   command: string;
   args?: readonly string[];
   launchCwd: string;
+  endpoint?: string;
   installDirectory?: string;
   packageSpec?: string;
 }
@@ -38,6 +41,12 @@ export function normalizeDshTarget(
   if (!isAbsolute(launchCwd)) {
     throw new Error('DSH launch directory must be absolute');
   }
+  const endpoint = input.endpoint === undefined
+    ? existing?.endpoint
+    : input.endpoint.trim() || undefined;
+  if (endpoint !== undefined && !isDshEndpoint(endpoint)) {
+    throw new Error('DSH endpoint must use ws:// or wss://');
+  }
   const installDirectory = input.installDirectory?.trim() || existing?.installDirectory;
   if (installDirectory !== undefined && !isAbsolute(installDirectory)) {
     throw new Error('DSH install directory must be absolute');
@@ -52,6 +61,7 @@ export function normalizeDshTarget(
     command,
     args: [...(input.args ?? existing?.args ?? DEFAULT_DSH_ARGS)],
     launchCwd,
+    ...(endpoint !== undefined ? { endpoint } : {}),
     ...(installDirectory !== undefined ? { installDirectory } : {}),
     packageSpec,
     createdAt: existing?.createdAt ?? now,
@@ -71,7 +81,18 @@ export function isDshTarget(value: unknown): value is DshTarget {
     && typeof candidate.packageSpec === 'string'
     && typeof candidate.createdAt === 'string'
     && typeof candidate.updatedAt === 'string'
+    && (candidate.endpoint === undefined
+      || (typeof candidate.endpoint === 'string' && isDshEndpoint(candidate.endpoint)))
     && (candidate.installDirectory === undefined || typeof candidate.installDirectory === 'string');
+}
+
+export function isDshEndpoint(value: string): boolean {
+  try {
+    const parsed = new URL(value.trim());
+    return parsed.protocol === 'ws:' || parsed.protocol === 'wss:';
+  } catch {
+    return false;
+  }
 }
 
 function createDshTargetId(): string {

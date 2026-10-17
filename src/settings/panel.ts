@@ -103,6 +103,11 @@ export class SettingsPanel {
   public static currentPanel: SettingsPanel | undefined;
   private readonly panel: vscode.WebviewPanel;
   private disposables: vscode.Disposable[] = [];
+  private webviewReady = false;
+  private pendingData: SettingsData | undefined;
+  private dataPostInFlight = false;
+  private pendingRequests: SettingsMessage[] = [];
+  private changeHandler: ((message: SettingsMessage) => Promise<void>) | undefined;
 
   public static readonly viewType = 'opencodeSettings';
 
@@ -132,26 +137,53 @@ export class SettingsPanel {
     );
 
     this.panel.iconPath = new vscode.ThemeIcon('gear');
-    this.panel.webview.html = this.getHtml();
 
+    // Register the message listener before assigning HTML. The webview script
+    // sends its ready handshake during initial load, and assigning HTML first
+    // can race that message before VS Code has a receiver.
     this.panel.onDidDispose(() => { this.dispose(); }, null, this.disposables);
     this.panel.webview.onDidReceiveMessage(
       (message: SettingsMessage) => { this.handleMessage(message); },
       null,
       this.disposables,
     );
+    this.panel.webview.html = this.getHtml();
   }
 
   public updateData(data: SettingsData): void {
-    void this.panel.webview.postMessage({ type: 'updateData', data });
+    this.pendingData = data;
+    this.flushPendingData();
   }
 
-  public onDidRequestChange: ((message: SettingsMessage) => Promise<void>) | undefined;
+  public set onDidRequestChange(
+    handler: ((message: SettingsMessage) => Promise<void>) | undefined,
+  ) {
+    this.changeHandler = handler;
+    if (!handler) {
+      return;
+    }
+
+    const pending = this.pendingRequests.splice(0);
+    for (const message of pending) {
+      this.handleMessage(message);
+    }
+  }
+
   private messageQueue: Promise<void> = Promise.resolve();
 
   private handleMessage(message: SettingsMessage): void {
+    if (message.type === 'ready') {
+      this.webviewReady = true;
+      this.flushPendingData();
+    }
+
+    if (!this.changeHandler) {
+      this.pendingRequests.push(message);
+      return;
+    }
+
     this.messageQueue = this.messageQueue
-      .then(async () => this.onDidRequestChange?.(message))
+      .then(async () => this.changeHandler?.(message))
       .then(() => undefined, (error: unknown) => {
         void this.panel.webview.postMessage({
           type: 'error',
@@ -160,8 +192,36 @@ export class SettingsPanel {
       });
   }
 
+  private flushPendingData(): void {
+    if (!this.webviewReady || this.dataPostInFlight || !this.pendingData) {
+      return;
+    }
+
+    const data = this.pendingData;
+    this.pendingData = undefined;
+    this.dataPostInFlight = true;
+
+    void Promise.resolve(this.panel.webview.postMessage({ type: 'updateData', data }))
+      .then((accepted) => {
+        if (!accepted && !this.pendingData) {
+          this.pendingData = data;
+        }
+      }, () => {
+        if (!this.pendingData) {
+          this.pendingData = data;
+        }
+      })
+      .finally(() => {
+        this.dataPostInFlight = false;
+        this.flushPendingData();
+      });
+  }
+
   private dispose(): void {
     SettingsPanel.currentPanel = undefined;
+    this.pendingData = undefined;
+    this.pendingRequests = [];
+    this.changeHandler = undefined;
     this.panel.dispose();
     for (const d of this.disposables) {
       d.dispose();
@@ -1019,7 +1079,7 @@ export class SettingsPanel {
       document.getElementById('btn-dsh-delete').classList.toggle('hidden', !targetId);
       document.getElementById('dsh-target-name').value = value.name || 'DeepSeek Harness';
       document.getElementById('dsh-command').value = value.command || 'dsh';
-      document.getElementById('dsh-args').value = (value.args || ['--profile', 'acp']).join('\n');
+      document.getElementById('dsh-args').value = (value.args || ['--profile', 'acp']).join('\\n');
       document.getElementById('dsh-launch-cwd').value = value.launchCwd || '';
       document.getElementById('dsh-install-directory').value = value.installDirectory || '';
       document.getElementById('dsh-package-spec').value = value.packageSpec || '@deepseek-ai/dsh@latest';
@@ -1041,7 +1101,7 @@ export class SettingsPanel {
         targetId: document.getElementById('dsh-target-id').value.trim() || undefined,
         name: document.getElementById('dsh-target-name').value.trim() || undefined,
         command: document.getElementById('dsh-command').value.trim(),
-        args: document.getElementById('dsh-args').value.split(/\r?\n/).map(value => value.trim()).filter(Boolean),
+        args: document.getElementById('dsh-args').value.split(/\\r?\\n/).map(value => value.trim()).filter(Boolean),
         launchCwd: document.getElementById('dsh-launch-cwd').value.trim(),
         installDirectory: document.getElementById('dsh-install-directory').value.trim(),
         packageSpec: document.getElementById('dsh-package-spec').value.trim() || undefined,

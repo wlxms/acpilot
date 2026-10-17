@@ -34,6 +34,7 @@ import {
   SettingsPanel,
   type SettingsMessage,
   type SettingsData,
+  type DirectoryField,
   type GlobalSettingItem,
   type BackendTargetItem,
 } from "./settings/panel";
@@ -67,6 +68,32 @@ import type { DshTargetInput } from "./backends/dsh/target";
 import { startRuntimeTestControlServer } from "./test-control/server";
 import { createRuntimeTestApi } from "./test-control/runtime-api";
 import { beginBackendRuntimeTransition } from "./runtime/backend-transition";
+
+export async function chooseDshDirectory(
+  field: DirectoryField,
+  currentValue: string,
+  workspacePath: string | undefined,
+  showOpenDialog: (options: vscode.OpenDialogOptions) => Thenable<readonly vscode.Uri[] | undefined> = (options) =>
+    vscode.window.showOpenDialog(options),
+): Promise<{ field: DirectoryField; value: string } | undefined> {
+  const candidate = currentValue.trim() || workspacePath?.trim();
+  const options: vscode.OpenDialogOptions = {
+    canSelectFiles: false,
+    canSelectFolders: true,
+    canSelectMany: false,
+    openLabel: "Select folder",
+  };
+  if (candidate) {
+    try {
+      options.defaultUri = vscode.Uri.file(candidate);
+    } catch {
+      // Ignore malformed input and let VS Code open the default location.
+    }
+  }
+  const selected = await showOpenDialog(options);
+  const uri = selected?.[0];
+  return uri ? { field, value: uri.fsPath } : undefined;
+}
 
 const KNOWN_PROVIDERS = [
   {
@@ -1106,6 +1133,20 @@ export function activate(context: vscode.ExtensionContext) {
                 context,
                 selectedTargetId,
               );
+              break;
+            }
+            case "selectDirectory": {
+              const selection = await chooseDshDirectory(
+                message.field,
+                message.currentValue,
+                workspacePath,
+              );
+              if (selection) {
+                await panel.postMessage({
+                  type: "directorySelected",
+                  ...selection,
+                });
+              }
               break;
             }
             case "setAgent": {

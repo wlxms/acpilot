@@ -61,7 +61,19 @@ describe('DeepSeek Harness target state', () => {
     const target: DshTarget = normalizeDshTarget({ ...base, id: 'dsh-one' });
     await saveDshTargetState(ctx, { activeTargetId: 'missing', targets: [target] });
 
-    expect(loadDshTargetState(ctx)).toEqual({ activeTargetId: undefined, targets: [target] });
+    const loaded = loadDshTargetState(ctx);
+    expect(loaded.activeTargetId).toBeUndefined();
+    expect(loaded.targets).toHaveLength(1);
+    expect(loaded.targets[0]).toMatchObject({
+      id: target.id,
+      name: target.name,
+      command: target.command,
+      args: target.args,
+      launchCwd: target.launchCwd,
+      packageSpec: target.packageSpec,
+    });
+    expect(loaded.targets[0].createdAt).toEqual(expect.any(String));
+    expect(loaded.targets[0].updatedAt).toEqual(expect.any(String));
     expect(getActiveDshTarget(ctx)).toBeUndefined();
   });
 
@@ -76,5 +88,9 @@ describe('DeepSeek Harness target state', () => {
     const next = await removeDshTarget(ctx, second.id);
     expect(next.activeTargetId).toBe(first.id);
     expect(next.targets).toHaveLength(1);
+  });
+
+  it('uses the official ACP profile when args are omitted', () => {
+    expect(normalizeDshTarget({ ...base, args: undefined }).args).toEqual(['--profile', 'acp']);
   });
 });

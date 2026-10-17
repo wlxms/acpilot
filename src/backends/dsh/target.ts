@@ -50,7 +50,7 @@ export function normalizeDshTarget(
     id,
     name,
     command,
-    args: [...(input.args ?? existing?.args ?? [])],
+    args: [...(input.args ?? existing?.args ?? DEFAULT_DSH_ARGS)],
     launchCwd,
     ...(installDirectory !== undefined ? { installDirectory } : {}),
     packageSpec,

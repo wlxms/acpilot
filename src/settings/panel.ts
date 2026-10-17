@@ -2,6 +2,8 @@ import * as vscode from 'vscode';
 import type { BackendSettingsDescriptor } from '../backend/types';
 import type { PermissionMode } from '../backend/types';
 
+export type DirectoryField = 'launchCwd' | 'installDirectory';
+
 export interface GlobalSettingItem {
   key: string;
   label: string;
@@ -14,6 +16,7 @@ export interface GlobalSettingItem {
 export type SettingsMessage =
   | { type: 'ready' }
   | { type: 'refreshData' }
+  | { type: 'selectDirectory'; field: DirectoryField; currentValue: string }
   | { type: 'setAgent'; agentId: string }
   | { type: 'setPermissionMode'; permissionMode: PermissionMode }
   | { type: 'setModel'; providerID: string; modelID: string }
@@ -153,6 +156,10 @@ export class SettingsPanel {
   public updateData(data: SettingsData): void {
     this.pendingData = data;
     this.flushPendingData();
+  }
+
+  public postMessage(message: unknown): Thenable<boolean> {
+    return this.panel.webview.postMessage(message);
   }
 
   public set onDidRequestChange(
@@ -385,6 +392,9 @@ export class SettingsPanel {
       margin-top: 5px;
     }
     .setting-item.is-bool .setting-bool-row { margin-top: 0; }
+    .setting-control-with-button { gap: 8px; }
+    .setting-control-with-button input { flex: 1; min-width: 0; width: auto; }
+    .setting-control-with-button button { flex-shrink: 0; }
     /* Native VS Code toggle switch */
     .setting-toggle {
       position: relative;
@@ -762,12 +772,12 @@ export class SettingsPanel {
           <div class="setting-item">
             <div class="setting-label">DSH launch directory</div>
             <div class="setting-desc">Working directory used to start your DSH server</div>
-            <div class="setting-control"><input type="text" id="dsh-launch-cwd" placeholder="C:\\path\\to\\your\\dsh"></div>
+            <div class="setting-control setting-control-with-button"><input type="text" id="dsh-launch-cwd" placeholder="C:\\path\\to\\your\\dsh"><button type="button" id="btn-dsh-launch-cwd-browse" class="button-secondary">Select folder</button></div>
           </div>
           <div class="setting-item">
             <div class="setting-label">Install directory</div>
             <div class="setting-desc">Directory used by the Install and Update buttons</div>
-            <div class="setting-control"><input type="text" id="dsh-install-directory" placeholder="C:\\path\\to\\acpilot-dsh"></div>
+            <div class="setting-control setting-control-with-button"><input type="text" id="dsh-install-directory" placeholder="C:\\path\\to\\acpilot-dsh"><button type="button" id="btn-dsh-install-directory-browse" class="button-secondary">Select folder</button></div>
           </div>
           <div class="setting-item">
             <div class="setting-label">Package spec</div>
@@ -939,6 +949,8 @@ export class SettingsPanel {
     document.getElementById('btn-dsh-delete').addEventListener('click', deleteDshSettings);
     document.getElementById('btn-dsh-install').addEventListener('click', () => installDshFromSettings('installDsh'));
     document.getElementById('btn-dsh-update').addEventListener('click', () => installDshFromSettings('updateDsh'));
+    document.getElementById('btn-dsh-launch-cwd-browse').addEventListener('click', () => requestDirectorySelection('launchCwd', 'dsh-launch-cwd'));
+    document.getElementById('btn-dsh-install-directory-browse').addEventListener('click', () => requestDirectorySelection('installDirectory', 'dsh-install-directory'));
     document.getElementById('btn-cancel-acp-target').addEventListener('click', () => {
       closeAcpTargetModal();
     });
@@ -988,6 +1000,10 @@ export class SettingsPanel {
         renderData(msg.data);
         renderProviders();
         renderGlobalSettings(msg.data.globalSettings);
+      } else if (msg.type === 'directorySelected') {
+        const inputId = msg.field === 'launchCwd' ? 'dsh-launch-cwd' : msg.field === 'installDirectory' ? 'dsh-install-directory' : undefined;
+        const input = inputId ? document.getElementById(inputId) : undefined;
+        if (input && typeof msg.value === 'string') input.value = msg.value;
       } else if (msg.type === 'error') {
         setDshStatus(msg.message || 'Request failed');
       }
@@ -1070,6 +1086,11 @@ export class SettingsPanel {
       vscode.postMessage({ type: 'setBackendTarget', targetId });
       document.getElementById('backend-chooser-modal').classList.add('hidden');
       showNav(targetId.startsWith('dsh:') || targetId === 'builtin:dsh' ? 'dsh' : targetId.startsWith('builtin:opencode') ? 'opencode' : 'global');
+    }
+
+    function requestDirectorySelection(field, inputId) {
+      const input = document.getElementById(inputId);
+      vscode.postMessage({ type: 'selectDirectory', field, currentValue: input?.value || '' });
     }
 
     function fillDshSettings(target) {

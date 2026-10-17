@@ -54,3 +54,12 @@ describe('SettingsPanel webview HTML', () => {
     }
   });
 });
+
+describe('SettingsPanel DSH directory controls', () => {
+  it('provides a directory chooser for every DSH directory field', () => {
+    expect(panelSource).toContain('id="btn-dsh-launch-cwd-browse"');
+    expect(panelSource).toContain('id="btn-dsh-install-directory-browse"');
+    expect(panelSource).toContain("type: 'selectDirectory'");
+    expect(panelSource).toContain("msg.type === 'directorySelected'");
+  });
+});

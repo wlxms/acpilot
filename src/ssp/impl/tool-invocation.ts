@@ -236,7 +236,7 @@ export class ToolInvocationSSP extends SerializableStreamPart<
       }
 
       // Contract C4: toolSpecificData mapping
-      const specific = this.buildToolSpecificData(toolName, input, output, title);
+      const specific = this.buildToolSpecificData(toolName, input, output, title, state.metadata);
       if (specific) {
         part.toolSpecificData = specific as any;
       }
@@ -534,6 +534,7 @@ export class ToolInvocationSSP extends SerializableStreamPart<
     input: Record<string, unknown>,
     output: string,
     title: string,
+    metadata?: Record<string, unknown>,
   ): ChatTerminalToolInvocationData | ChatSimpleToolResultData | ChatToolResourcesInvocationData | (ChatSubagentToolInvocationData & { kind?: 'subagent' }) | ChatTodoToolInvocationData | undefined {
     const formatInput = (data: Record<string, unknown>, fallbackTitle: string): string => {
       const keys = Object.keys(data);
@@ -549,6 +550,31 @@ export class ToolInvocationSSP extends SerializableStreamPart<
 
     const truncate = (s: string, max: number): string =>
       s.length > max ? s.substring(0, max) + '...' : s;
+
+    const dshPresentation = getDshPresentation(metadata);
+    if (dshPresentation?.card === 'terminal') {
+      const command = (input.command as string)
+        ?? (input.script as string)
+        ?? (dshPresentation.title as string | undefined)
+        ?? title;
+      const exitCode = typeof dshPresentation.exitCode === 'number'
+        ? dshPresentation.exitCode
+        : (() => {
+            if (!stateOutputHasExitCode(output)) {return undefined;}
+            const match = output.match(/exitCode:\s*(-?\d+)/);
+            return match ? parseInt(match[1], 10) : undefined;
+          })();
+      return {
+        commandLine: { original: command },
+        language: (input.language as string) ?? (dshPresentation.language as string | undefined) ?? dshTerminalLanguage(metadata?.dshToolName) ?? 'bash',
+        output: output ? { text: truncate(output, 2000) } : undefined,
+        state: exitCode !== undefined ? { exitCode } : undefined,
+      } satisfies ChatTerminalToolInvocationData;
+    }
+    if (dshPresentation?.card === 'search' || dshPresentation?.card === 'read') {
+      const values = buildDshResourceValues(dshPresentation);
+      if (values.length > 0) {return { values } satisfies ChatToolResourcesInvocationData;}
+    }
 
     // Whether this tool runs nested inside a subagent (child tool).
     // Drives the todo-rendering distinction: root → native todo widget,
@@ -724,6 +750,70 @@ export class ToolInvocationSSP extends SerializableStreamPart<
 // ---------------------------------------------------------------------------
 // Module-level helpers (trunk L2132-2147)
 // ---------------------------------------------------------------------------
+
+function buildDshResourceValues(
+  presentation: Record<string, unknown>,
+): Array<vscode.Uri | vscode.Location> {
+  const values: Array<vscode.Uri | vscode.Location> = [];
+  const seen = new Set<string>();
+  const addPath = (value: unknown, line?: unknown): void => {
+    if (typeof value !== 'string' || !value) {return;}
+    const lineNumber = typeof line === 'number' && line > 0 ? line : undefined;
+    const key = String(value) + ':' + String(lineNumber ?? 0);
+    if (seen.has(key)) {return;}
+    try {
+      const uri = vscode.Uri.file(value);
+      values.push(lineNumber !== undefined
+        ? new vscode.Location(uri, new vscode.Position(lineNumber - 1, 0))
+        : uri);
+      seen.add(key);
+    } catch { /* skip invalid path */ }
+  };
+
+  if (presentation.card === 'read') {
+    addPath(presentation.path, presentation.offset);
+  }
+  if (Array.isArray(presentation.paths)) {
+    for (const value of presentation.paths) {addPath(value);}
+  }
+  if (Array.isArray(presentation.files)) {
+    for (const file of presentation.files) {
+      if (!file || typeof file !== 'object' || Array.isArray(file)) {continue;}
+      const record = file as Record<string, unknown>;
+      addPath(record.path);
+      if (Array.isArray(record.matches)) {
+        for (const match of record.matches) {
+          if (!match || typeof match !== 'object' || Array.isArray(match)) {continue;}
+          addPath(record.path, (match as Record<string, unknown>).lineNumber);
+        }
+      }
+    }
+  }
+  if (Array.isArray(presentation.locations)) {
+    for (const location of presentation.locations) {
+      if (!location || typeof location !== 'object' || Array.isArray(location)) {continue;}
+      const record = location as Record<string, unknown>;
+      addPath(record.path, record.line);
+    }
+  }
+  return values;
+}
+
+function dshTerminalLanguage(toolName: unknown): string | undefined {
+  if (typeof toolName !== 'string') {return undefined;}
+  const value = toolName.toLowerCase();
+  if (value === 'pwsh' || value === 'powershell' || value.includes('powershell')) {return 'powershell';}
+  if (value === 'cmd' || value.includes('cmd.exe')) {return 'cmd';}
+  if (value === 'zsh' || value === 'fish' || value === 'sh' || value === 'bash') {return value;}
+  return undefined;
+}
+
+function getDshPresentation(metadata?: Record<string, unknown>): Record<string, unknown> | undefined {
+  const value = metadata?.dshPresentation;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {return undefined;}
+  return value as Record<string, unknown>;
+}
+
 
 function formatSubagentInput(input: Record<string, unknown>): string {
   const entries = Object.entries(input);

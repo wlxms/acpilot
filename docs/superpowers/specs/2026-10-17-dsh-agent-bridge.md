@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-17
 
-**Goal:** Add a first-class DeepSeek Harness Agent to ACPilot while always launching the user's own DSH command and startup directory, with explicit DSH installation from Settings and an optional bridge extension point.
+**Goal:** Add a first-class DeepSeek Harness Agent to ACPilot while always launching the user's own DSH command and startup directory, with explicit DSH installation from Settings and an optional tool-presentation bridge.
 
 ## User-visible behavior
 
@@ -19,9 +19,9 @@ After a successful DSH install, ACPilot can populate the target command with the
 
 ## Architecture
 
-ACPilot owns a `dsh` backend that reuses the existing ACP session adapter. The backend creates a local ACP process using the target's command, args, and launchCwd. The optional DSH bridge plugin runs inside the user's DSH process and exposes a small future extension point. It emits a nonce-bound readiness marker on stderr when enabled; stdout remains exclusively ACP JSON-RPC.
+ACPilot owns a `dsh` backend that reuses the existing ACP session adapter. The backend creates a local ACP process using the target's command, args, and launchCwd. The optional DSH bridge plugin runs inside the user's DSH process, observes the DSH tool lifecycle, and forwards the tool's structured presentation to ACPilot. It emits a nonce-bound readiness marker and versioned tool messages on stderr when enabled; stdout remains exclusively ACP JSON-RPC.
 
-The ACPilot process continues to accept a normal DSH ACP profile without requiring the bridge marker. If the optional marker appears, ACPilot recognizes its plugin and protocol identity while ordinary DSH stderr remains out-of-band. It does not inspect DSH internals, import DSH packages, or assume a package-manager command. The current data plane stays standard ACP.
+The ACPilot process continues to accept a normal DSH ACP profile without requiring the bridge. If the optional marker or tool messages appear, ACPilot recognizes the versioned bridge protocol while ordinary DSH stderr remains out-of-band. The bridge does not inspect DSH internals from ACPilot, import DSH packages, or assume a package-manager command; it consumes only the JSON-safe presentation messages emitted by the user-installed plugin. ACP streaming remains standard ACP, with the bridge supplying presentation metadata alongside it.
 
 ## Stable identifiers
 
@@ -31,6 +31,7 @@ The ACPilot process continues to accept a normal DSH ACP profile without requiri
 - Bridge plugin name: `@wlxms/acpilot-dsh-bridge`
 - Bridge protocol: `acpilot-dsh-bridge/1`
 - Readiness line prefix: `ACPILOT_DSH_BRIDGE_READY\t`
+- Tool message prefix: `ACPILOT_DSH_BRIDGE_TOOL\t`
 
 ## Bridge contract
 
@@ -42,11 +43,13 @@ The plugin emits its optional readiness payload only when `ACPILOT_DSH_BRIDGE_NO
 
 ACPilot does not require this marker for startup. When present, the marker is parsed as an optional extension signal; missing, malformed, or mismatched markers do not prevent a standard DSH ACP profile from starting. ACP stdout is not interpreted as a DSH event stream; it is parsed only by the existing ACP JSON-RPC client.
 
+When the bridge is enabled, each tool call and result is emitted as a versioned JSON line with the `ACPILOT_DSH_BRIDGE_TOOL\t` prefix. The bridge resolves `presentCall` and `presentResult` against the executing DSH Agent scope, so agent-local tool overrides keep their own presentation. The bridge side channel is available for ACPilot-managed local processes; an already-running or remote ACP endpoint remains compatible through standard ACP and does not expose the endpoint process's stderr to ACPilot.
+
 ## Installation rules
 
 The DSH installer executes the user's local npm command (`npm.cmd` on Windows, `npm` elsewhere) with an absolute `--prefix` directory. No install action runs on activation or backend start; Install and Update are explicit Settings actions. A first-time install can fill the target command with the discovered local launcher, while an existing target keeps its configured command.
 
-The optional bridge package does not modify DSH profile files. Users can install and enable it in their own DSH profile when they need the future extension point.
+The optional bridge package does not modify DSH source files or choose a runtime. Users install and enable it in their own DSH profile when they want structured terminal, read, search, diff, custom-tool, or External Edit rendering.
 
 ## Error behavior
 

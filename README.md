@@ -70,7 +70,7 @@ task / subagent      → 点击展开子代理完整对话
 
 安装 DSH 后，首次安装会自动填入安装目录下的 launcher；已有 target 的更新操作会保留用户设置的 command，因此可以继续使用自己的 DSH server。DSH 进程启动目录和 ACP `session/new` 使用的 VS Code workspace 目录分别配置，互不覆盖。
 
-ACPilot 也附带了可选的 `dsh-bridge` 插件扩展点。普通 DSH ACP profile 不需要安装 bridge；未来需要传递 DSH 专用消息时，可以在用户自己的 DSH profile 中启用它。
+ACPilot 也附带了可选的 `dsh-bridge` 插件。普通 DSH ACP profile 不需要安装 bridge；安装后，DSH 工具可以通过 `presentCall` / `presentResult` 把终端、文件读取、搜索、diff 和 External Edit 信息交给 VS Code 渲染。插件安装到用户自己的 DSH profile，不会替换用户的 DSH 命令或启动目录。
 
 ## 开发
 

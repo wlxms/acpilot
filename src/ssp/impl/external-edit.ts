@@ -108,10 +108,7 @@ export class ExternalEditSSP extends SerializableStreamPart<
     if (!stream.externalEdit) {return;}
     this.editStarted = true;
 
-    const uris = (this.payload.uris ?? []) as vscode.Uri[];
-    if (uris.length === 0 && this.payload.uri) {
-      uris.push(buildFileUri(this.payload.uri, this.directory));
-    }
+    const uris = this.resolveUris();
     if (uris.length === 0) {return;}
 
     const toolCallId = this.payload.toolCallId;
@@ -154,10 +151,7 @@ export class ExternalEditSSP extends SerializableStreamPart<
               this.meta.editId = this._undoStopId;
             }
             // Capture after-snapshots
-            const uris = (this.payload.uris ?? []) as vscode.Uri[];
-            if (this.payload.uri && uris.length === 0) {
-              uris.push(buildFileUri(this.payload.uri, this.directory));
-            }
+            const uris = this.resolveUris();
             for (let i = 0; i < uris.length; i++) {
               const after = captureSnapshot(uris[i], this.payload.toolCallId, 'after', i, this.meta.turnIndex);
               after.undoStopId = undoStopId || undefined;
@@ -172,6 +166,24 @@ export class ExternalEditSSP extends SerializableStreamPart<
         );
       }
     }
+  }
+
+  private resolveUris(): vscode.Uri[] {
+    const values = Array.isArray(this.payload.uris) ? this.payload.uris : [];
+    const uris = values.flatMap(value => {
+      if (typeof value === 'string' && value.length > 0) {
+        return [buildFileUri(value, this.directory)];
+      }
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
+        const fsPath = (value as { fsPath?: unknown }).fsPath;
+        if (typeof fsPath === 'string' && fsPath.length > 0) {
+          return [buildFileUri(fsPath, this.directory)];
+        }
+      }
+      return [];
+    });
+    if (uris.length > 0) {return uris;}
+    return this.payload.uri ? [buildFileUri(this.payload.uri, this.directory)] : [];
   }
 
   private emitSnapshot(snapshot: FileSnapshotRecord): void {

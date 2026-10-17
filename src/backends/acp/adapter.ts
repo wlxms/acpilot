@@ -255,6 +255,16 @@ export class AcpBackend implements Backend<ActiveSessionMessage> {
     this.optionsProvider = provider;
   }
 
+  /** Specialized ACP-speaking backends may consume a stderr side channel. */
+  protected shouldObserveLocalStderr(): boolean {
+    return false;
+  }
+
+  /** Called for every non-readiness stderr line while a local process is alive. */
+  protected onLocalStderrLine(_line: string): void {
+    // Base ACP has no side channel.
+  }
+
   async start(directory?: string): Promise<BackendResult<BackendServerInfo>> {
     // A stop owns the old connection until its bounded cleanup pass finishes.
     // Waiting here gives a replacement target a clean lifecycle boundary while
@@ -316,7 +326,16 @@ export class AcpBackend implements Backend<ActiveSessionMessage> {
       let stream: Stream;
       let dispose: () => void;
       if (options.local) {
-        const spawned = spawnAcpAgent({ ...options.local, cwd: options.local.cwd ?? directory });
+        const configuredLocal = { ...options.local, cwd: options.local.cwd ?? directory };
+        if (this.shouldObserveLocalStderr() || configuredLocal.onStderrLine) {
+          const configuredOnStderrLine = configuredLocal.onStderrLine;
+          configuredLocal.stderr = 'pipe';
+          configuredLocal.onStderrLine = line => {
+            configuredOnStderrLine?.(line);
+            this.onLocalStderrLine(line);
+          };
+        }
+        const spawned = spawnAcpAgent(configuredLocal);
         try {
           if (spawned.ready) {
             await spawned.ready;

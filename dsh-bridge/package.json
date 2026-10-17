@@ -1,7 +1,7 @@
 {
   "name": "@wlxms/acpilot-dsh-bridge",
   "version": "0.1.0",
-  "description": "Optional ACPilot readiness bridge for DeepSeek Harness profiles",
+  "description": "Optional ACPilot DSH tool-presentation bridge for ACP and VS Code integrations",
   "type": "module",
   "main": "./index.mjs",
   "exports": {

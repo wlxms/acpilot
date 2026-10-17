@@ -48,8 +48,8 @@ function textFromContent(content: ContentBlock | undefined): string {
 }
 
 export class AcpPipeline implements BackendPipeline<ActiveSessionMessage> {
-  private readonly sss: BackendPipelineStream;
-  private readonly directory?: string;
+  protected readonly sss: BackendPipelineStream;
+  protected readonly directory?: string;
   protected logger: PipelineLogger = { appendLine: () => {} };
   protected readonly sessionId: string;
   private readonly permissionMode: PermissionMode;
@@ -62,7 +62,7 @@ export class AcpPipeline implements BackendPipeline<ActiveSessionMessage> {
   /** Timestamp-based IDs can collide when an agent emits several chunks in one turn. */
   private nextPartSequence = 0;
 
-  /** toolCallId → root stream key (for tool invocation update correlation). */
+  /** toolCallId → persisted stream-part id (ToolInvocationSSP uses callId as its id). */
   private readonly toolTargets = new Map<string, string>();
   /**
    * ACP tool updates may omit `status` when they only replace content/title.
@@ -82,6 +82,16 @@ export class AcpPipeline implements BackendPipeline<ActiveSessionMessage> {
     if (options.logger) {
       this.logger = options.logger;
     }
+  }
+
+  /** Specialized ACP backends may defer the generic tool card until a side channel supplies its presentation. */
+  protected shouldDeferToolCall(_update: Extract<SessionUpdate, { sessionUpdate: 'tool_call' }>): boolean {
+    return false;
+  }
+
+  /** Specialized pipelines can flush side-channel state before a turn closes. */
+  protected beforeStop(): void {
+    // Base ACP has no delayed side-channel state.
   }
 
   async resolvePermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
@@ -111,13 +121,12 @@ export class AcpPipeline implements BackendPipeline<ActiveSessionMessage> {
       ? automaticPermissionResponse(params.options)
       : undefined;
     const toolCallId = params.toolCall.toolCallId;
-    const rawPath = resolveToolCallPath(params.toolCall.rawInput)
-      ?? params.toolCall.locations?.find(location => typeof location.path === 'string')?.path;
+    const filePaths = resolveToolCallPaths(params.toolCall, this.directory);
 
     if (!this.sss) {
       return { outcome: { outcome: 'cancelled' } };
     }
-    if (!rawPath) {
+    if (filePaths.length === 0) {
       if (automaticResponse) {
         const mode = this.permissionMode === 'full-edit' ? 'full-edit' : 'non-interactive LM';
         this.logger.appendLine(`[acp-pipeline] Automatically allowed ${params.toolCall.kind ?? 'unknown'} in ${mode}`);
@@ -130,9 +139,6 @@ export class AcpPipeline implements BackendPipeline<ActiveSessionMessage> {
       return this.requestPermissionChoice(params);
     }
 
-    const filePath = path.isAbsolute(rawPath)
-      ? rawPath
-      : path.resolve(this.directory ?? '', rawPath);
     const externalEditId = `external-edit-${toolCallId}`;
     this.externalEditTargets.set(toolCallId, externalEditId);
 
@@ -154,7 +160,7 @@ export class AcpPipeline implements BackendPipeline<ActiveSessionMessage> {
           toolCallId,
           editId: '',
           status: 'pending',
-          uri: filePath,
+          ...(filePaths.length > 1 ? { uris: filePaths } : { uri: filePaths[0] }),
         },
         {
           onBaselineCaptured: () => {
@@ -173,7 +179,7 @@ export class AcpPipeline implements BackendPipeline<ActiveSessionMessage> {
         {
           sessionId: params.sessionId,
           toolCallId,
-          uri: filePath,
+          uri: filePaths[0],
         },
         externalEditId,
       ));
@@ -236,6 +242,7 @@ export class AcpPipeline implements BackendPipeline<ActiveSessionMessage> {
       for await (const message of events) {
         if (token.isCancellationRequested) {break;}
         if (message.kind === 'stop') {
+          this.beforeStop();
           log(`turn stopped: stopReason=${message.stopReason}`);
           completed = isSuccessfulStopReason(message.stopReason);
           this.handleStop(message.stopReason);
@@ -256,7 +263,7 @@ export class AcpPipeline implements BackendPipeline<ActiveSessionMessage> {
     };
   }
 
-  private handleSessionUpdate(update: SessionUpdate, eventSessionId: string | null | undefined): void {
+  protected handleSessionUpdate(update: SessionUpdate, eventSessionId: string | null | undefined): void {
     const target: SessionStreamNode = this.sss;
     switch (update.sessionUpdate) {
       case 'agent_message_chunk': {
@@ -293,9 +300,12 @@ export class AcpPipeline implements BackendPipeline<ActiveSessionMessage> {
         // tool_call_update messages keyed by toolCallId, while the persisted
         // part uses a namespaced id to avoid collisions with other SSP kinds.
         const partId = `tool-${toolCallId}`;
-        this.toolTargets.set(toolCallId, partId);
+        this.toolTargets.set(toolCallId, toolCallId);
+        if (this.shouldDeferToolCall(update)) {
+          break;
+        }
         target.push(new ToolInvocationSSP({
-          partId: `tool-${toolCallId}`,
+          partId,
           toolName,
           callId: toolCallId,
           state: {
@@ -321,12 +331,12 @@ export class AcpPipeline implements BackendPipeline<ActiveSessionMessage> {
         if (!partId) {
           // Update for an unknown tool call — create implicitly.
           const implicitPartId = `tool-${update.toolCallId}`;
-          this.toolTargets.set(update.toolCallId, implicitPartId);
+          this.toolTargets.set(update.toolCallId, update.toolCallId);
           const implicitStatus = toToolLifecycleStatus(update.status) ?? 'running';
           this.toolStatuses.set(update.toolCallId, implicitStatus);
           const output = toolOutputToText(update);
           target.push(new ToolInvocationSSP({
-            partId: `tool-${update.toolCallId}`,
+            partId: implicitPartId,
             toolName: update.title ?? 'tool',
             callId: update.toolCallId,
             state: {
@@ -406,6 +416,19 @@ export class AcpPipeline implements BackendPipeline<ActiveSessionMessage> {
       status: isSuccessfulStopReason(stopReason) ? 'completed' : 'failed',
     });
   }
+}
+
+function resolveToolCallPaths(
+  toolCall: RequestPermissionRequest['toolCall'],
+  directory?: string,
+): string[] {
+  const candidates = [
+    resolveToolCallPath(toolCall.rawInput),
+    ...(toolCall.locations ?? []).map(location => location.path),
+  ].filter((value): value is string => typeof value === 'string' && value.length > 0);
+  return [...new Set(candidates)].map(value => path.isAbsolute(value)
+    ? value
+    : path.resolve(directory ?? '', value));
 }
 
 function isReadOnlyAcpTool(kind: string | null | undefined): boolean {

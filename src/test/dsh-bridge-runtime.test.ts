@@ -9,6 +9,11 @@ interface BridgeRuntimeProbeResult {
   resultTitle?: string;
 }
 
+interface BridgePermissionProbeResult {
+  decision: { kind?: string; reason?: string };
+  callTitle?: string;
+}
+
 describe('DeepSeek Harness bridge runtime', () => {
   it('resolves presenters from the executing Agent scope', () => {
     const bridgePath = JSON.stringify(pathToFileURL(path.resolve(process.cwd(), 'dsh-bridge/index.mjs')).href);
@@ -71,5 +76,51 @@ describe('DeepSeek Harness bridge runtime', () => {
     expect(result.scopeCalls).toEqual([true, true]);
     expect(result.callTitle).toBe('agent-view');
     expect(result.resultTitle).toBe('agent-result');
+  });
+
+  it('turns an allowed diff presentation into an approval request', () => {
+    const bridgePath = JSON.stringify(pathToFileURL(path.resolve(process.cwd(), 'dsh-bridge/index.mjs')).href);
+    const script = `
+      const bridge = await import(${bridgePath});
+      const writes = [];
+      const originalWrite = process.stderr.write.bind(process.stderr);
+      process.stderr.write = (chunk) => {
+        writes.push(String(chunk));
+        return true;
+      };
+      const agent = { session: { id: 'session-1' } };
+      const handlers = {};
+      bridge.apply({
+        tools: {
+          get: () => ({
+            presentCall: () => ({ card: 'diff', title: 'Write dsh-hello.md', locations: [{ path: 'dsh-hello.md', line: 1 }] }),
+          }),
+        },
+        on: (name, handler) => { handlers[name] = handler; },
+        provide: () => undefined,
+      });
+      const decision = await handlers['tools/pre-execute']({
+        agent,
+        callId: 'call-1',
+        rootCallId: 'call-1',
+        name: 'write',
+        arguments: { path: 'dsh-hello.md', content: 'after' },
+      }, async () => ({ kind: 'allow' }));
+      process.stderr.write = originalWrite;
+      const prefix = 'ACPILOT_DSH_BRIDGE_TOOL\\t';
+      const call = writes
+        .filter((line) => line.startsWith(prefix))
+        .map((line) => JSON.parse(line.slice(prefix.length)))
+        .find((message) => message.type === 'tool_call');
+      process.stdout.write(JSON.stringify({ decision, callTitle: call?.presentation?.title }));
+    `;
+    const raw = execFileSync(process.execPath, ['--input-type=module', '-e', script], {
+      cwd: process.cwd(),
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const result = JSON.parse(raw) as BridgePermissionProbeResult;
+    expect(result.decision).toEqual({ kind: 'ask', reason: 'Write dsh-hello.md' });
+    expect(result.callTitle).toBe('Write dsh-hello.md');
   });
 });

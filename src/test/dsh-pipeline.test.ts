@@ -1,3 +1,6 @@
+import { access, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import type { ActiveSessionMessage } from '@agentclientprotocol/sdk';
 import type { BackendPipelineStream } from '../backend/backend';
@@ -7,12 +10,19 @@ function createStream() {
   const pushed: Array<{ id?: string; toJSON?: () => { payload?: Record<string, unknown> } }> = [];
   const updated: Array<{ id: string; data: Record<string, unknown> }> = [];
   const ids = new Set<string>();
+  const parts = new Map<string, { update?: (data: Record<string, unknown>) => void }>();
   const value = {
-    push: vi.fn((part: { id?: string; toJSON?: () => { payload?: Record<string, unknown> } }) => {
+    push: vi.fn((part: { id?: string; toJSON?: () => { payload?: Record<string, unknown> }; update?: (data: Record<string, unknown>) => void }) => {
       pushed.push(part);
-      if (part.id) {ids.add(part.id);}
+      if (part.id) {
+        ids.add(part.id);
+        parts.set(part.id, part);
+      }
     }),
-    update: vi.fn((id: string, data: Record<string, unknown>) => updated.push({ id, data })),
+    update: vi.fn((id: string, data: Record<string, unknown>) => {
+      updated.push({ id, data });
+      parts.get(id)?.update?.(data);
+    }),
     has: vi.fn((id: string) => ids.has(id)),
     writeMeta: vi.fn(),
     updateTitle: vi.fn(),
@@ -253,6 +263,104 @@ describe('DshPipeline', () => {
       data: { status: 'completed', error: undefined },
     }));
   });
+  it('creates ExternalEditSSP from permission after a bridge diff call', async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'acpilot-dsh-'));
+    try {
+      const filePath = path.join(directory, 'dsh-hello.md');
+      const target = createStream();
+      const pipeline = new DshPipeline({
+        sessionId: 'session-1',
+        directory,
+        stream: target.value,
+        permissionMode: 'full-edit',
+      });
+      const snapshots: Array<Record<string, unknown>> = [];
+      let external: {
+        onSnapshot?: (callback: (snapshot: Record<string, unknown>) => void) => void;
+        render(stream: { externalEdit(target: unknown, callback: () => PromiseLike<unknown>): PromiseLike<string> }): void;
+        getMetadata?: () => Record<string, unknown> | undefined;
+        whenMetadataSettled?: () => Promise<void>;
+      } | undefined;
+
+      await pipeline.run((async function* () {
+        yield sessionUpdate({
+          sessionUpdate: 'tool_call',
+          toolCallId: 'call-bridge-only-edit',
+          title: 'write',
+          status: 'in_progress',
+          rawInput: { path: 'dsh-hello.md', content: 'after' },
+        });
+        pipeline.handleBridgeMessage({
+          type: 'tool_call',
+          protocol: 1,
+          sessionId: 'session-1',
+          toolCallId: 'call-bridge-only-edit',
+          rootToolCallId: 'call-bridge-only-edit',
+          toolName: 'write',
+          rawInput: { path: 'dsh-hello.md', content: 'after' },
+          presentation: {
+            card: 'diff',
+            title: 'Write dsh-hello.md',
+            locations: [{ path: 'dsh-hello.md', line: 1 }],
+            diffs: [{ path: 'dsh-hello.md', oldText: null, newText: 'after' }],
+          },
+        });
+        await Promise.resolve();
+
+        expect(target.pushed).toHaveLength(0);
+
+        const permissionPromise = pipeline.resolvePermission({
+          sessionId: 'session-1',
+          toolCall: { toolCallId: 'call-bridge-only-edit' },
+          options: [{ optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' }],
+        } as never);
+        let permissionSettled = false;
+        void permissionPromise.then(() => { permissionSettled = true; });
+        await Promise.resolve();
+        expect(permissionSettled).toBe(false);
+        expect(target.pushed).toHaveLength(1);
+
+        external = target.pushed[0] as unknown as typeof external;
+        external?.onSnapshot?.(snapshot => snapshots.push(snapshot));
+        external?.render({
+          externalEdit: (_uris, callback) => Promise.resolve(callback()).then(() => 'undo-stop'),
+        });
+        expect(snapshots).toHaveLength(1);
+        expect(snapshots[0]).toMatchObject({ phase: 'before', missing: true });
+        await expect(permissionPromise).resolves.toEqual({
+          outcome: { outcome: 'selected', optionId: 'allow-once' },
+        });
+        expect(await access(filePath).then(() => true, () => false)).toBe(false);
+
+        await writeFile(filePath, 'after', 'utf8');
+        yield sessionUpdate({
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'call-bridge-only-edit',
+          status: 'completed',
+        });
+        pipeline.handleBridgeMessage({
+          type: 'tool_result',
+          protocol: 1,
+          sessionId: 'session-1',
+          toolCallId: 'call-bridge-only-edit',
+          rootToolCallId: 'call-bridge-only-edit',
+          toolName: 'write',
+          isError: false,
+          presentation: { card: 'diff', title: 'Write dsh-hello.md', diffs: [] },
+        });
+        await external?.whenMetadataSettled?.();
+        yield stop();
+      })(), { isCancellationRequested: false });
+
+      expect(snapshots).toHaveLength(2);
+      expect(snapshots[1]).toMatchObject({ phase: 'after', content: 'after', undoStopId: 'undo-stop' });
+      expect(external?.getMetadata?.()).toEqual({ undoStopId: 'undo-stop' });
+      expect(target.pushed.some(part => (part as unknown as { kind?: string }).kind === 'toolInvocation')).toBe(false);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it('does not create a generic tool card when the bridge call follows the ACP update', async () => {
     const target = createStream();
     const pipeline = new DshPipeline({

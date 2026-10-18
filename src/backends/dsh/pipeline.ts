@@ -250,8 +250,35 @@ export class DshPipeline extends AcpPipeline {
         status: update.status === 'failed' ? 'error' : 'completed',
         error: update.status === 'failed' ? dshToolOutputToText(update) : undefined,
       });
+    } else {
+      const bridgeCall = this.bridgeCalls.get(update.toolCallId);
+      if (bridgeCall && !this.sss.has(update.toolCallId)) {
+        const presentation = bridgeCall.presentation;
+        const output = dshToolOutputToText(update);
+        this.sss.push(new ToolInvocationSSP({
+          partId: update.toolCallId,
+          toolName: displayToolName(bridgeCall.toolName, presentation),
+          callId: update.toolCallId,
+          state: {
+            status: update.status === 'failed' ? 'error' : 'completed',
+            input: presentationInput(presentation, bridgeCall.rawInput),
+            title: presentationTitle(presentation) ?? bridgeCall.toolName,
+            originalToolName: bridgeCall.toolName,
+            output,
+            error: update.status === 'failed' ? output : undefined,
+            metadata: presentationMetadata(bridgeCall.toolName, presentation),
+          },
+          sessionId: bridgeCall.sessionId,
+        }));
+      }
     }
     this.deferredDiffToolCalls.delete(update.toolCallId);
+
+    // A bridge result may have arrived before the ACP terminal update. Apply it
+    // after the fallback card is created, or update ExternalEditSSP when the
+    // permission path already owns the call.
+    const result = this.bridgeResults.get(update.toolCallId);
+    if (result) {this.applyBridgeResult(result);}
   }
 
   private applyBridgeCall(message: DshBridgeToolCallMessage): void {
@@ -291,8 +318,8 @@ export class DshPipeline extends AcpPipeline {
 
     const partId = message.toolCallId;
     // A diff is represented by ExternalEditSSP when permission gating is
-    // active. Do not create a second ordinary tool card if the ACP update was
-    // intentionally deferred and the external edit is the only visible part.
+    // active. Before the ACP terminal update arrives, keep the deferred call
+    // hidden so a later permission request cannot create a duplicate card.
     if (presentation?.card === 'diff' && !this.sss.has(partId)) {return;}
     if (this.sss.has(partId)) {
       this.sss.update(partId, {

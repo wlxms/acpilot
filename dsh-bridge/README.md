@@ -10,6 +10,12 @@ The official DSH `acp` profile remains the owner of stdout and ACP JSON-RPC. The
 - custom tool titles, categories, inputs, and outputs;
 - diff presentations and the `ExternalEditSSP` baseline, after snapshot, and undo metadata flow.
 
+Diff presentations use DSH's permission lifecycle. After downstream `tools/pre-execute`
+listeners allow the call, the bridge returns an `ask` decision, so DSH's approval
+service emits the normal ACP `session/request_permission` request. ACPilot's
+`full-edit` mode answers that request automatically after `ExternalEditSSP` has
+captured the baseline; it does not bypass the permission request.
+
 The plugin is optional. A normal user-owned `dsh --profile acp` process works without it, and ACPilot still accepts an already-running DSH ACP endpoint through the standard ACP fallback path. Structured stderr bridge messages are available when ACPilot starts the local process; a remote or already-running endpoint exposes standard ACP events only.
 
 Install it into the user's DSH profile when structured tool presentation is needed:

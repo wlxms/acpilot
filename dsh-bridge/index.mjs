@@ -73,8 +73,9 @@ export function apply(ctx) {
     }
   }
 
-  ctx.on('tools/pre-execute', (exec, next) => {
+  ctx.on('tools/pre-execute', async (exec, next) => {
     const sessionId = sessionIdentity(exec)
+    const presentation = callPresentation(exec)
     if (sessionId) {
       emit({
         type: 'tool_call',
@@ -84,10 +85,17 @@ export function apply(ctx) {
         rootToolCallId: exec.rootCallId ?? exec.callId,
         toolName: exec.name,
         rawInput: exec.arguments,
-        presentation: callPresentation(exec),
+        presentation,
       })
     }
-    return next()
+    const decision = await next()
+    if (presentation.card === 'diff' && decision?.kind === 'allow') {
+      return {
+        kind: 'ask',
+        reason: presentationTitle(presentation) ?? `Allow ${exec.name}`,
+      }
+    }
+    return decision
   })
 
   ctx.on('tools/result', (exec, result) => {
@@ -145,4 +153,10 @@ function toolKind(name) {
   if (value.includes('fetch') || value.includes('url')) return 'fetch'
   if (value.includes('bash') || value.includes('shell') || value.includes('pwsh') || value.includes('exec') || value.includes('command')) return 'execute'
   return 'other'
+}
+
+function presentationTitle(presentation) {
+  return typeof presentation?.title === 'string' && presentation.title.trim()
+    ? presentation.title
+    : undefined
 }

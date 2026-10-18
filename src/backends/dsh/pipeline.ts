@@ -10,7 +10,6 @@ import { ToolInvocationSSP } from '../../ssp/impl/tool-invocation';
 import { AcpPipeline } from '../acp/pipeline';
 import { resolveToolCallPath } from '../acp/filepath-resolver';
 const DSH_BRIDGE_PERMISSION_WAIT_MS = 1_500;
-const DSH_BRIDGE_TOOL_WAIT_MS = 100;
 const DSH_BRIDGE_CACHE_LIMIT = 256;
 
 interface DeferredAcpToolCall {
@@ -20,7 +19,6 @@ interface DeferredAcpToolCall {
     update: Extract<SessionUpdate, { sessionUpdate: 'tool_call_update' }>;
     eventSessionId: string | null | undefined;
   }>;
-  timer: ReturnType<typeof setTimeout>;
 }
 
 import type {
@@ -78,12 +76,9 @@ export class DshPipeline extends AcpPipeline {
     this.applyBridgeResult(message);
   }
 
-  /** Stop delayed ACP fallback work when the owning backend is replaced. */
+  /** Drop pending ACP fallback state when the owning backend is replaced. */
   dispose(): void {
     this.disposed = true;
-    for (const pending of this.pendingAcpToolCalls.values()) {
-      clearTimeout(pending.timer);
-    }
     this.pendingAcpToolCalls.clear();
     this.bridgePermissionWaiters.clear();
     this.bridgeCalls.clear();
@@ -108,6 +103,7 @@ export class DshPipeline extends AcpPipeline {
       bridgeCall = await this.waitForBridgeCall(params.toolCall.toolCallId);
     }
     if (!bridgeCall) {
+      this.flushPendingAcpToolCall(params.toolCall.toolCallId);
       return super.resolvePermission(params);
     }
 
@@ -117,7 +113,7 @@ export class DshPipeline extends AcpPipeline {
       title: presentationTitle(presentation) ?? params.toolCall.title ?? bridgeCall.toolName,
       kind: presentationKind(presentation) ?? params.toolCall.kind,
       rawInput: bridgeCall.rawInput ?? params.toolCall.rawInput ?? presentationInput(presentation),
-      locations: params.toolCall.locations ?? presentationLocations(presentation),
+      locations: mergeToolLocations(params.toolCall.locations, presentationLocations(presentation)),
     };
     return super.resolvePermission({ ...params, toolCall });
   }
@@ -152,9 +148,9 @@ export class DshPipeline extends AcpPipeline {
   }
 
   /**
-   * Give the stderr bridge a short chance to arrive before rendering a generic
-   * ACP tool card. DSH appends the ACP tool/call before running tools/pre-execute,
-   * so this ordering is expected for a local process with the bridge installed.
+   * Keep ACP tool calls pending until the optional bridge identifies them or ACP
+   * supplies a terminal update. This prevents a late diff presentation from
+   * creating a second card after the generic ACP card was already rendered.
    */
   protected override handleSessionUpdate(
     update: SessionUpdate,
@@ -172,6 +168,11 @@ export class DshPipeline extends AcpPipeline {
       const pending = this.pendingAcpToolCalls.get(update.toolCallId);
       if (pending) {
         pending.updates.push({ update, eventSessionId });
+        if ((update.status === 'completed' || update.status === 'failed')
+          && !this.bridgeCalls.has(update.toolCallId)
+          && !this.bridgeResults.has(update.toolCallId)) {
+          this.flushPendingAcpToolCall(update.toolCallId);
+        }
         return;
       }
       if (this.deferredDiffToolCalls.has(update.toolCallId)) {
@@ -188,12 +189,11 @@ export class DshPipeline extends AcpPipeline {
     eventSessionId: string | null | undefined,
   ): void {
     const existing = this.pendingAcpToolCalls.get(update.toolCallId);
-    if (existing) {clearTimeout(existing.timer);}
+    if (existing) {this.pendingAcpToolCalls.delete(update.toolCallId);}
     const pending: DeferredAcpToolCall = {
       update,
       eventSessionId,
       updates: [],
-      timer: setTimeout(() => this.flushPendingAcpToolCall(update.toolCallId), DSH_BRIDGE_TOOL_WAIT_MS),
     };
     this.pendingAcpToolCalls.set(update.toolCallId, pending);
     if (this.bridgeCalls.has(update.toolCallId) || this.bridgeResults.has(update.toolCallId)) {
@@ -204,7 +204,6 @@ export class DshPipeline extends AcpPipeline {
   private flushPendingAcpToolCall(toolCallId: string): void {
     const pending = this.pendingAcpToolCalls.get(toolCallId);
     if (!pending) {return;}
-    clearTimeout(pending.timer);
     this.pendingAcpToolCalls.delete(toolCallId);
     if (this.bridgeCalls.get(toolCallId)?.presentation.card === 'diff') {
       this.deferredDiffToolCalls.add(toolCallId);
@@ -273,6 +272,7 @@ export class DshPipeline extends AcpPipeline {
       }
     }
     this.deferredDiffToolCalls.delete(update.toolCallId);
+    this.clearExternalEditTracking(update.toolCallId);
 
     // A bridge result may have arrived before the ACP terminal update. Apply it
     // after the fallback card is created, or update ExternalEditSSP when the
@@ -314,6 +314,7 @@ export class DshPipeline extends AcpPipeline {
         status,
         error: message.isError ? output : undefined,
       });
+      this.clearExternalEditTracking(message.toolCallId);
     }
 
     const partId = message.toolCallId;
@@ -441,15 +442,40 @@ function presentationKind(presentation: DshBridgePresentation | undefined): DshA
 }
 
 function presentationLocations(presentation: DshBridgePresentation | undefined): Array<{ path: string; line?: number }> | undefined {
-  const locations = presentation?.locations;
-  if (!Array.isArray(locations)) {return undefined;}
-  const result = locations.filter(isRecord).flatMap(location => {
-    if (typeof location.path !== 'string' || location.path.trim() === '') {return [];}
-    return [{
-      path: location.path,
-      ...(typeof location.line === 'number' ? { line: location.line } : {}),
-    }];
-  });
+  const result: Array<{ path: string; line?: number }> = [];
+  const seen = new Set<string>();
+  const add = (value: unknown): void => {
+    if (!isRecord(value) || typeof value.path !== 'string' || value.path.trim() === '') {return;}
+    const location = {
+      path: value.path,
+      ...(typeof value.line === 'number' ? { line: value.line } : {}),
+    };
+    const key = `${location.path}|${location.line ?? ''}`;
+    if (seen.has(key)) {return;}
+    seen.add(key);
+    result.push(location);
+  };
+  if (Array.isArray(presentation?.locations)) {
+    for (const location of presentation.locations) {add(location);}
+  }
+  if (Array.isArray(presentation?.diffs)) {
+    for (const diff of presentation.diffs) {add(diff);}
+  }
+  return result.length > 0 ? result : undefined;
+}
+
+function mergeToolLocations(
+  primary: RequestPermissionRequest['toolCall']['locations'],
+  fallback: Array<{ path: string; line?: number }> | undefined,
+): RequestPermissionRequest['toolCall']['locations'] | undefined {
+  const result = [...(primary ?? [])];
+  const seen = new Set(result.map(location => `${location.path}|${location.line ?? ''}`));
+  for (const location of fallback ?? []) {
+    const key = `${location.path}|${location.line ?? ''}`;
+    if (seen.has(key)) {continue;}
+    seen.add(key);
+    result.push(location);
+  }
   return result.length > 0 ? result : undefined;
 }
 

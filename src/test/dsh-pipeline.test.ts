@@ -201,6 +201,50 @@ describe('DshPipeline', () => {
     await expect(responsePromise).resolves.toEqual({ outcome: { outcome: 'selected', optionId: 'allow-once' } });
   });
 
+  it('derives diff-only paths for the permission-gated ExternalEdit lifecycle', async () => {
+    const target = createStream();
+    const pipeline = new DshPipeline({
+      sessionId: 'session-1',
+      directory: 'D:/workspace',
+      stream: target.value,
+      permissionMode: 'full-edit',
+    });
+    pipeline.handleBridgeMessage({
+      type: 'tool_call',
+      protocol: 1,
+      sessionId: 'session-1',
+      toolCallId: 'call-diff-only',
+      rootToolCallId: 'call-diff-only',
+      toolName: 'write',
+      presentation: {
+        card: 'diff',
+        title: 'Write src/diff-only.ts',
+        diffs: [{ path: 'src/diff-only.ts', oldText: null, newText: 'new' }],
+      },
+    });
+
+    const responsePromise = pipeline.resolvePermission({
+      sessionId: 'session-1',
+      toolCall: { toolCallId: 'call-diff-only' },
+      options: [{ optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' }],
+    } as never);
+    await Promise.resolve();
+
+    expect(target.pushed).toHaveLength(1);
+    const external = target.pushed[0] as unknown as {
+      toJSON?: () => { payload?: { uri?: string } };
+      render(stream: { externalEdit(target: unknown, callback: () => PromiseLike<unknown>): PromiseLike<string> }): void;
+    };
+    expect(external.toJSON?.().payload?.uri).toBe('D:\\workspace\\src\\diff-only.ts');
+    external.render({
+      externalEdit: (_uris, callback) => {
+        void callback();
+        return Promise.resolve('undo-stop');
+      },
+    });
+    await expect(responsePromise).resolves.toEqual({ outcome: { outcome: 'selected', optionId: 'allow-once' } });
+  });
+
   it('defers diff cards and correlates permission facts with ExternalEditSSP', async () => {
     const target = createStream();
     const pipeline = new DshPipeline({
@@ -359,6 +403,167 @@ describe('DshPipeline', () => {
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
+  });
+
+  it('waits for the bridge before choosing a representation when ACP arrives first', async () => {
+    const target = createStream();
+    const pipeline = new DshPipeline({
+      sessionId: 'session-1',
+      directory: 'D:/workspace',
+      stream: target.value,
+      permissionMode: 'full-edit',
+    });
+
+    let pushedBeforeBridge = -1;
+    await pipeline.run((async function* () {
+      yield sessionUpdate({
+        sessionUpdate: 'tool_call',
+        toolCallId: 'call-late-diff',
+        title: 'write',
+        status: 'in_progress',
+      });
+      await new Promise(resolve => setTimeout(resolve, 150));
+      pushedBeforeBridge = target.pushed.length;
+
+      pipeline.handleBridgeMessage({
+        type: 'tool_call',
+        protocol: 1,
+        sessionId: 'session-1',
+        toolCallId: 'call-late-diff',
+        rootToolCallId: 'call-late-diff',
+        toolName: 'write',
+        presentation: {
+          card: 'diff',
+          title: 'Write src/late-diff.ts',
+          locations: [{ path: 'src/late-diff.ts', line: 1 }],
+          diffs: [{ path: 'src/late-diff.ts', oldText: null, newText: 'new' }],
+        },
+      });
+      const responsePromise = pipeline.resolvePermission({
+        sessionId: 'session-1',
+        toolCall: { toolCallId: 'call-late-diff' },
+        options: [{ optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' }],
+      } as never);
+      await Promise.resolve();
+
+      expect(target.pushed).toHaveLength(1);
+      const external = target.pushed[0] as unknown as {
+        render(stream: { externalEdit(target: unknown, callback: () => PromiseLike<unknown>): PromiseLike<string> }): void;
+      };
+      external.render({
+        externalEdit: (_uris, callback) => {
+          void callback();
+          return Promise.resolve('undo-stop');
+        },
+      });
+      await expect(responsePromise).resolves.toEqual({ outcome: { outcome: 'selected', optionId: 'allow-once' } });
+      yield stop();
+    })(), { isCancellationRequested: false });
+    expect(pushedBeforeBridge).toBe(0);
+    expect(target.pushed.filter(part => (part as unknown as { kind?: string }).kind === 'externalEdit')).toHaveLength(1);
+  });
+
+  it('keeps ordinary ACP fallback when no DSH bridge arrives', async () => {
+    const target = createStream();
+    const pipeline = new DshPipeline({
+      sessionId: 'session-1',
+      stream: target.value,
+    });
+
+    await pipeline.run((async function* () {
+      yield sessionUpdate({
+        sessionUpdate: 'tool_call',
+        toolCallId: 'call-no-bridge',
+        title: 'read',
+        status: 'in_progress',
+        rawInput: { path: 'src/no-bridge.ts' },
+      });
+      yield sessionUpdate({
+        sessionUpdate: 'tool_call_update',
+        toolCallId: 'call-no-bridge',
+        status: 'completed',
+        rawOutput: 'content',
+      });
+      yield stop();
+    })(), { isCancellationRequested: false });
+
+    expect(target.pushed).toHaveLength(1);
+    expect((target.pushed[0] as unknown as { kind?: string }).kind).toBe('toolInvocation');
+  });
+
+  it('cleans deferred ExternalEdit correlation after terminal completion', async () => {
+    const target = createStream();
+    const pipeline = new DshPipeline({
+      sessionId: 'session-1',
+      directory: 'D:/workspace',
+      stream: target.value,
+      permissionMode: 'full-edit',
+    });
+    const internals = pipeline as unknown as {
+      handleSessionUpdate(update: never, eventSessionId: string): void;
+    };
+
+    pipeline.handleBridgeMessage({
+      type: 'tool_call',
+      protocol: 1,
+      sessionId: 'session-1',
+      toolCallId: 'call-cleanup',
+      rootToolCallId: 'call-cleanup',
+      toolName: 'write',
+      presentation: {
+        card: 'diff',
+        title: 'Write src/cleanup.ts',
+        locations: [{ path: 'src/cleanup.ts', line: 1 }],
+        diffs: [{ path: 'src/cleanup.ts', oldText: null, newText: 'new' }],
+      },
+    });
+    internals.handleSessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'call-cleanup',
+      title: 'write',
+      status: 'in_progress',
+    } as never, 'session-1');
+
+    const responsePromise = pipeline.resolvePermission({
+      sessionId: 'session-1',
+      toolCall: { toolCallId: 'call-cleanup' },
+      options: [{ optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' }],
+    } as never);
+    await Promise.resolve();
+    const firstExternal = target.pushed[0] as unknown as {
+      render(stream: { externalEdit(target: unknown, callback: () => PromiseLike<unknown>): PromiseLike<string> }): void;
+    };
+    firstExternal.render({
+      externalEdit: (_uris, callback) => {
+        void callback();
+        return Promise.resolve('undo-stop');
+      },
+    });
+    await expect(responsePromise).resolves.toEqual({ outcome: { outcome: 'selected', optionId: 'allow-once' } });
+
+    internals.handleSessionUpdate({
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'call-cleanup',
+      status: 'completed',
+    } as never, 'session-1');
+
+    const secondResponsePromise = pipeline.resolvePermission({
+      sessionId: 'session-1',
+      toolCall: { toolCallId: 'call-cleanup' },
+      options: [{ optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' }],
+    } as never);
+    await Promise.resolve();
+    expect(target.pushed.filter(part => (part as unknown as { kind?: string }).kind === 'externalEdit')).toHaveLength(2);
+    const secondExternal = target.pushed[1] as unknown as {
+      render(stream: { externalEdit(target: unknown, callback: () => PromiseLike<unknown>): PromiseLike<string> }): void;
+    };
+    secondExternal.render({
+      externalEdit: (_uris, callback) => {
+        void callback();
+        return Promise.resolve('undo-stop-2');
+      },
+    });
+    await expect(secondResponsePromise).resolves.toEqual({ outcome: { outcome: 'selected', optionId: 'allow-once' } });
   });
 
   it('does not create a generic tool card when the bridge call follows the ACP update', async () => {

@@ -230,6 +230,11 @@ export class AcpPipeline implements BackendPipeline<ActiveSessionMessage> {
     return true;
   }
 
+  protected clearExternalEditTracking(toolCallId: string): void {
+    this.externalEditTargets.delete(toolCallId);
+    this.externalEditBaselineStates.delete(toolCallId);
+  }
+
   private requestPermissionChoice(params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
     return new Promise(resolve => {
       const questionId = `permission-${params.toolCall.toolCallId}`;
@@ -360,8 +365,7 @@ export class AcpPipeline implements BackendPipeline<ActiveSessionMessage> {
             status: update.status === 'failed' ? 'error' : 'completed',
             error: update.status === 'failed' ? toolOutputToText(update) : undefined,
           });
-          this.externalEditTargets.delete(update.toolCallId);
-          this.externalEditBaselineStates.delete(update.toolCallId);
+          this.clearExternalEditTracking(update.toolCallId);
         }
 
         const partId = this.toolTargets.get(update.toolCallId);

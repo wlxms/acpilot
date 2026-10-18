@@ -590,6 +590,68 @@ describe('DshPipeline', () => {
     }
   });
 
+  it('hides a generic placeholder when a late diff bridge arrives', async () => {
+    vi.useFakeTimers();
+    try {
+      const target = createStream();
+      const pipeline = new DshPipeline({
+        sessionId: 'session-1',
+        directory: 'D:/workspace',
+        stream: target.value,
+        permissionMode: 'full-edit',
+      });
+      const internals = pipeline as unknown as {
+        handleSessionUpdate(update: never, eventSessionId: string): void;
+      };
+      internals.handleSessionUpdate({
+        sessionUpdate: 'tool_call',
+        toolCallId: 'call-unknown-late-diff',
+        title: 'custom-tool',
+        kind: 'other',
+        status: 'in_progress',
+      } as never, 'session-1');
+      await vi.advanceTimersByTimeAsync(1_600);
+      expect(target.pushed).toHaveLength(1);
+
+      pipeline.handleBridgeMessage({
+        type: 'tool_call',
+        protocol: 1,
+        sessionId: 'session-1',
+        toolCallId: 'call-unknown-late-diff',
+        rootToolCallId: 'call-unknown-late-diff',
+        toolName: 'custom-tool',
+        presentation: {
+          card: 'diff',
+          title: 'Update src/late.ts',
+          diffs: [{ path: 'src/late.ts', oldText: null, newText: 'new' }],
+        },
+      });
+      expect(target.pushed[0]?.toJSON?.().payload?.state).toMatchObject({
+        metadata: { externalEdit: true },
+      });
+
+      const responsePromise = pipeline.resolvePermission({
+        sessionId: 'session-1',
+        toolCall: { toolCallId: 'call-unknown-late-diff' },
+        options: [{ optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' }],
+      } as never);
+      await Promise.resolve();
+      expect(target.pushed.filter(part => (part as unknown as { kind?: string }).kind === 'externalEdit')).toHaveLength(1);
+      const external = target.pushed[1] as unknown as {
+        render(stream: { externalEdit(target: unknown, callback: () => PromiseLike<unknown>): PromiseLike<string> }): void;
+      };
+      external.render({
+        externalEdit: (_uris, callback) => {
+          void callback();
+          return Promise.resolve('undo-stop');
+        },
+      });
+      await expect(responsePromise).resolves.toEqual({ outcome: { outcome: 'selected', optionId: 'allow-once' } });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('keeps ordinary ACP fallback when no DSH bridge arrives', async () => {
     const target = createStream();
     const pipeline = new DshPipeline({

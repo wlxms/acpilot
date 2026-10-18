@@ -237,15 +237,26 @@ function fileMutationPresentation(exec) {
   if (!lowered.includes('write') && !lowered.includes('create') && !lowered.includes('edit')) return undefined
 
   const filePath = firstString(args.file_path, args.filePath, args.path, args.filename)
-  const content = firstString(args.content, args.new_content, args.newContent, args.new_text, args.newText)
-  if (!filePath || content === undefined) return undefined
+  if (!filePath) return undefined
+  const oldText = firstString(args.old_string, args.oldString, args.old_text, args.oldText)
+  const newText = firstString(
+    args.content,
+    args.new_content,
+    args.newContent,
+    args.new_string,
+    args.newString,
+    args.new_text,
+    args.newText,
+  )
 
   const verb = lowered.includes('write') || lowered.includes('create') ? 'Write' : 'Edit'
   return {
     card: 'diff',
     title: `${verb} ${filePath}`,
     kind: 'edit',
-    diffs: [{ path: filePath, oldText: null, newText: content }],
+    diffs: oldText !== undefined || newText !== undefined
+      ? [{ path: filePath, oldText: oldText ?? null, newText: newText ?? null }]
+      : [],
     locations: [{ path: filePath }],
   }
 }

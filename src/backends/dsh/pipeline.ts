@@ -41,6 +41,9 @@ export class DshPipeline extends AcpPipeline {
   private readonly observedAcpToolCalls = new Set<string>();
   private readonly bridgeCalls = new Map<string, DshBridgeToolCallMessage>();
   private readonly bridgeResults = new Map<string, DshBridgeToolResultMessage>();
+  /** Standard ACP tool updates can carry enough write data to recover the
+   * diff path when the optional stderr bridge is missing or delayed. */
+  private readonly acpToolCalls = new Map<string, AcpToolCall>();
   private readonly bridgePermissionWaiters = new Map<string, Set<(message: DshBridgeToolCallMessage) => void>>();
   private readonly pendingAcpToolCalls = new Map<string, DeferredAcpToolCall>();
   private readonly deferredDiffToolCalls = new Set<string>();
@@ -89,6 +92,7 @@ export class DshPipeline extends AcpPipeline {
     this.bridgePermissionWaiters.clear();
     this.bridgeCalls.clear();
     this.bridgeResults.clear();
+    this.acpToolCalls.clear();
     this.observedAcpToolCalls.clear();
     this.deferredDiffToolCalls.clear();
   }
@@ -104,13 +108,17 @@ export class DshPipeline extends AcpPipeline {
    * tool facts from the bridge before AcpPipeline creates ExternalEditSSP.
    */
   override async resolvePermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
-    let bridgeCall = this.bridgeCalls.get(params.toolCall.toolCallId);
+    const toolCallId = params.toolCall.toolCallId;
+    let bridgeCall = this.bridgeCalls.get(toolCallId);
+    if (!bridgeCall) {
+      bridgeCall = bridgeCallFromAcpUpdate(this.acpToolCalls.get(toolCallId), this.sessionId);
+    }
     if (!bridgeCall && (shouldWaitForBridge(params)
-      || (this.pendingAcpToolCalls.has(params.toolCall.toolCallId) && !isReadOnlyPermissionKind(params.toolCall.kind)))) {
-      bridgeCall = await this.waitForBridgeCall(params.toolCall.toolCallId);
+      || (this.pendingAcpToolCalls.has(toolCallId) && !isReadOnlyPermissionKind(params.toolCall.kind)))) {
+      bridgeCall = await this.waitForBridgeCall(toolCallId);
     }
     if (!bridgeCall) {
-      this.flushPendingAcpToolCall(params.toolCall.toolCallId);
+      this.flushPendingAcpToolCall(toolCallId);
       return super.resolvePermission(params);
     }
 
@@ -151,7 +159,8 @@ export class DshPipeline extends AcpPipeline {
     update: Extract<SessionUpdate, { sessionUpdate: 'tool_call' }>,
   ): boolean {
     const bridgeCall = this.bridgeCalls.get(update.toolCallId);
-    return bridgeCall?.presentation.card === 'diff';
+    return bridgeCall?.presentation.card === 'diff'
+      || inferAcpFilePresentation(update)?.card === 'diff';
   }
 
   /**
@@ -166,6 +175,8 @@ export class DshPipeline extends AcpPipeline {
     if (update.sessionUpdate === 'tool_call') {
       this.observedAcpToolCalls.add(update.toolCallId);
       trimSet(this.observedAcpToolCalls);
+      this.acpToolCalls.set(update.toolCallId, update);
+      trimMap(this.acpToolCalls);
       this.deferAcpToolCall(update, eventSessionId);
       return;
     }
@@ -220,7 +231,8 @@ export class DshPipeline extends AcpPipeline {
     if (!pending) {return;}
     if (pending.timer !== undefined) {clearTimeout(pending.timer);}
     this.pendingAcpToolCalls.delete(toolCallId);
-    if (this.bridgeCalls.get(toolCallId)?.presentation.card === 'diff') {
+    if (this.bridgeCalls.get(toolCallId)?.presentation.card === 'diff'
+      || inferAcpFilePresentation(pending.update)?.card === 'diff') {
       this.deferredDiffToolCalls.add(toolCallId);
     }
     this.dispatchAcpUpdate(pending.update, pending.eventSessionId);
@@ -265,7 +277,8 @@ export class DshPipeline extends AcpPipeline {
         error: update.status === 'failed' ? dshToolOutputToText(update) : undefined,
       });
     } else {
-      const bridgeCall = this.bridgeCalls.get(update.toolCallId);
+      const bridgeCall = this.bridgeCalls.get(update.toolCallId)
+        ?? bridgeCallFromAcpUpdate(this.acpToolCalls.get(update.toolCallId), this.sessionId);
       if (bridgeCall && !this.sss.has(update.toolCallId)) {
         const presentation = bridgeCall.presentation;
         const output = dshToolOutputToText(update);
@@ -287,6 +300,7 @@ export class DshPipeline extends AcpPipeline {
       }
     }
     this.deferredDiffToolCalls.delete(update.toolCallId);
+    this.acpToolCalls.delete(update.toolCallId);
     this.clearExternalEditTracking(update.toolCallId);
 
     // A bridge result may have arrived before the ACP terminal update. Apply it
@@ -314,7 +328,8 @@ export class DshPipeline extends AcpPipeline {
   }
 
   private applyBridgeResult(message: DshBridgeToolResultMessage): void {
-    const call = this.bridgeCalls.get(message.toolCallId);
+    const call = this.bridgeCalls.get(message.toolCallId)
+      ?? bridgeCallFromAcpUpdate(this.acpToolCalls.get(message.toolCallId), this.sessionId);
     const callPresentation = call?.presentation;
     const presentation = message.presentation ?? callPresentation;
     const input = presentationInput(presentation, call?.rawInput);
@@ -376,6 +391,52 @@ export class DshPipeline extends AcpPipeline {
       sessionId: message.sessionId,
     }));
   }
+}
+
+function bridgeCallFromAcpUpdate(
+  update: AcpToolCall | undefined,
+  sessionId: string,
+): DshBridgeToolCallMessage | undefined {
+  const presentation = update ? inferAcpFilePresentation(update) : undefined;
+  if (!update || !presentation) {return undefined;}
+  return {
+    type: 'tool_call',
+    protocol: 1,
+    sessionId,
+    toolCallId: update.toolCallId,
+    rootToolCallId: update.toolCallId,
+    toolName: update.title ?? 'write',
+    ...(update.rawInput !== undefined ? { rawInput: update.rawInput } : {}),
+    presentation,
+  };
+}
+
+/**
+ * Recover the canonical write presentation from standard ACP data. This is the
+ * no-plugin path for an already-running DSH endpoint, and also covers a delayed
+ * stderr bridge without turning the call into a generic completed tool card.
+ */
+function inferAcpFilePresentation(update: AcpToolCall): DshBridgePresentation | undefined {
+  const name = String(update.title ?? '').toLowerCase();
+  if (!name.includes('write') && !name.includes('create') && !name.includes('edit')) {
+    return undefined;
+  }
+  if (!isRecord(update.rawInput)) {return undefined;}
+  const filePath = firstString(update.rawInput.file_path, update.rawInput.filePath, update.rawInput.path, update.rawInput.filename);
+  const content = firstString(update.rawInput.content, update.rawInput.new_content, update.rawInput.newContent, update.rawInput.new_text, update.rawInput.newText);
+  if (!filePath || content === undefined) {return undefined;}
+  const verb = name.includes('write') || name.includes('create') ? 'Write' : 'Edit';
+  return {
+    card: 'diff',
+    title: verb + ' ' + filePath,
+    kind: 'edit',
+    diffs: [{ path: filePath, oldText: null, newText: content }],
+    locations: [{ path: filePath }],
+  };
+}
+
+function firstString(...values: unknown[]): string | undefined {
+  return values.find((value): value is string => typeof value === 'string');
 }
 
 function trimMap<T>(value: Map<string, T>): void {

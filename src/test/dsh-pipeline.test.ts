@@ -652,6 +652,49 @@ describe('DshPipeline', () => {
     }
   });
 
+  it('uses the standard ACP write input to start ExternalEdit without the bridge', async () => {
+    const target = createStream();
+    const pipeline = new DshPipeline({
+      sessionId: 'session-1',
+      directory: 'D:/workspace',
+      stream: target.value,
+      permissionMode: 'full-edit',
+    });
+    const internals = pipeline as unknown as {
+      handleSessionUpdate(update: never, eventSessionId: string): void;
+    };
+    internals.handleSessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'call-write-no-bridge',
+      title: 'write',
+      kind: 'other',
+      status: 'in_progress',
+      rawInput: { file_path: 'src/no-bridge.md', content: '# created\n' },
+    } as never, 'session-1');
+
+    const responsePromise = pipeline.resolvePermission({
+      sessionId: 'session-1',
+      toolCall: { toolCallId: 'call-write-no-bridge' },
+      options: [{ optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' }],
+    } as never);
+    await Promise.resolve();
+    expect(target.pushed).toHaveLength(1);
+    expect((target.pushed[0] as unknown as { kind?: string }).kind).toBe('externalEdit');
+
+    const external = target.pushed[0] as unknown as {
+      render(stream: { externalEdit(target: unknown, callback: () => PromiseLike<unknown>): PromiseLike<string> }): void;
+    };
+    external.render({
+      externalEdit: (_uris, callback) => {
+        void callback();
+        return Promise.resolve('undo-stop');
+      },
+    });
+    await expect(responsePromise).resolves.toEqual({
+      outcome: { outcome: 'selected', optionId: 'allow-once' },
+    });
+  });
+
   it('keeps ordinary ACP fallback when no DSH bridge arrives', async () => {
     const target = createStream();
     const pipeline = new DshPipeline({

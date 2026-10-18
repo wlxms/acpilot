@@ -463,6 +463,97 @@ describe('DshPipeline', () => {
     expect(target.pushed.filter(part => (part as unknown as { kind?: string }).kind === 'externalEdit')).toHaveLength(1);
   });
 
+  it('waits for a late bridge even when ACP permission includes a file path', async () => {
+    const target = createStream();
+    const pipeline = new DshPipeline({
+      sessionId: 'session-1',
+      directory: 'D:/workspace',
+      stream: target.value,
+      permissionMode: 'full-edit',
+    });
+    const internals = pipeline as unknown as {
+      handleSessionUpdate(update: never, eventSessionId: string): void;
+    };
+    internals.handleSessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'call-path-race',
+      title: 'write',
+      kind: 'edit',
+      status: 'in_progress',
+      rawInput: { path: 'src/path-race.ts' },
+    } as never, 'session-1');
+
+    const responsePromise = pipeline.resolvePermission({
+      sessionId: 'session-1',
+      toolCall: {
+        toolCallId: 'call-path-race',
+        kind: 'edit',
+        rawInput: { path: 'src/path-race.ts' },
+      },
+      options: [{ optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' }],
+    } as never);
+    await Promise.resolve();
+    expect(target.pushed).toHaveLength(0);
+
+    pipeline.handleBridgeMessage({
+      type: 'tool_call',
+      protocol: 1,
+      sessionId: 'session-1',
+      toolCallId: 'call-path-race',
+      rootToolCallId: 'call-path-race',
+      toolName: 'write',
+      presentation: {
+        card: 'diff',
+        title: 'Write src/path-race.ts',
+        diffs: [{ path: 'src/path-race.ts', oldText: null, newText: 'new' }],
+      },
+    });
+    await Promise.resolve();
+    expect(target.pushed).toHaveLength(1);
+    const external = target.pushed[0] as unknown as {
+      render(stream: { externalEdit(target: unknown, callback: () => PromiseLike<unknown>): PromiseLike<string> }): void;
+    };
+    external.render({
+      externalEdit: (_uris, callback) => {
+        void callback();
+        return Promise.resolve('undo-stop');
+      },
+    });
+    await expect(responsePromise).resolves.toEqual({ outcome: { outcome: 'selected', optionId: 'allow-once' } });
+  });
+
+  it('renders a bridge-free read tool while it is still running', async () => {
+    const target = createStream();
+    const pipeline = new DshPipeline({
+      sessionId: 'session-1',
+      stream: target.value,
+    });
+    let pushedDuringRun = -1;
+
+    await pipeline.run((async function* () {
+      yield sessionUpdate({
+        sessionUpdate: 'tool_call',
+        toolCallId: 'call-long-read',
+        title: 'read',
+        kind: 'read',
+        status: 'in_progress',
+        rawInput: { path: 'src/long-read.ts' },
+      });
+      await new Promise(resolve => setTimeout(resolve, 150));
+      pushedDuringRun = target.pushed.length;
+      yield sessionUpdate({
+        sessionUpdate: 'tool_call_update',
+        toolCallId: 'call-long-read',
+        status: 'completed',
+        rawOutput: 'content',
+      });
+      yield stop();
+    })(), { isCancellationRequested: false });
+
+    expect(pushedDuringRun).toBe(1);
+    expect((target.pushed[0] as unknown as { kind?: string }).kind).toBe('toolInvocation');
+  });
+
   it('keeps ordinary ACP fallback when no DSH bridge arrives', async () => {
     const target = createStream();
     const pipeline = new DshPipeline({

@@ -10,6 +10,7 @@ import { ToolInvocationSSP } from '../../ssp/impl/tool-invocation';
 import { AcpPipeline } from '../acp/pipeline';
 import { resolveToolCallPath } from '../acp/filepath-resolver';
 const DSH_BRIDGE_PERMISSION_WAIT_MS = 1_500;
+const DSH_BRIDGE_TOOL_WAIT_MS = 100;
 const DSH_BRIDGE_CACHE_LIMIT = 256;
 
 interface DeferredAcpToolCall {
@@ -19,6 +20,7 @@ interface DeferredAcpToolCall {
     update: Extract<SessionUpdate, { sessionUpdate: 'tool_call_update' }>;
     eventSessionId: string | null | undefined;
   }>;
+  timer?: ReturnType<typeof setTimeout>;
 }
 
 import type {
@@ -79,6 +81,9 @@ export class DshPipeline extends AcpPipeline {
   /** Drop pending ACP fallback state when the owning backend is replaced. */
   dispose(): void {
     this.disposed = true;
+    for (const pending of this.pendingAcpToolCalls.values()) {
+      if (pending.timer !== undefined) {clearTimeout(pending.timer);}
+    }
     this.pendingAcpToolCalls.clear();
     this.bridgePermissionWaiters.clear();
     this.bridgeCalls.clear();
@@ -99,7 +104,8 @@ export class DshPipeline extends AcpPipeline {
    */
   override async resolvePermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
     let bridgeCall = this.bridgeCalls.get(params.toolCall.toolCallId);
-    if (!bridgeCall && shouldWaitForBridge(params)) {
+    if (!bridgeCall && (shouldWaitForBridge(params)
+      || (this.pendingAcpToolCalls.has(params.toolCall.toolCallId) && !isReadOnlyPermissionKind(params.toolCall.kind)))) {
       bridgeCall = await this.waitForBridgeCall(params.toolCall.toolCallId);
     }
     if (!bridgeCall) {
@@ -189,12 +195,18 @@ export class DshPipeline extends AcpPipeline {
     eventSessionId: string | null | undefined,
   ): void {
     const existing = this.pendingAcpToolCalls.get(update.toolCallId);
-    if (existing) {this.pendingAcpToolCalls.delete(update.toolCallId);}
+    if (existing) {
+      if (existing.timer !== undefined) {clearTimeout(existing.timer);}
+      this.pendingAcpToolCalls.delete(update.toolCallId);
+    }
     const pending: DeferredAcpToolCall = {
       update,
       eventSessionId,
       updates: [],
     };
+    if (shouldRenderGenericBeforeBridge(update)) {
+      pending.timer = setTimeout(() => this.flushPendingAcpToolCall(update.toolCallId), DSH_BRIDGE_TOOL_WAIT_MS);
+    }
     this.pendingAcpToolCalls.set(update.toolCallId, pending);
     if (this.bridgeCalls.has(update.toolCallId) || this.bridgeResults.has(update.toolCallId)) {
       this.flushPendingAcpToolCall(update.toolCallId);
@@ -204,6 +216,7 @@ export class DshPipeline extends AcpPipeline {
   private flushPendingAcpToolCall(toolCallId: string): void {
     const pending = this.pendingAcpToolCalls.get(toolCallId);
     if (!pending) {return;}
+    if (pending.timer !== undefined) {clearTimeout(pending.timer);}
     this.pendingAcpToolCalls.delete(toolCallId);
     if (this.bridgeCalls.get(toolCallId)?.presentation.card === 'diff') {
       this.deferredDiffToolCalls.add(toolCallId);
@@ -381,15 +394,46 @@ function trimSet(value: Set<string>): void {
 
 function shouldWaitForBridge(params: RequestPermissionRequest): boolean {
   const toolCall = params.toolCall;
+  if (toolCall.kind === 'edit' || toolCall.kind === 'delete' || toolCall.kind === 'move') {
+    return true;
+  }
   const hasLocation = resolveToolCallPath(toolCall.rawInput)
     ?? toolCall.locations?.find(location => typeof location.path === 'string')?.path;
-  if (hasLocation) {return false;}
-  if (toolCall.kind === 'edit' || toolCall.kind === 'delete' || toolCall.kind === 'move') {
+  if (hasLocation && !isReadOnlyPermissionKind(toolCall.kind)) {
     return true;
   }
   return toolCall.rawInput === undefined
     && (toolCall.kind === undefined || toolCall.kind === null || toolCall.kind === 'other')
     && !toolCall.title;
+}
+
+function isReadOnlyPermissionKind(kind: RequestPermissionRequest['toolCall']['kind']): boolean {
+  return kind === 'read' || kind === 'search' || kind === 'think' || kind === 'fetch';
+}
+
+type AcpToolCall = Extract<SessionUpdate, { sessionUpdate: 'tool_call' }>;
+
+function shouldRenderGenericBeforeBridge(update: AcpToolCall): boolean {
+  switch (update.kind) {
+    case 'read':
+    case 'search':
+    case 'fetch':
+    case 'think':
+    case 'execute':
+      return true;
+    case 'edit':
+    case 'delete':
+    case 'move':
+      return false;
+    default:
+      break;
+  }
+
+  const title = (update.title ?? '').toLowerCase();
+  if (/(read|search|grep|glob|list|find|fetch|bash|shell|pwsh|exec|command|terminal)/u.test(title)) {
+    return true;
+  }
+  return false;
 }
 
 function dshToolOutputToText(

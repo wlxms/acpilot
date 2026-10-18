@@ -62,7 +62,8 @@ export interface SpawnedAcpAgent {
 /**
  * Spawn a local ACP agent and wrap its stdio in an ACP Stream (ndJson).
  * If readiness is configured, stderr is line-read until the parser accepts a
- * line. The caller must await `ready` before sending ACP requests.
+ * line. The reader intentionally remains alive after readiness so optional
+ * side-channel protocols can continue to use stderr for the lifetime of ACP.
  */
 export function spawnAcpAgent(opts: LocalSpawnOptions): SpawnedAcpAgent {
   const needsStderrPipe = opts.stderr === 'pipe' || opts.readiness !== undefined || opts.onStderrLine !== undefined;
@@ -78,7 +79,7 @@ export function spawnAcpAgent(opts: LocalSpawnOptions): SpawnedAcpAgent {
   const stream = ndJsonStream(output, input);
   let stderrReader: Interface | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
-  let settled = false;
+  let readinessSettled = false;
   let resolveReady!: (value: unknown) => void;
   let rejectReady!: (error: unknown) => void;
   const ready = new Promise<unknown>((resolve, reject) => {
@@ -87,22 +88,37 @@ export function spawnAcpAgent(opts: LocalSpawnOptions): SpawnedAcpAgent {
   });
 
   const settleReady = (callback: () => void): void => {
-    if (settled) {return;}
-    settled = true;
-    if (timer) {clearTimeout(timer);}
-    stderrReader?.close();
+    if (readinessSettled) {return;}
+    readinessSettled = true;
+    if (timer) {
+      clearTimeout(timer);
+      timer = undefined;
+    }
     callback();
   };
 
+  const forwardStderrLine = (line: string): void => {
+    opts.onStderrLine?.(line);
+  };
+
   if (!opts.readiness) {
-    settled = true;
+    readinessSettled = true;
     resolveReady(undefined);
+    if (child.stderr && opts.onStderrLine) {
+      stderrReader = createInterface({ input: child.stderr });
+      stderrReader.on('line', forwardStderrLine);
+    }
   } else if (!child.stderr) {
+    readinessSettled = true;
     rejectReady(new Error('ACP local process did not provide stderr for readiness handshake'));
-    settled = true;
   } else {
     stderrReader = createInterface({ input: child.stderr });
     stderrReader.on('line', line => {
+      if (readinessSettled) {
+        forwardStderrLine(line);
+        return;
+      }
+
       let parsed: unknown;
       try {
         parsed = opts.readiness?.parse(line);
@@ -111,9 +127,11 @@ export function spawnAcpAgent(opts: LocalSpawnOptions): SpawnedAcpAgent {
         return;
       }
       if (parsed === undefined) {
-        opts.onStderrLine?.(line);
+        forwardStderrLine(line);
         return;
       }
+      // Keep the readline interface alive. The accepted marker is a startup
+      // handshake; later lines may carry a structured DSH bridge message.
       settleReady(() => resolveReady(parsed));
     });
     const timeoutMs = opts.readiness.timeoutMs ?? 15_000;
@@ -123,13 +141,13 @@ export function spawnAcpAgent(opts: LocalSpawnOptions): SpawnedAcpAgent {
   }
 
   const failBeforeReady = (error: Error): void => {
-    if (!settled) {
+    if (!readinessSettled) {
       settleReady(() => rejectReady(error));
     }
   };
   child.once('error', error => failBeforeReady(error));
   child.once('exit', (code, signal) => {
-    if (!settled) {
+    if (!readinessSettled) {
       failBeforeReady(new Error(
         `ACP local process exited before readiness (code=${code ?? 'null'}, signal=${signal ?? 'none'})`,
       ));

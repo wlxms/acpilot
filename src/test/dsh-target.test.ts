@@ -61,7 +61,19 @@ describe('DeepSeek Harness target state', () => {
     const target: DshTarget = normalizeDshTarget({ ...base, id: 'dsh-one' });
     await saveDshTargetState(ctx, { activeTargetId: 'missing', targets: [target] });
 
-    expect(loadDshTargetState(ctx)).toEqual({ activeTargetId: undefined, targets: [target] });
+    const loaded = loadDshTargetState(ctx);
+    expect(loaded.activeTargetId).toBeUndefined();
+    expect(loaded.targets).toHaveLength(1);
+    expect(loaded.targets[0]).toMatchObject({
+      id: target.id,
+      name: target.name,
+      command: target.command,
+      args: target.args,
+      launchCwd: target.launchCwd,
+      packageSpec: target.packageSpec,
+    });
+    expect(loaded.targets[0].createdAt).toEqual(expect.any(String));
+    expect(loaded.targets[0].updatedAt).toEqual(expect.any(String));
     expect(getActiveDshTarget(ctx)).toBeUndefined();
   });
 
@@ -76,5 +88,25 @@ describe('DeepSeek Harness target state', () => {
     const next = await removeDshTarget(ctx, second.id);
     expect(next.activeTargetId).toBe(first.id);
     expect(next.targets).toHaveLength(1);
+  });
+
+  it('preserves a configured running ACP endpoint', () => {
+    expect(normalizeDshTarget({ ...base, endpoint: 'ws://127.0.0.1:4318' })).toMatchObject({
+      endpoint: 'ws://127.0.0.1:4318',
+    });
+  });
+
+  it('rejects an endpoint that is not a WebSocket URL', () => {
+    expect(() => normalizeDshTarget({ ...base, endpoint: 'http://127.0.0.1:4318' }))
+      .toThrow('DSH endpoint must use ws:// or wss://');
+  });
+
+  it('clears an existing endpoint when the settings field is emptied', () => {
+    const existing = normalizeDshTarget({ ...base, id: 'dsh-existing', endpoint: 'ws://127.0.0.1:4318' });
+    expect(normalizeDshTarget({ ...base, id: existing.id, endpoint: '' }, existing).endpoint).toBeUndefined();
+  });
+
+  it('uses the official ACP profile when args are omitted', () => {
+    expect(normalizeDshTarget({ ...base, args: undefined }).args).toEqual(['--profile', 'acp']);
   });
 });

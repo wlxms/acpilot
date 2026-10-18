@@ -48,11 +48,11 @@ function textFromContent(content: ContentBlock | undefined): string {
 }
 
 export class AcpPipeline implements BackendPipeline<ActiveSessionMessage> {
-  private readonly sss: BackendPipelineStream;
-  private readonly directory?: string;
+  protected readonly sss: BackendPipelineStream;
+  protected readonly directory?: string;
   protected logger: PipelineLogger = { appendLine: () => {} };
   protected readonly sessionId: string;
-  private readonly permissionMode: PermissionMode;
+  protected readonly permissionMode: PermissionMode;
   private readonly allowUserInteraction: boolean;
 
   /** ACP may echo the user message identity in user_message_chunk updates. */
@@ -62,7 +62,7 @@ export class AcpPipeline implements BackendPipeline<ActiveSessionMessage> {
   /** Timestamp-based IDs can collide when an agent emits several chunks in one turn. */
   private nextPartSequence = 0;
 
-  /** toolCallId → root stream key (for tool invocation update correlation). */
+  /** toolCallId → persisted stream-part id (ToolInvocationSSP uses callId as its id). */
   private readonly toolTargets = new Map<string, string>();
   /**
    * ACP tool updates may omit `status` when they only replace content/title.
@@ -70,8 +70,10 @@ export class AcpPipeline implements BackendPipeline<ActiveSessionMessage> {
    * a completed tool back to `running`.
    */
   private readonly toolStatuses = new Map<string, ToolLifecycleStatus>();
-  /** toolCallId → ExternalEditSSP id (for permission-gated file edits). */
+  /** toolCallId → ExternalEditSSP id for permission-gated file edits. */
   private readonly externalEditTargets = new Map<string, string>();
+  /** Baseline callbacks may be registered before or after a bridge edit is rendered. */
+  private readonly externalEditBaselineStates = new Map<string, { captured: boolean; callbacks: Set<() => void> }>();
 
   constructor(options: BackendPipelineOptions) {
     this.sessionId = options.sessionId;
@@ -82,6 +84,16 @@ export class AcpPipeline implements BackendPipeline<ActiveSessionMessage> {
     if (options.logger) {
       this.logger = options.logger;
     }
+  }
+
+  /** Specialized ACP backends may defer the generic tool card until a side channel supplies its presentation. */
+  protected shouldDeferToolCall(_update: Extract<SessionUpdate, { sessionUpdate: 'tool_call' }>): boolean {
+    return false;
+  }
+
+  /** Specialized pipelines can flush side-channel state before a turn closes. */
+  protected beforeStop(): void {
+    // Base ACP has no delayed side-channel state.
   }
 
   async resolvePermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
@@ -110,14 +122,12 @@ export class AcpPipeline implements BackendPipeline<ActiveSessionMessage> {
     const automaticResponse = (this.permissionMode === 'full-edit' || !this.allowUserInteraction)
       ? automaticPermissionResponse(params.options)
       : undefined;
-    const toolCallId = params.toolCall.toolCallId;
-    const rawPath = resolveToolCallPath(params.toolCall.rawInput)
-      ?? params.toolCall.locations?.find(location => typeof location.path === 'string')?.path;
+    const filePaths = resolveToolCallPaths(params.toolCall, this.directory);
 
     if (!this.sss) {
       return { outcome: { outcome: 'cancelled' } };
     }
-    if (!rawPath) {
+    if (filePaths.length === 0) {
       if (automaticResponse) {
         const mode = this.permissionMode === 'full-edit' ? 'full-edit' : 'non-interactive LM';
         this.logger.appendLine(`[acp-pipeline] Automatically allowed ${params.toolCall.kind ?? 'unknown'} in ${mode}`);
@@ -129,12 +139,6 @@ export class AcpPipeline implements BackendPipeline<ActiveSessionMessage> {
       }
       return this.requestPermissionChoice(params);
     }
-
-    const filePath = path.isAbsolute(rawPath)
-      ? rawPath
-      : path.resolve(this.directory ?? '', rawPath);
-    const externalEditId = `external-edit-${toolCallId}`;
-    this.externalEditTargets.set(toolCallId, externalEditId);
 
     return await new Promise<RequestPermissionResponse>((resolve) => {
       let settled = false;
@@ -149,34 +153,18 @@ export class AcpPipeline implements BackendPipeline<ActiveSessionMessage> {
         resolve(response);
       };
 
-      this.sss.push(new ExternalEditSSP(
-        {
-          toolCallId,
-          editId: '',
-          status: 'pending',
-          uri: filePath,
-        },
-        {
-          onBaselineCaptured: () => {
-            if (automaticResponse) {
-              const mode = this.permissionMode === 'full-edit' ? 'full-edit' : 'non-interactive LM';
-              this.logger.appendLine(`[acp-pipeline] Automatically allowed ${params.toolCall.kind ?? 'unknown'} in ${mode} after baseline`);
-              settle(automaticResponse);
-            } else if (!this.allowUserInteraction) {
-              this.logger.appendLine(`[acp-pipeline] Rejected ${params.toolCall.kind ?? 'unknown'}: no allow option for non-interactive LM`);
-              settle({ outcome: { outcome: 'cancelled' } });
-            } else {
-              void this.requestPermissionChoice(params).then(settle);
-            }
-          },
-        },
-        {
-          sessionId: params.sessionId,
-          toolCallId,
-          uri: filePath,
-        },
-        externalEditId,
-      ));
+      this.ensureExternalEdit(params.toolCall, filePaths, () => {
+        if (automaticResponse) {
+          const mode = this.permissionMode === 'full-edit' ? 'full-edit' : 'non-interactive LM';
+          this.logger.appendLine(`[acp-pipeline] Automatically allowed ${params.toolCall.kind ?? 'unknown'} in ${mode} after baseline`);
+          settle(automaticResponse);
+        } else if (!this.allowUserInteraction) {
+          this.logger.appendLine(`[acp-pipeline] Rejected ${params.toolCall.kind ?? 'unknown'}: no allow option for non-interactive LM`);
+          settle({ outcome: { outcome: 'cancelled' } });
+        } else {
+          void this.requestPermissionChoice(params).then(settle);
+        }
+      });
 
       timeout = setTimeout(() => settle({ outcome: { outcome: 'cancelled' } }), 30_000);
       // A synchronous renderer may capture the baseline during push(), before
@@ -186,6 +174,65 @@ export class AcpPipeline implements BackendPipeline<ActiveSessionMessage> {
         timeout = undefined;
       }
     });
+  }
+
+  /**
+   * Start one ExternalEditSSP for a permission-gated file operation. The
+   * baseline callback is the barrier before an allow response is returned.
+   */
+  protected ensureExternalEdit(
+    toolCall: RequestPermissionRequest['toolCall'],
+    filePaths: string[],
+    onBaselineCaptured: () => void,
+  ): boolean {
+    const toolCallId = toolCall.toolCallId;
+    const existingId = this.externalEditTargets.get(toolCallId);
+    if (existingId) {
+      const state = this.externalEditBaselineStates.get(toolCallId);
+      if (state?.captured) {
+        queueMicrotask(onBaselineCaptured);
+      } else {
+        state?.callbacks.add(onBaselineCaptured);
+      }
+      return false;
+    }
+    if (filePaths.length === 0) {return false;}
+
+    const externalEditId = `external-edit-${toolCallId}`;
+    const state = { captured: false, callbacks: new Set<() => void>() };
+    state.callbacks.add(onBaselineCaptured);
+    this.externalEditTargets.set(toolCallId, externalEditId);
+    this.externalEditBaselineStates.set(toolCallId, state);
+
+    this.sss.push(new ExternalEditSSP(
+      {
+        toolCallId,
+        editId: '',
+        status: 'pending',
+        ...(filePaths.length > 1 ? { uris: filePaths } : { uri: filePaths[0] }),
+      },
+      {
+        onBaselineCaptured: () => {
+          state.captured = true;
+          const callbacks = [...state.callbacks];
+          state.callbacks.clear();
+          for (const callback of callbacks) {callback();}
+        },
+      },
+      {
+        sessionId: this.sessionId,
+        toolCallId,
+        uri: filePaths[0],
+      },
+      externalEditId,
+      this.directory,
+    ));
+    return true;
+  }
+
+  protected clearExternalEditTracking(toolCallId: string): void {
+    this.externalEditTargets.delete(toolCallId);
+    this.externalEditBaselineStates.delete(toolCallId);
   }
 
   private requestPermissionChoice(params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
@@ -236,6 +283,7 @@ export class AcpPipeline implements BackendPipeline<ActiveSessionMessage> {
       for await (const message of events) {
         if (token.isCancellationRequested) {break;}
         if (message.kind === 'stop') {
+          this.beforeStop();
           log(`turn stopped: stopReason=${message.stopReason}`);
           completed = isSuccessfulStopReason(message.stopReason);
           this.handleStop(message.stopReason);
@@ -256,7 +304,7 @@ export class AcpPipeline implements BackendPipeline<ActiveSessionMessage> {
     };
   }
 
-  private handleSessionUpdate(update: SessionUpdate, eventSessionId: string | null | undefined): void {
+  protected handleSessionUpdate(update: SessionUpdate, eventSessionId: string | null | undefined): void {
     const target: SessionStreamNode = this.sss;
     switch (update.sessionUpdate) {
       case 'agent_message_chunk': {
@@ -293,9 +341,12 @@ export class AcpPipeline implements BackendPipeline<ActiveSessionMessage> {
         // tool_call_update messages keyed by toolCallId, while the persisted
         // part uses a namespaced id to avoid collisions with other SSP kinds.
         const partId = `tool-${toolCallId}`;
-        this.toolTargets.set(toolCallId, partId);
+        this.toolTargets.set(toolCallId, toolCallId);
+        if (this.shouldDeferToolCall(update)) {
+          break;
+        }
         target.push(new ToolInvocationSSP({
-          partId: `tool-${toolCallId}`,
+          partId,
           toolName,
           callId: toolCallId,
           state: {
@@ -314,19 +365,19 @@ export class AcpPipeline implements BackendPipeline<ActiveSessionMessage> {
             status: update.status === 'failed' ? 'error' : 'completed',
             error: update.status === 'failed' ? toolOutputToText(update) : undefined,
           });
-          this.externalEditTargets.delete(update.toolCallId);
+          this.clearExternalEditTracking(update.toolCallId);
         }
 
         const partId = this.toolTargets.get(update.toolCallId);
         if (!partId) {
           // Update for an unknown tool call — create implicitly.
           const implicitPartId = `tool-${update.toolCallId}`;
-          this.toolTargets.set(update.toolCallId, implicitPartId);
+          this.toolTargets.set(update.toolCallId, update.toolCallId);
           const implicitStatus = toToolLifecycleStatus(update.status) ?? 'running';
           this.toolStatuses.set(update.toolCallId, implicitStatus);
           const output = toolOutputToText(update);
           target.push(new ToolInvocationSSP({
-            partId: `tool-${update.toolCallId}`,
+            partId: implicitPartId,
             toolName: update.title ?? 'tool',
             callId: update.toolCallId,
             state: {
@@ -406,6 +457,19 @@ export class AcpPipeline implements BackendPipeline<ActiveSessionMessage> {
       status: isSuccessfulStopReason(stopReason) ? 'completed' : 'failed',
     });
   }
+}
+
+function resolveToolCallPaths(
+  toolCall: RequestPermissionRequest['toolCall'],
+  directory?: string,
+): string[] {
+  const candidates = [
+    resolveToolCallPath(toolCall.rawInput),
+    ...(toolCall.locations ?? []).map(location => location.path),
+  ].filter((value): value is string => typeof value === 'string' && value.length > 0);
+  return [...new Set(candidates)].map(value => path.isAbsolute(value)
+    ? value
+    : path.resolve(directory ?? '', value));
 }
 
 function isReadOnlyAcpTool(kind: string | null | undefined): boolean {

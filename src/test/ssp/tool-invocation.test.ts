@@ -247,6 +247,32 @@ describe('ToolInvocationSSP', () => {
   // ════════════════════════════════════════════════════════════════════════
 
   describe('Contract C4: toolSpecificData mapping', () => {
+    it('DSH read presentation exposes the file location', () => {
+      const stream = mockStream();
+      const ssp = new ToolInvocationSSP({
+        partId: 'p1', toolName: 'read', callId: 'c1',
+        state: toolState({
+          status: 'completed',
+          input: { filePath: 'src/index.ts' },
+          output: '1: export const value = 1',
+          metadata: {
+            dshPresentation: {
+              card: 'read',
+              path: 'D:/workspace/src/index.ts',
+              offset: 12,
+              lines: [{ number: 12, text: 'export const value = 1' }],
+              totalLines: 40,
+            },
+          },
+        }),
+      });
+      ssp.render(stream);
+      const data = lastPushedPart(stream).toolSpecificData;
+      expect(data?.values).toHaveLength(1);
+      expect(data.values[0]).toBeInstanceOf(vscode.Location);
+      expect(data.values[0].range.start.line).toBe(11);
+    });
+
     it('read → undefined (no toolSpecificData)', () => {
       const stream = mockStream();
       const ssp = new ToolInvocationSSP({
@@ -275,6 +301,29 @@ describe('ToolInvocationSSP', () => {
       });
       ssp.render(stream);
       expect(lastPushedPart(stream).toolSpecificData).toBeUndefined();
+    });
+
+    it('DSH terminal presentation infers the shell language from the original tool', () => {
+      const stream = mockStream();
+      const ssp = new ToolInvocationSSP({
+        partId: 'p1', toolName: 'bash', callId: 'c1',
+        state: toolState({
+          status: 'completed',
+          input: { command: 'Get-ChildItem', cwd: 'D:/workspace' },
+          output: 'src',
+          metadata: {
+            dshToolName: 'pwsh',
+            dshPresentation: { card: 'terminal', title: 'Get-ChildItem', cwd: 'D:/workspace' },
+          },
+        }),
+      });
+      ssp.render(stream);
+      const data = lastPushedPart(stream).toolSpecificData;
+      expect(data).toMatchObject({
+        commandLine: { original: 'Get-ChildItem' },
+        language: 'powershell',
+        output: { text: 'src' },
+      });
     });
 
     it('bash → ChatTerminalToolInvocationData', () => {

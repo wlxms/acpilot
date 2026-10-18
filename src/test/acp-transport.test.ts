@@ -35,6 +35,22 @@ describe('ACP local transport lifecycle', () => {
     });
   });
 
+  it('keeps forwarding stderr lines after readiness resolves', async () => {
+    const nonce = 'transport-after-ready';
+    const marker = serializeDshBridgeReady(nonce);
+    const lines: string[] = [];
+    const spawned = spawnAcpAgent({
+      command: process.execPath,
+      args: nodeScript(`process.stderr.write(${JSON.stringify(marker + '\n')}); setTimeout(() => process.stderr.write('bridge-after-ready\\n'), 20); process.stdin.resume();`),
+      stderr: 'pipe',
+      readiness: { parse: parseDshBridgeReadyLine, timeoutMs: 1_000 },
+      onStderrLine: line => lines.push(line),
+    });
+    children.push(spawned);
+    await expect(spawned.ready).resolves.toMatchObject({ nonce });
+    await new Promise(resolve => setTimeout(resolve, 80));
+    expect(lines).toContain('bridge-after-ready');
+  });
   it('rejects a process that never publishes the bridge marker', async () => {
     const spawned = spawnAcpAgent({
       command: process.execPath,

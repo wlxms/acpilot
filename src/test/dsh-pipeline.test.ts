@@ -554,6 +554,42 @@ describe('DshPipeline', () => {
     expect((target.pushed[0] as unknown as { kind?: string }).kind).toBe('toolInvocation');
   });
 
+  it('renders an unknown bridge-free tool after the bounded bridge window', async () => {
+    vi.useFakeTimers();
+    try {
+      const target = createStream();
+      const pipeline = new DshPipeline({
+        sessionId: 'session-1',
+        stream: target.value,
+      });
+      let pushedDuringRun = -1;
+
+      await pipeline.run((async function* () {
+        yield sessionUpdate({
+          sessionUpdate: 'tool_call',
+          toolCallId: 'call-unknown-long',
+          title: 'custom-tool',
+          kind: 'other',
+          status: 'in_progress',
+        });
+        await vi.advanceTimersByTimeAsync(1_600);
+        pushedDuringRun = target.pushed.length;
+        yield sessionUpdate({
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'call-unknown-long',
+          status: 'completed',
+          rawOutput: 'done',
+        });
+        yield stop();
+      })(), { isCancellationRequested: false });
+
+      expect(pushedDuringRun).toBe(1);
+      expect((target.pushed[0] as unknown as { kind?: string }).kind).toBe('toolInvocation');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('keeps ordinary ACP fallback when no DSH bridge arrives', async () => {
     const target = createStream();
     const pipeline = new DshPipeline({

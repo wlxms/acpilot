@@ -11,6 +11,7 @@ import { AcpPipeline } from '../acp/pipeline';
 import { resolveToolCallPath } from '../acp/filepath-resolver';
 const DSH_BRIDGE_PERMISSION_WAIT_MS = 1_500;
 const DSH_BRIDGE_TOOL_WAIT_MS = 100;
+const DSH_BRIDGE_UNKNOWN_TOOL_WAIT_MS = DSH_BRIDGE_PERMISSION_WAIT_MS;
 const DSH_BRIDGE_CACHE_LIMIT = 256;
 
 interface DeferredAcpToolCall {
@@ -204,8 +205,9 @@ export class DshPipeline extends AcpPipeline {
       eventSessionId,
       updates: [],
     };
-    if (shouldRenderGenericBeforeBridge(update)) {
-      pending.timer = setTimeout(() => this.flushPendingAcpToolCall(update.toolCallId), DSH_BRIDGE_TOOL_WAIT_MS);
+    const fallbackDelay = genericFallbackDelay(update);
+    if (fallbackDelay !== undefined) {
+      pending.timer = setTimeout(() => this.flushPendingAcpToolCall(update.toolCallId), fallbackDelay);
     }
     this.pendingAcpToolCalls.set(update.toolCallId, pending);
     if (this.bridgeCalls.has(update.toolCallId) || this.bridgeResults.has(update.toolCallId)) {
@@ -413,27 +415,32 @@ function isReadOnlyPermissionKind(kind: RequestPermissionRequest['toolCall']['ki
 
 type AcpToolCall = Extract<SessionUpdate, { sessionUpdate: 'tool_call' }>;
 
-function shouldRenderGenericBeforeBridge(update: AcpToolCall): boolean {
+function genericFallbackDelay(update: AcpToolCall): number | undefined {
   switch (update.kind) {
     case 'read':
     case 'search':
     case 'fetch':
     case 'think':
     case 'execute':
-      return true;
+      return DSH_BRIDGE_TOOL_WAIT_MS;
     case 'edit':
     case 'delete':
     case 'move':
-      return false;
+      return undefined;
     default:
       break;
   }
 
+  if (resolveToolCallPath(update.rawInput)
+    || (Array.isArray(update.locations) && update.locations.length > 0)) {
+    return undefined;
+  }
+
   const title = (update.title ?? '').toLowerCase();
   if (/(read|search|grep|glob|list|find|fetch|bash|shell|pwsh|exec|command|terminal)/u.test(title)) {
-    return true;
+    return DSH_BRIDGE_TOOL_WAIT_MS;
   }
-  return false;
+  return DSH_BRIDGE_UNKNOWN_TOOL_WAIT_MS;
 }
 
 function dshToolOutputToText(

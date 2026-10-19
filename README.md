@@ -2,15 +2,15 @@
 
 在 VSCode Copilot Chat 中使用任意 [ACP (Agent Client Protocol)](https://github.com/zcovex/acp) 兼容的 AI 编码助手后端。
 
-`@opencode`、`@acp` 或 `@reasonix` → 实时推理过程 → 工具调用 → AI 流式输出
+`@opencode`、`@acp`、`@dsh` 或 `@reasonix` → 实时推理过程 → 工具调用 → AI 流式输出
 
 ACPilot 以 ACP 语义为核心，将 Copilot 接入层与可插拔 Agent 后端解耦。当前内置
-OpenCode、标准 ACP 和 Reasonix 后端；每个后端独立管理自己的会话、Pipeline 和
+OpenCode、标准 ACP、DeepSeek Harness 和 Reasonix 后端；每个后端独立管理自己的会话、Pipeline 和
 Copilot Vendor。
 
 ## 功能
 
-- **聊天集成**: 在 Copilot Chat 输入 `@opencode`、`@acp` 或 `@reasonix` 即可对话（对应后端需已配置）
+- **聊天集成**: 在 Copilot Chat 输入 `@opencode`、`@acp`、`@dsh` 或 `@reasonix` 即可对话（对应后端需已配置）
 - **实时推理显示**: AI 思考过程实时流式展示（thinkingProgress API）
 - **原生工具调用卡片**: 文件读取、Shell 命令等以原生 UI 渲染，可点击展开
 - **子代理支持**: 子代理/子任务自动以可展开卡片展示
@@ -30,7 +30,7 @@ task / subagent      → 点击展开子代理完整对话
 
 ## 安装
 
-1. 按需安装并配置后端。使用 OpenCode 时请先安装 [OpenCode CLI](https://opencode-ai.com) 并完成认证；标准 ACP 和 Reasonix 后端可在设置中配置目标
+1. 按需安装并配置后端。使用 OpenCode 时请先安装 [OpenCode CLI](https://opencode-ai.com) 并完成认证；标准 ACP 和 DeepSeek Harness 目标可在 ACP 设置中配置，Reasonix 后端使用扩展设置中的命令配置
 2. 克隆仓库
    ```bash
    git clone https://github.com/wlxms/acpilot.git
@@ -55,6 +55,22 @@ task / subagent      → 点击展开子代理完整对话
 | `@opencode /help` | 显示帮助 |
 | `@acp read package.json` | 通过当前配置的标准 ACP 后端对话 |
 | `@reasonix read package.json` | 通过 Reasonix ACP 后端对话 |
+| `@dsh read package.json` | 通过当前配置的 DeepSeek Harness 命令对话 |
+| `@dsh /model` | 显示 DeepSeek Harness 提供的模型列表 |
+
+
+### DeepSeek Harness 配置
+
+在 `ACP: Open Settings` 的 **DeepSeek Harness** 页面中可以保存自己的 DSH target：
+
+- `DSH command`：用户自己的 `dsh` 可执行文件、脚本或 wrapper 命令
+- `DSH launch directory`：启动 DSH 进程时使用的工作目录，可指向用户魔改后的 DSH 源码目录
+- `Arguments`：逐行填写启动参数，默认使用 `--profile` 和 `acp`
+- `Install DSH` / `Update DSH`：使用用户本机的 npm，把 `@deepseek-ai/dsh@latest` 安装或更新到指定目录
+
+安装 DSH 后，首次安装会自动填入安装目录下的 launcher；已有 target 的更新操作会保留用户设置的 command，因此可以继续使用自己的 DSH server。DSH 进程启动目录和 ACP `session/new` 使用的 VS Code workspace 目录分别配置，互不覆盖。
+
+ACPilot 也附带了可选的 `dsh-bridge` 插件。普通 DSH ACP profile 不需要安装 bridge；安装后，DSH 工具可以通过 `presentCall` / `presentResult` 把终端、文件读取、搜索、diff 和 External Edit 信息交给 VS Code 渲染。插件安装到用户自己的 DSH profile，不会替换用户的 DSH 命令或启动目录。
 
 ## 开发
 
@@ -62,7 +78,7 @@ task / subagent      → 点击展开子代理完整对话
 # 类型检查
 npm run lint
 
-# 测试（555 个单元测试）
+# 测试（618 个单元测试）
 npm test
 
 # VS Code Extension Host + loopback 控制端点 smoke/e2e
@@ -98,6 +114,7 @@ src/
 ├── backends/opencode/    # OpenCode Backend Pipeline 与协议解析
 ├── backends/acp/         # 标准 ACP Backend、transport 与 Pipeline
 ├── backends/reasonix/    # Reasonix 的 ACP preset Backend
+├── backends/dsh/         # DeepSeek Harness 独立 ACP Backend
 ├── surfaces/vscode/model-catalog.ts # CopilotModelCatalog 与模型路由
 ├── surfaces/vscode/      # VS Code participant、session provider 与模型 surface
 ├── participant/          # ChatRequestHandler 编排层（handler + checkpoint + title）
@@ -179,6 +196,7 @@ src/
 ├── backends/opencode/        # OpenCode Backend Pipeline + raw 事件解析
 ├── backends/acp/             # 标准 ACP Backend + Pipeline
 ├── backends/reasonix/        # Reasonix ACP preset
+├── backends/dsh/             # DeepSeek Harness ACP preset
 ├── backend/transient-session-stream.ts # Native LM 的不落盘 stream
 ├── surfaces/vscode/model-catalog.ts # CopilotModelCatalog
 ├── surfaces/vscode/          # VS Code surfaces 与能力检测

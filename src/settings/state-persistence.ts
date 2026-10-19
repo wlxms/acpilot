@@ -21,6 +21,12 @@
 import type * as vscode from 'vscode';
 import type { SelectionState } from '../backend/app-event-bus';
 import type { PersistedSettingsState } from '../types';
+import {
+  isDshTarget,
+  normalizeDshTarget,
+  type DshTarget,
+  type DshTargetInput,
+} from '../backends/dsh/target';
 
 /**
  * Settings state key, namespaced per backend so that each backend's
@@ -29,6 +35,7 @@ import type { PersistedSettingsState } from '../types';
 const SETTINGS_STATE_KEY_PREFIX = 'acp.settingsState';
 const ACP_TARGET_STATE_KEY = 'acp.remoteTargets.v1';
 const ACP_TARGET_SECRET_PREFIX = 'acp.remoteTargetToken';
+const DSH_TARGET_STATE_KEY = 'dsh.targets.v1';
 
 function settingsStateKey(backendId: string): string {
   return `${SETTINGS_STATE_KEY_PREFIX}.${backendId}`;
@@ -53,6 +60,11 @@ export interface AcpTargetInput {
   name?: string;
   endpoint: string;
   authToken?: string;
+}
+
+export interface DshTargetState {
+  activeTargetId?: string;
+  targets: DshTarget[];
 }
 
 // ---------------------------------------------------------------------------
@@ -265,4 +277,92 @@ function createTargetId(): string {
 
 function acpTargetSecretKey(targetId: string): string {
   return `${ACP_TARGET_SECRET_PREFIX}.${targetId}`;
+}
+// ---------------------------------------------------------------------------
+// DeepSeek Harness target persistence
+// ---------------------------------------------------------------------------
+
+export function loadDshTargetState(context: vscode.ExtensionContext): DshTargetState {
+  const raw = context.globalState.get<Partial<DshTargetState>>(DSH_TARGET_STATE_KEY);
+  const targets = Array.isArray(raw?.targets)
+    ? raw.targets.flatMap(target => {
+      if (!isDshTarget(target)) {return [];}
+      // Targets were normalized before persistence. Keep their timestamps
+      // stable while loading; normalizing here would rewrite updatedAt on every
+      // settings panel refresh.
+      return [target];
+    })
+    : [];
+  const activeTargetId = typeof raw?.activeTargetId === 'string'
+    && targets.some(target => target.id === raw.activeTargetId)
+    ? raw.activeTargetId
+    : undefined;
+  return { activeTargetId, targets };
+}
+
+export async function saveDshTargetState(
+  context: vscode.ExtensionContext,
+  state: DshTargetState,
+): Promise<void> {
+  const targets = state.targets.map(target => normalizeDshTarget(target));
+  const normalized: DshTargetState = {
+    activeTargetId: state.activeTargetId && targets.some(target => target.id === state.activeTargetId)
+      ? state.activeTargetId
+      : undefined,
+    targets,
+  };
+  await context.globalState.update(DSH_TARGET_STATE_KEY, normalized);
+}
+
+export function getActiveDshTarget(context: vscode.ExtensionContext): DshTarget | undefined {
+  const state = loadDshTargetState(context);
+  return state.targets.find(target => target.id === state.activeTargetId);
+}
+
+export async function upsertDshTarget(
+  context: vscode.ExtensionContext,
+  input: DshTargetInput,
+  options?: { makeActive?: boolean },
+): Promise<DshTarget> {
+  const state = loadDshTargetState(context);
+  const existing = input.id ? state.targets.find(target => target.id === input.id) : undefined;
+  const target = normalizeDshTarget(input, existing);
+  const index = state.targets.findIndex(item => item.id === target.id);
+  if (index >= 0) {
+    state.targets[index] = target;
+  } else {
+    state.targets.push(target);
+  }
+  if (options?.makeActive ?? !state.activeTargetId) {
+    state.activeTargetId = target.id;
+  }
+  await saveDshTargetState(context, state);
+  return target;
+}
+
+export async function removeDshTarget(
+  context: vscode.ExtensionContext,
+  targetId: string,
+): Promise<DshTargetState> {
+  const state = loadDshTargetState(context);
+  const targets = state.targets.filter(target => target.id !== targetId);
+  const activeTargetId = state.activeTargetId === targetId
+    ? targets[0]?.id
+    : state.activeTargetId;
+  const next = { activeTargetId, targets };
+  await saveDshTargetState(context, next);
+  return next;
+}
+
+export async function setActiveDshTarget(
+  context: vscode.ExtensionContext,
+  targetId: string | undefined,
+): Promise<DshTargetState> {
+  const state = loadDshTargetState(context);
+  if (targetId && !state.targets.some(target => target.id === targetId)) {
+    throw new Error('Unknown DSH target: ' + targetId);
+  }
+  const next = { ...state, activeTargetId: targetId };
+  await saveDshTargetState(context, next);
+  return next;
 }

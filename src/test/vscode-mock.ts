@@ -338,12 +338,29 @@ export class Position {
 }
 
 export class Range {
+    readonly start: Position;
+    readonly end: Position;
     constructor(
         public readonly startLine: number,
         public readonly startCharacter: number,
         public readonly endLine: number,
         public readonly endCharacter: number,
-    ) {}
+    ) {
+        this.start = new Position(startLine, startCharacter);
+        this.end = new Position(endLine, endCharacter);
+    }
+}
+
+export class Location {
+    readonly range: Range;
+    constructor(
+        public readonly uri: Uri,
+        positionOrRange: Position | Range,
+    ) {
+        this.range = positionOrRange instanceof Range
+            ? positionOrRange
+            : new Range(positionOrRange.line, positionOrRange.character, positionOrRange.line, positionOrRange.character);
+    }
 }
 
 export class TextEdit {

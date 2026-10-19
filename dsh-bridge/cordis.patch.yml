@@ -1,0 +1,5 @@
+# Optional ACPilot readiness bridge. The official dsh ACP bundle remains the
+# owner of stdout and the ACP JSON-RPC transport.
+- insert:
+    - id: acpilot-dsh-bridge
+      name: '@wlxms/acpilot-dsh-bridge'

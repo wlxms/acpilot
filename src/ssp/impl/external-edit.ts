@@ -57,6 +57,7 @@ export class ExternalEditSSP extends SerializableStreamPart<
   private deferred: { resolve: () => void; promise: Promise<void> } | null = null;
   private onDidComplete: Thenable<string> | null = null;
   private metadataSettled: Promise<void> | null = null;
+  private completionRequested = false;
   private _undoStopId: string | null = null;
   private snapshotListeners: Array<(snapshot: FileSnapshotRecord) => void> = [];
 
@@ -108,10 +109,7 @@ export class ExternalEditSSP extends SerializableStreamPart<
     if (!stream.externalEdit) {return;}
     this.editStarted = true;
 
-    const uris = (this.payload.uris ?? []) as vscode.Uri[];
-    if (uris.length === 0 && this.payload.uri) {
-      uris.push(buildFileUri(this.payload.uri, this.directory));
-    }
+    const uris = this.resolveUris();
     if (uris.length === 0) {return;}
 
     const toolCallId = this.payload.toolCallId;
@@ -128,10 +126,16 @@ export class ExternalEditSSP extends SerializableStreamPart<
 
       // Block until update({status:'completed'}) resolves the deferred
       this.deferred ??= createDeferred();
+      if (this.completionRequested) {
+        this.deferred.resolve();
+      }
       await this.deferred.promise;
     };
 
     this.onDidComplete = stream.externalEdit(uris, callback);
+    if (this.completionRequested) {
+      this.settleCompletion();
+    }
   }
 
   // ── IMutableStreamPart.update ──────────────────────────────────────────
@@ -139,39 +143,58 @@ export class ExternalEditSSP extends SerializableStreamPart<
   update(data: Partial<ExternalEditStreamPartPayload>): void {
     Object.assign(this.payload, data);
 
-    if ((data.status === 'completed' || data.status === 'error') && this.deferred) {
-      this.deferred.resolve();
+    if (data.status !== 'completed' && data.status !== 'error') {return;}
+    if (this.completionRequested) {return;}
+    this.completionRequested = true;
+    this.deferred?.resolve();
+    this.settleCompletion();
+  }
 
-      // Wait for VS Code to return undoStopId
-      const completion = this.onDidComplete;
-      if (completion) {
-        this.metadataSettled = Promise.resolve(completion).then(
-          (undoStopId: string) => {
-            this._undoStopId = undoStopId || null;
-            if (this._undoStopId) {
-              this.payload.undoStopId = this._undoStopId;
-              this.payload.editId = this._undoStopId;
-              this.meta.editId = this._undoStopId;
-            }
-            // Capture after-snapshots
-            const uris = (this.payload.uris ?? []) as vscode.Uri[];
-            if (this.payload.uri && uris.length === 0) {
-              uris.push(buildFileUri(this.payload.uri, this.directory));
-            }
-            for (let i = 0; i < uris.length; i++) {
-              const after = captureSnapshot(uris[i], this.payload.toolCallId, 'after', i, this.meta.turnIndex);
-              after.undoStopId = undoStopId || undefined;
-              this.emitSnapshot(after);
-            }
-            this.emitStateChange();
-          },
-          () => {
-            // onDidComplete rejected — still emit to mark completion
-            this.emitStateChange();
-          },
-        );
+  private settleCompletion(): void {
+    if (this.metadataSettled || !this.onDidComplete) {return;}
+
+    // Wait for VS Code to return undoStopId
+    const completion = this.onDidComplete;
+    this.metadataSettled = Promise.resolve(completion).then(
+      (undoStopId: string) => {
+        this._undoStopId = undoStopId || null;
+        if (this._undoStopId) {
+          this.payload.undoStopId = this._undoStopId;
+          this.payload.editId = this._undoStopId;
+          this.meta.editId = this._undoStopId;
+        }
+        // Capture after-snapshots
+        const uris = this.resolveUris();
+        for (let i = 0; i < uris.length; i++) {
+          const after = captureSnapshot(uris[i], this.payload.toolCallId, 'after', i, this.meta.turnIndex);
+          after.undoStopId = undoStopId || undefined;
+          this.emitSnapshot(after);
+        }
+        this.emitStateChange();
+      },
+      () => {
+        // onDidComplete rejected — still emit to mark completion
+        this.emitStateChange();
+      },
+    );
+  }
+
+  private resolveUris(): vscode.Uri[] {
+    const values = Array.isArray(this.payload.uris) ? this.payload.uris : [];
+    const uris = values.flatMap(value => {
+      if (typeof value === 'string' && value.length > 0) {
+        return [buildFileUri(value, this.directory)];
       }
-    }
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
+        const fsPath = (value as { fsPath?: unknown }).fsPath;
+        if (typeof fsPath === 'string' && fsPath.length > 0) {
+          return [buildFileUri(fsPath, this.directory)];
+        }
+      }
+      return [];
+    });
+    if (uris.length > 0) {return uris;}
+    return this.payload.uri ? [buildFileUri(this.payload.uri, this.directory)] : [];
   }
 
   private emitSnapshot(snapshot: FileSnapshotRecord): void {

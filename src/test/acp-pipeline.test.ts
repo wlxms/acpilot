@@ -97,7 +97,7 @@ describe('AcpPipeline', () => {
 
     expect(target.updated).toHaveLength(1);
     expect(target.updated[0]).toMatchObject({
-      id: 'tool-call-1',
+      id: 'call-1',
       data: { state: { status: 'completed', output: 'contents' } },
     });
   });

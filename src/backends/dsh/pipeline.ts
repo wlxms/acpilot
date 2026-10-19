@@ -119,6 +119,7 @@ export class DshPipeline extends AcpPipeline {
    */
   override async resolvePermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
     const toolCallId = params.toolCall.toolCallId;
+    this.logger.appendLine(`[dsh-pipeline] permission.request tool=${toolCallId} kind=${params.toolCall.kind ?? 'unknown'}`);
     let bridgeCall = this.bridgeCalls.get(toolCallId);
     if (!bridgeCall) {
       bridgeCall = bridgeCallFromAcpUpdate(this.acpToolCalls.get(toolCallId), this.sessionId);
@@ -129,7 +130,9 @@ export class DshPipeline extends AcpPipeline {
     }
     if (!bridgeCall) {
       this.flushPendingAcpToolCall(toolCallId);
-      return super.resolvePermission(params);
+      const response = await super.resolvePermission(params);
+      this.logger.appendLine(`[dsh-pipeline] permission.reply tool=${toolCallId} outcome=${response.outcome.outcome}`);
+      return response;
     }
 
     const presentation = bridgeCall.presentation;
@@ -140,7 +143,9 @@ export class DshPipeline extends AcpPipeline {
       rawInput: bridgeCall.rawInput ?? params.toolCall.rawInput ?? presentationInput(presentation),
       locations: mergeToolLocations(params.toolCall.locations, presentationLocations(presentation)),
     };
-    return super.resolvePermission({ ...params, toolCall });
+    const response = await super.resolvePermission({ ...params, toolCall });
+    this.logger.appendLine(`[dsh-pipeline] permission.reply tool=${toolCallId} outcome=${response.outcome.outcome}`);
+    return response;
   }
 
   private waitForBridgeCall(toolCallId: string): Promise<DshBridgeToolCallMessage | undefined> {
@@ -340,6 +345,7 @@ export class DshPipeline extends AcpPipeline {
     }
     const presentation = inferAcpFilePresentation(update);
     if (presentation?.card !== 'diff') {return;}
+    this.logger.appendLine(`[dsh-pipeline] bridge.missing fallback=external_edit call=${update.toolCallId}`);
     const filePaths = resolveDshFilePaths(update, presentation, this.directory);
     if (filePaths.length === 0) {return;}
 

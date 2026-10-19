@@ -74,12 +74,14 @@ export class DshBackend extends AcpBackend {
   protected override onLocalStderrLine(line: string): void {
     const ready = parseDshBridgeReadyLine(line);
     if (ready) {
+      this.logMessage(`bridge.ready protocol=${ready.protocol}`);
       return;
     }
     const message = parseDshBridgeToolLine(line);
     if (!message) {
       return;
     }
+    this.logMessage(`bridge.${message.type} session=${message.sessionId} call=${message.toolCallId} tool=${message.toolName}`);
     this.routeBridgeMessage(message);
   }
 

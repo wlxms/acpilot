@@ -82,6 +82,7 @@ describe('DeepSeek Harness bridge runtime', () => {
   it('uses the executing Agent scope for the real DSH write presentation', () => {
     const bridgePath = JSON.stringify(pathToFileURL(path.resolve(process.cwd(), 'dsh-bridge/index.mjs')).href);
     const script = `
+      process.env.ACPILOT_DSH_BRIDGE_NONCE = 'test-nonce';
       const bridge = await import(${bridgePath});
       const writes = [];
       const originalWrite = process.stderr.write.bind(process.stderr);
@@ -156,6 +157,7 @@ describe('DeepSeek Harness bridge runtime', () => {
   it('turns an allowed diff presentation into an approval request', () => {
     const bridgePath = JSON.stringify(pathToFileURL(path.resolve(process.cwd(), 'dsh-bridge/index.mjs')).href);
     const script = `
+      process.env.ACPILOT_DSH_BRIDGE_NONCE = 'test-nonce';
       const bridge = await import(${bridgePath});
       const writes = [];
       const originalWrite = process.stderr.write.bind(process.stderr);
@@ -199,6 +201,42 @@ describe('DeepSeek Harness bridge runtime', () => {
     expect(result.callTitle).toBe('Write dsh-hello.md');
   });
 
+  it('runs downstream policy listeners before converting an allowed diff call into ask', () => {
+    const bridgePath = JSON.stringify(pathToFileURL(path.resolve(process.cwd(), 'dsh-bridge/index.mjs')).href);
+    const script = `
+      process.env.ACPILOT_DSH_BRIDGE_NONCE = 'test-nonce';
+      const bridge = await import(${bridgePath});
+      const handlers = {};
+      let nextCalled = false;
+      const approval = { config: { policy: 'ask' }, overrideOf: () => 'ask' };
+      bridge.apply({
+        tools: { get: () => ({ presentCall: () => ({ card: 'diff', title: 'Write dsh-hello.md' }) }) },
+        get: (name) => name === 'approval' ? approval : undefined,
+        on: (name, handler) => { handlers[name] = handler; },
+        provide: () => undefined,
+      });
+      const decision = await handlers['tools/pre-execute']({
+        agent: { session: { id: 'session-1' } },
+        callId: 'call-1', rootCallId: 'call-1', name: 'write',
+        arguments: { file_path: 'dsh-hello.md', content: 'after' },
+      }, async () => {
+        nextCalled = true;
+        return { kind: 'allow' };
+      });
+      process.stdout.write(JSON.stringify({ decision, nextCalled }));
+    `;
+    const raw = execFileSync(process.execPath, ['--input-type=module', '-e', script], {
+      cwd: process.cwd(),
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const result = JSON.parse(raw) as {
+      decision: { kind?: string; reason?: string };
+      nextCalled: boolean;
+    };
+    expect(result.decision).toEqual({ kind: 'ask', reason: 'Write dsh-hello.md' });
+    expect(result.nextCalled).toBe(true);
+  });
   it('re-enables the approval channel for full-access write calls when ACPilot is attached', () => {
     const bridgePath = JSON.stringify(pathToFileURL(path.resolve(process.cwd(), 'dsh-bridge/index.mjs')).href);
     const script = `
@@ -289,4 +327,66 @@ describe('DeepSeek Harness bridge runtime', () => {
     expect(result.policyChanges[0]?.policy).toBe('ask');
   });
 
+  it('projects DSH result metadata into read and edit cards when no presenter is installed', () => {
+    const bridgePath = JSON.stringify(pathToFileURL(path.resolve(process.cwd(), 'dsh-bridge/index.mjs')).href);
+    const script = `
+      const bridge = await import(${bridgePath});
+      const writes = [];
+      const originalWrite = process.stderr.write.bind(process.stderr);
+      process.stderr.write = (chunk) => {
+        writes.push(String(chunk));
+        return true;
+      };
+      const handlers = {};
+      bridge.apply({
+        tools: { get: () => ({}) },
+        on: (name, handler) => { handlers[name] = handler; },
+        provide: () => undefined,
+      });
+      const agent = { session: { id: 'session-1' } };
+      handlers['tools/result'](
+        { agent, callId: 'read-1', rootCallId: 'read-1', name: 'read', arguments: { file_path: 'src/a.ts' } },
+        {
+          isError: false,
+          content: [{ type: 'text', text: '<path>src/a.ts</path>' }],
+          meta: { path: 'src/a.ts', offset: 4, lines: [{ number: 4, text: 'const x = 1;' }], totalLines: 8, lang: 'ts' },
+        },
+      );
+      handlers['tools/result'](
+        { agent, callId: 'edit-1', rootCallId: 'edit-1', name: 'edit', arguments: { file_path: 'src/a.ts' } },
+        {
+          isError: false,
+          content: [{ type: 'text', text: 'Edited' }],
+          meta: { diffs: [{ path: 'src/a.ts', oldText: 'const x = 1;', newText: 'const x = 2;' }] },
+        },
+      );
+      process.stderr.write = originalWrite;
+      const prefix = 'ACPILOT_DSH_BRIDGE_TOOL\\t';
+      const messages = writes
+        .filter((line) => line.startsWith(prefix))
+        .map((line) => JSON.parse(line.slice(prefix.length)));
+      process.stdout.write(JSON.stringify({ read: messages[0]?.presentation, edit: messages[1]?.presentation }));
+    `;
+    const raw = execFileSync(process.execPath, ['--input-type=module', '-e', script], {
+      cwd: process.cwd(),
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const result = JSON.parse(raw) as {
+      read?: Record<string, unknown>;
+      edit?: Record<string, unknown>;
+    };
+    expect(result.read).toMatchObject({
+      card: 'read',
+      path: 'src/a.ts',
+      offset: 4,
+      totalLines: 8,
+      lang: 'ts',
+    });
+    expect(result.edit).toMatchObject({
+      card: 'diff',
+      diffs: [{ path: 'src/a.ts', oldText: 'const x = 1;', newText: 'const x = 2;' }],
+      locations: [{ path: 'src/a.ts' }],
+    });
+  });
 });

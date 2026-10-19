@@ -3,6 +3,7 @@ import type {
   RequestPermissionResponse,
   SessionUpdate,
 } from '@agentclientprotocol/sdk';
+import path from 'node:path';
 import type {
   BackendPipelineOptions,
 } from '../../backend/backend';
@@ -11,6 +12,7 @@ import { AcpPipeline } from '../acp/pipeline';
 import { resolveToolCallPath } from '../acp/filepath-resolver';
 const DSH_BRIDGE_PERMISSION_WAIT_MS = 1_500;
 const DSH_BRIDGE_TOOL_WAIT_MS = 100;
+const DSH_BRIDGE_EXTERNAL_EDIT_WAIT_MS = 0;
 const DSH_BRIDGE_UNKNOWN_TOOL_WAIT_MS = DSH_BRIDGE_PERMISSION_WAIT_MS;
 const DSH_BRIDGE_CACHE_LIMIT = 256;
 
@@ -46,6 +48,7 @@ export class DshPipeline extends AcpPipeline {
   private readonly acpToolCalls = new Map<string, AcpToolCall>();
   private readonly bridgePermissionWaiters = new Map<string, Set<(message: DshBridgeToolCallMessage) => void>>();
   private readonly pendingAcpToolCalls = new Map<string, DeferredAcpToolCall>();
+  private readonly pendingExternalEditTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly deferredDiffToolCalls = new Set<string>();
   private disposed = false;
 
@@ -58,6 +61,11 @@ export class DshPipeline extends AcpPipeline {
     if (this.disposed || message.sessionId !== this.sessionId) {return;}
     if (message.type === 'tool_call') {
       this.bridgeCalls.set(message.toolCallId, message);
+      const externalEditTimer = this.pendingExternalEditTimers.get(message.toolCallId);
+      if (externalEditTimer !== undefined) {
+        clearTimeout(externalEditTimer);
+        this.pendingExternalEditTimers.delete(message.toolCallId);
+      }
       trimMap(this.bridgeCalls);
       this.flushPendingAcpToolCall(message.toolCallId);
       this.applyBridgeCall(message);
@@ -88,7 +96,9 @@ export class DshPipeline extends AcpPipeline {
     for (const pending of this.pendingAcpToolCalls.values()) {
       if (pending.timer !== undefined) {clearTimeout(pending.timer);}
     }
+    for (const timer of this.pendingExternalEditTimers.values()) {clearTimeout(timer);}
     this.pendingAcpToolCalls.clear();
+    this.pendingExternalEditTimers.clear();
     this.bridgePermissionWaiters.clear();
     this.bridgeCalls.clear();
     this.bridgeResults.clear();
@@ -109,6 +119,7 @@ export class DshPipeline extends AcpPipeline {
    */
   override async resolvePermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
     const toolCallId = params.toolCall.toolCallId;
+    this.logger.appendLine(`[dsh-pipeline] permission.request tool=${toolCallId} kind=${params.toolCall.kind ?? 'unknown'}`);
     let bridgeCall = this.bridgeCalls.get(toolCallId);
     if (!bridgeCall) {
       bridgeCall = bridgeCallFromAcpUpdate(this.acpToolCalls.get(toolCallId), this.sessionId);
@@ -119,7 +130,9 @@ export class DshPipeline extends AcpPipeline {
     }
     if (!bridgeCall) {
       this.flushPendingAcpToolCall(toolCallId);
-      return super.resolvePermission(params);
+      const response = await super.resolvePermission(params);
+      this.logger.appendLine(`[dsh-pipeline] permission.reply tool=${toolCallId} outcome=${response.outcome.outcome}`);
+      return response;
     }
 
     const presentation = bridgeCall.presentation;
@@ -130,7 +143,9 @@ export class DshPipeline extends AcpPipeline {
       rawInput: bridgeCall.rawInput ?? params.toolCall.rawInput ?? presentationInput(presentation),
       locations: mergeToolLocations(params.toolCall.locations, presentationLocations(presentation)),
     };
-    return super.resolvePermission({ ...params, toolCall });
+    const response = await super.resolvePermission({ ...params, toolCall });
+    this.logger.appendLine(`[dsh-pipeline] permission.reply tool=${toolCallId} outcome=${response.outcome.outcome}`);
+    return response;
   }
 
   private waitForBridgeCall(toolCallId: string): Promise<DshBridgeToolCallMessage | undefined> {
@@ -177,6 +192,7 @@ export class DshPipeline extends AcpPipeline {
       trimSet(this.observedAcpToolCalls);
       this.acpToolCalls.set(update.toolCallId, update);
       trimMap(this.acpToolCalls);
+      this.ensureBridgeFreeExternalEdit(update);
       this.deferAcpToolCall(update, eventSessionId);
       return;
     }
@@ -231,8 +247,14 @@ export class DshPipeline extends AcpPipeline {
     if (!pending) {return;}
     if (pending.timer !== undefined) {clearTimeout(pending.timer);}
     this.pendingAcpToolCalls.delete(toolCallId);
+    const externalEditTimer = this.pendingExternalEditTimers.get(toolCallId);
+    if (externalEditTimer !== undefined) {
+      clearTimeout(externalEditTimer);
+      this.pendingExternalEditTimers.delete(toolCallId);
+    }
     if (this.bridgeCalls.get(toolCallId)?.presentation.card === 'diff'
       || inferAcpFilePresentation(pending.update)?.card === 'diff') {
+      this.startBridgeFreeExternalEdit(pending.update);
       this.deferredDiffToolCalls.add(toolCallId);
     }
     this.dispatchAcpUpdate(pending.update, pending.eventSessionId);
@@ -252,7 +274,8 @@ export class DshPipeline extends AcpPipeline {
     }
     super.handleSessionUpdate(update, eventSessionId);
     if (update.sessionUpdate === 'tool_call') {
-      const bridgeCall = this.bridgeCalls.get(update.toolCallId);
+      const bridgeCall = this.bridgeCalls.get(update.toolCallId)
+        ?? bridgeCallFromAcpUpdate(update, this.sessionId);
       if (bridgeCall) {
         this.applyBridgeCall(bridgeCall);
         const result = this.bridgeResults.get(update.toolCallId);
@@ -262,8 +285,77 @@ export class DshPipeline extends AcpPipeline {
     }
     if (update.sessionUpdate === 'tool_call_update') {
       const result = this.bridgeResults.get(update.toolCallId);
-      if (result) {this.applyBridgeResult(result);}
+      if (result) {
+        this.applyBridgeResult(result);
+      } else if (update.status === 'completed' || update.status === 'failed') {
+        const call = this.acpToolCalls.get(update.toolCallId);
+        const presentation = inferAcpReadPresentation(call, dshToolOutputToText(update));
+        if (presentation) {
+          const output = dshToolOutputToText(update);
+          this.applyBridgeResult({
+            type: 'tool_result',
+            protocol: 1,
+            sessionId: eventSessionId ?? this.sessionId,
+            toolCallId: update.toolCallId,
+            rootToolCallId: update.toolCallId,
+            toolName: call?.title ?? 'read',
+            isError: update.status === 'failed',
+            ...(output !== undefined ? { output } : {}),
+            presentation,
+          });
+          this.acpToolCalls.delete(update.toolCallId);
+        }
+      }
     }
+  }
+
+  /**
+   * A DSH profile may run in full access without emitting request_permission,
+   * and the optional stderr bridge may be absent. Start the same ExternalEdit
+   * lifecycle from the standard ACP tool_call so writes and edits still pass
+   * through VS Code's external-edit checkpoint.
+   */
+  private ensureBridgeFreeExternalEdit(
+    update: Extract<SessionUpdate, { sessionUpdate: 'tool_call' }>,
+  ): void {
+    if (this.bridgeCalls.has(update.toolCallId)) {return;}
+    if (inferAcpFilePresentation(update)?.card !== 'diff') {return;}
+
+    // Start the ExternalEdit checkpoint on the next event-loop turn. This
+    // leaves a same-turn stderr bridge message a chance to cancel the fallback,
+    // while removing the old 100ms window in which a bridge-free DSH mutation
+    // could race ahead of baseline capture.
+    const timer = setTimeout(() => {
+      this.pendingExternalEditTimers.delete(update.toolCallId);
+      if (!this.bridgeCalls.has(update.toolCallId)) {
+        this.startBridgeFreeExternalEdit(update);
+      }
+    }, DSH_BRIDGE_EXTERNAL_EDIT_WAIT_MS);
+    this.pendingExternalEditTimers.set(update.toolCallId, timer);
+  }
+
+  private startBridgeFreeExternalEdit(
+    update: Extract<SessionUpdate, { sessionUpdate: 'tool_call' }>,
+  ): void {
+    if (this.bridgeCalls.has(update.toolCallId)) {return;}
+    const pendingTimer = this.pendingExternalEditTimers.get(update.toolCallId);
+    if (pendingTimer !== undefined) {
+      clearTimeout(pendingTimer);
+      this.pendingExternalEditTimers.delete(update.toolCallId);
+    }
+    const presentation = inferAcpFilePresentation(update);
+    if (presentation?.card !== 'diff') {return;}
+    this.logger.appendLine(`[dsh-pipeline] bridge.missing fallback=external_edit call=${update.toolCallId}`);
+    const filePaths = resolveDshFilePaths(update, presentation, this.directory);
+    if (filePaths.length === 0) {return;}
+
+    this.ensureExternalEdit({
+      toolCallId: update.toolCallId,
+      title: presentationTitle(presentation) ?? update.title,
+      kind: 'edit',
+      ...(update.rawInput !== undefined ? { rawInput: update.rawInput } : {}),
+      locations: presentationLocations(presentation),
+    }, filePaths, () => {});
   }
 
   private applyDeferredDiffUpdate(
@@ -331,10 +423,16 @@ export class DshPipeline extends AcpPipeline {
     const call = this.bridgeCalls.get(message.toolCallId)
       ?? bridgeCallFromAcpUpdate(this.acpToolCalls.get(message.toolCallId), this.sessionId);
     const callPresentation = call?.presentation;
-    const presentation = message.presentation ?? callPresentation;
+    const output = bridgeOutputText(message, message.presentation);
+    const parsedReadPresentation = inferAcpReadPresentation(
+      this.acpToolCalls.get(message.toolCallId),
+      output,
+    );
+    const presentation = message.presentation?.card === 'read'
+      ? message.presentation
+      : parsedReadPresentation ?? message.presentation ?? callPresentation;
     const input = presentationInput(presentation, call?.rawInput);
     const title = presentationTitle(presentation) ?? call?.toolName ?? message.toolName;
-    const output = bridgeOutputText(message, presentation);
     const status = message.isError ? 'error' : 'completed';
     const metadata = presentationMetadata(message.toolName, presentation, message);
 
@@ -397,7 +495,10 @@ function bridgeCallFromAcpUpdate(
   update: AcpToolCall | undefined,
   sessionId: string,
 ): DshBridgeToolCallMessage | undefined {
-  const presentation = update ? inferAcpFilePresentation(update) : undefined;
+  const filePresentation = update ? inferAcpFilePresentation(update) : undefined;
+  const presentation = update
+    ? (hasRenderableDiff(filePresentation) ? filePresentation : inferAcpReadPresentation(update))
+    : undefined;
   if (!update || !presentation) {return undefined;}
   return {
     type: 'tool_call',
@@ -418,25 +519,142 @@ function bridgeCallFromAcpUpdate(
  */
 function inferAcpFilePresentation(update: AcpToolCall): DshBridgePresentation | undefined {
   const name = String(update.title ?? '').toLowerCase();
-  if (!name.includes('write') && !name.includes('create') && !name.includes('edit')) {
+  if (!name.includes('write') && !name.includes('create') && !name.includes('edit')
+    && update.kind !== 'edit' && update.kind !== 'delete' && update.kind !== 'move') {
     return undefined;
   }
   if (!isRecord(update.rawInput)) {return undefined;}
   const filePath = firstString(update.rawInput.file_path, update.rawInput.filePath, update.rawInput.path, update.rawInput.filename);
-  const content = firstString(update.rawInput.content, update.rawInput.new_content, update.rawInput.newContent, update.rawInput.new_text, update.rawInput.newText);
-  if (!filePath || content === undefined) {return undefined;}
-  const verb = name.includes('write') || name.includes('create') ? 'Write' : 'Edit';
+  if (!filePath) {return undefined;}
+  const oldText = firstString(update.rawInput.old_string, update.rawInput.oldString, update.rawInput.old_text, update.rawInput.oldText);
+  const newText = firstString(
+    update.rawInput.content,
+    update.rawInput.new_content,
+    update.rawInput.newContent,
+    update.rawInput.new_string,
+    update.rawInput.newString,
+    update.rawInput.new_text,
+    update.rawInput.newText,
+  );
+  const isWrite = name.includes('write') || name.includes('create');
+  const verb = isWrite ? 'Write' : name.includes('delete') || update.kind === 'delete' ? 'Delete' : 'Edit';
   return {
     card: 'diff',
     title: verb + ' ' + filePath,
     kind: 'edit',
-    diffs: [{ path: filePath, oldText: null, newText: content }],
+    diffs: oldText !== undefined || newText !== undefined
+      ? [{ path: filePath, oldText: oldText ?? null, newText: newText ?? null }]
+      : [],
     locations: [{ path: filePath }],
   };
 }
 
+function inferAcpReadPresentation(
+  update: AcpToolCall | undefined,
+  output?: string,
+): DshBridgePresentation | undefined {
+  if (!update) {return undefined;}
+  const name = String(update.title ?? '').toLowerCase();
+  if (update.kind !== 'read' && !name.includes('read')) {return undefined;}
+
+  const parsed = output ? parseDshReadEnvelope(output) : undefined;
+  const input = isRecord(update.rawInput) ? update.rawInput : undefined;
+  const filePath = parsed?.path
+    ?? firstString(input?.file_path, input?.filePath, input?.filepath, input?.path, input?.filename);
+  if (!filePath) {return undefined;}
+
+  const offset = parsed?.offset
+    ?? positiveInteger(input?.offset)
+    ?? 1;
+  return {
+    card: 'read',
+    title: `Read ${filePath}`,
+    kind: 'read',
+    path: filePath,
+    offset,
+    ...(positiveInteger(input?.limit) !== undefined ? { limit: positiveInteger(input?.limit) } : {}),
+    ...(parsed?.lines !== undefined ? { lines: parsed.lines } : {}),
+    ...(parsed?.totalLines !== undefined ? { totalLines: parsed.totalLines } : {}),
+  };
+}
+
+function resolveDshFilePaths(
+  update: AcpToolCall,
+  presentation: DshBridgePresentation,
+  directory: string | undefined,
+): string[] {
+  const values: string[] = [];
+  const add = (value: unknown): void => {
+    if (typeof value === 'string' && value.trim() !== '') {values.push(value);}
+  };
+  const input = isRecord(update.rawInput) ? update.rawInput : undefined;
+  add(input?.file_path);
+  add(input?.filePath);
+  add(input?.filepath);
+  add(input?.path);
+  add(input?.filename);
+  if (Array.isArray(input?.paths)) {
+    for (const value of input.paths) {add(value);}
+  }
+  for (const location of presentationLocations(presentation) ?? []) {add(location.path);}
+  return [...new Set(values)].map(value => path.isAbsolute(value)
+    ? value
+    : path.resolve(directory ?? '', value));
+}
+
 function firstString(...values: unknown[]): string | undefined {
   return values.find((value): value is string => typeof value === 'string');
+}
+
+function positiveInteger(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : undefined;
+}
+
+interface ParsedDshReadEnvelope {
+  path: string;
+  offset?: number;
+  lines?: Array<{ number: number; text: string }>;
+  totalLines?: number;
+}
+
+function parseDshReadEnvelope(output: string): ParsedDshReadEnvelope | undefined {
+  const pathMatch = output.match(/<path>\s*([\s\S]*?)\s*<\/path>/iu);
+  const typeMatch = output.match(/<type>\s*([^<]+?)\s*<\/type>/iu);
+  if (!pathMatch || (typeMatch && typeMatch[1].trim().toLowerCase() !== 'file')) {return undefined;}
+
+  const filePath = pathMatch[1].trim();
+  if (!filePath) {return undefined;}
+  const contentMatch = output.match(/<content>\r?\n?([\s\S]*?)\r?\n?<\/content>/iu);
+  if (!contentMatch) {return { path: filePath };}
+
+  const body = contentMatch[1].replace(/\r\n/gu, '\n');
+  const bodyLines = body.split('\n');
+  const footerIndex = bodyLines.findIndex(line => /^\((?:End of file|Showing lines|Output capped)/iu.test(line.trim()));
+  const contentLines = (footerIndex >= 0 ? bodyLines.slice(0, footerIndex) : bodyLines)
+    .filter(line => line.trim() !== '')
+    .map(line => {
+      const match = line.match(/^(\d+):(?: ?)(.*)$/u);
+      return match ? { number: Number(match[1]), text: match[2] } : undefined;
+    })
+    .filter((line): line is { number: number; text: string } => line !== undefined);
+  const footer = footerIndex >= 0 ? bodyLines.slice(footerIndex).join(' ') : '';
+  const firstLine = contentLines[0]?.number;
+  const showingMatch = footer.match(/\(Showing lines\s+(\d+)\s*-\s*\d+/iu)
+    ?? footer.match(/\(Output capped\.\s*Showing lines\s+(\d+)\s*-\s*\d+/iu);
+  const totalMatch = footer.match(/\btotal\s+(\d+)\s+lines\b/iu)
+    ?? footer.match(/\bof\s+(\d+)(?:\s+lines)?\b/iu);
+  return {
+    path: filePath,
+    ...(firstLine !== undefined || showingMatch ? { offset: firstLine ?? Number(showingMatch?.[1]) } : {}),
+    lines: contentLines,
+    ...(totalMatch ? { totalLines: Number(totalMatch[1]) } : {}),
+  };
+}
+
+function hasRenderableDiff(presentation: DshBridgePresentation | undefined): presentation is DshBridgePresentation {
+  return presentation?.card === 'diff'
+    && Array.isArray(presentation.diffs)
+    && presentation.diffs.length > 0;
 }
 
 function trimMap<T>(value: Map<string, T>): void {
@@ -595,12 +813,16 @@ function presentationInput(
   presentation: DshBridgePresentation | undefined,
   rawInput?: unknown,
 ): Record<string, unknown> {
-  if (isRecord(rawInput)) {return rawInput;}
+  if (isRecord(rawInput)) {
+    return withCanonicalFilePath(presentation, rawInput);
+  }
   if (rawInput !== undefined) {return { value: rawInput };
   }
 
   if (!presentation) {return {};}
-  if (isRecord(presentation.rawInput)) {return presentation.rawInput;}
+  if (isRecord(presentation.rawInput)) {
+    return withCanonicalFilePath(presentation, presentation.rawInput);
+  }
   const locations = presentationLocations(presentation);
   const firstLocation = locations?.[0];
   if (presentation.card === 'terminal') {
@@ -616,6 +838,22 @@ function presentationInput(
     };
   }
   return {};
+}
+
+function withCanonicalFilePath(
+  presentation: DshBridgePresentation | undefined,
+  rawInput: Record<string, unknown>,
+): Record<string, unknown> {
+  const filePath = firstString(
+    rawInput.filePath,
+    rawInput.file_path,
+    rawInput.filepath,
+    rawInput.path,
+    rawInput.filename,
+  ) ?? (presentation?.card === 'read' ? firstString(presentation.path) : presentationLocations(presentation)?.[0]?.path);
+  return filePath && rawInput.filePath === undefined
+    ? { ...rawInput, filePath }
+    : rawInput;
 }
 
 function displayToolName(toolName: string, presentation: DshBridgePresentation | undefined): string {
@@ -652,6 +890,8 @@ function bridgeOutputText(
   presentation: DshBridgePresentation | undefined,
 ): string | undefined {
   if (typeof message.output === 'string') {return message.output;}
+  const messageContent = dshContentToText(message.output);
+  if (messageContent !== undefined) {return messageContent;}
   if (message.output !== undefined) {
     try {return JSON.stringify(message.output);}
     catch {return String(message.output);}
@@ -659,6 +899,8 @@ function bridgeOutputText(
   if (!presentation) {return undefined;}
   const output = presentation.output;
   if (typeof output === 'string') {return output;}
+  const presentationContent = dshContentToText(presentation.content);
+  if (presentationContent !== undefined) {return presentationContent;}
   if (output !== undefined) {
     try {return JSON.stringify(output);}
     catch {return String(output);}
@@ -689,4 +931,22 @@ function bridgeOutputText(
     }
   }
   return undefined;
+}
+
+
+function dshContentToText(value: unknown): string | undefined {
+  if (!Array.isArray(value)) {return undefined;}
+  const text = value
+    .map(item => {
+      if (!isRecord(item)) {return '';}
+      if (item.type === 'text' && typeof item.text === 'string') {return item.text;}
+      if (item.type === 'content' && isRecord(item.content)
+        && item.content.type === 'text' && typeof item.content.text === 'string') {
+        return item.content.text;
+      }
+      return '';
+    })
+    .filter(Boolean)
+    .join('\n');
+  return text || undefined;
 }

@@ -265,6 +265,11 @@ export class AcpBackend implements Backend<ActiveSessionMessage> {
     // Base ACP has no side channel.
   }
 
+  /** Allow specialized adapters to report side-channel lifecycle diagnostics. */
+  protected logMessage(message: string): void {
+    this.log(message);
+  }
+
   async start(directory?: string): Promise<BackendResult<BackendServerInfo>> {
     // A stop owns the old connection until its bounded cleanup pass finishes.
     // Waiting here gives a replacement target a clean lifecycle boundary while

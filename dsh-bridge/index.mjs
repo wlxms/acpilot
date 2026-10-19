@@ -144,6 +144,10 @@ export function apply(ctx) {
     } catch {
       // Fall through to a provider-neutral fallback card.
     }
+    if (!result.isError) {
+      const metadataPresentation = resultMetadataPresentation(exec, result)
+      if (metadataPresentation) return metadataPresentation
+    }
     return result.isError ? undefined : fileMutationPresentation(exec)
   }
   ctx.on('tools/pre-execute', async (exec, next) => {
@@ -161,22 +165,23 @@ export function apply(ctx) {
         presentation,
       })
     }
-    // Switch a full-access session back to the normal approval channel before
-    // downstream policy listeners run. Some DSH profiles resolve approval:
-    // never into a deny during next(), which would otherwise prevent ACPilot
-    // from ever receiving session/request_permission.
+    // DSH's pre-execute waterfall is the permission gate. Re-enable a full-
+    // access approval channel before delegating so the normal downstream
+    // policy listeners still run. Only an allowed downstream decision is
+    // converted into `ask`; denials and other decisions remain authoritative.
+    // The approval service then runs before tools/execute can dispatch, while
+    // monotonic tools.guard() policies continue to run after the approval.
     if (presentation.card === 'diff' && bridgeAttached) {
       await ensureApprovalChannel(exec)
-    }
-
-    const decision = await next()
-    if (presentation.card === 'diff' && decision?.kind === 'allow') {
+      const decision = await next()
+      if (decision?.kind !== 'allow') return decision
       return {
         kind: 'ask',
         reason: presentationTitle(presentation) ?? `Allow ${exec.name}`,
       }
     }
-    return decision
+
+    return next()
   }, { prepend: true })
 
   ctx.on('tools/result', (exec, result) => {
@@ -229,6 +234,87 @@ function loadApprovalPolicySetter() {
   return approvalPolicySetterPromise
 }
 
+function resultMetadataPresentation(exec, result) {
+  const meta = result?.meta
+  if (!isRecord(meta)) return undefined
+
+  const name = String(exec?.name ?? '').toLowerCase()
+  const args = isRecord(exec?.arguments) ? exec.arguments : {}
+  const filePath = firstString(args.file_path, args.filePath, args.path, args.filename)
+
+  if (Array.isArray(meta.diffs)) {
+    const diffs = meta.diffs
+      .filter(isRecord)
+      .map(diff => ({
+        path: firstString(diff.path, diff.file_path, diff.filePath),
+        oldText: diff.oldText ?? diff.old_text ?? null,
+        newText: diff.newText ?? diff.new_text ?? null,
+      }))
+      .filter(diff => typeof diff.path === 'string')
+    const paths = uniqueStrings([
+      ...diffs.map(diff => diff.path),
+      filePath,
+    ])
+    if (name.includes('write') || name.includes('create') || name.includes('edit') || diffs.length > 0) {
+      const verb = name.includes('write') || name.includes('create') ? 'Write' : 'Edit'
+      return {
+        card: 'diff',
+        title: `${verb} ${paths[0] ?? filePath ?? exec.name}`,
+        kind: 'edit',
+        diffs,
+        locations: paths.map(path => ({ path })),
+      }
+    }
+  }
+
+  if (Array.isArray(meta.lines)
+    && typeof meta.offset === 'number'
+    && Number.isFinite(meta.offset)
+    && typeof meta.totalLines === 'number'
+    && Number.isFinite(meta.totalLines)) {
+    const path = firstString(meta.path, filePath)
+    if (path) {
+      const lines = meta.lines
+        .filter(isRecord)
+        .map(line => ({ number: line.number, text: line.text }))
+        .filter(line => Number.isInteger(line.number) && typeof line.text === 'string')
+      return {
+        card: 'read',
+        path,
+        offset: meta.offset,
+        lines,
+        totalLines: meta.totalLines,
+        ...(typeof meta.lang === 'string' ? { lang: meta.lang } : {}),
+        ...(Array.isArray(result.content) ? { content: result.content } : {}),
+      }
+    }
+  }
+
+  if (meta.shape === 'matches' && Array.isArray(meta.files)) {
+    return {
+      card: 'search',
+      shape: 'matches',
+      files: meta.files,
+      truncated: meta.truncated === true,
+      total: typeof meta.total === 'number' ? meta.total : meta.files.length,
+    }
+  }
+  if (meta.shape === 'paths' && Array.isArray(meta.paths)) {
+    return {
+      card: 'search',
+      shape: 'paths',
+      paths: meta.paths.filter(value => typeof value === 'string'),
+      truncated: meta.truncated === true,
+      total: typeof meta.total === 'number' ? meta.total : meta.paths.length,
+    }
+  }
+
+  return undefined
+}
+
+function uniqueStrings(values) {
+  return [...new Set(values.filter(value => typeof value === 'string' && value.length > 0))]
+}
 function fileMutationPresentation(exec) {
   const name = String(exec?.name ?? '')
   const lowered = name.toLowerCase()
@@ -237,15 +323,26 @@ function fileMutationPresentation(exec) {
   if (!lowered.includes('write') && !lowered.includes('create') && !lowered.includes('edit')) return undefined
 
   const filePath = firstString(args.file_path, args.filePath, args.path, args.filename)
-  const content = firstString(args.content, args.new_content, args.newContent, args.new_text, args.newText)
-  if (!filePath || content === undefined) return undefined
+  if (!filePath) return undefined
+  const oldText = firstString(args.old_string, args.oldString, args.old_text, args.oldText)
+  const newText = firstString(
+    args.content,
+    args.new_content,
+    args.newContent,
+    args.new_string,
+    args.newString,
+    args.new_text,
+    args.newText,
+  )
 
   const verb = lowered.includes('write') || lowered.includes('create') ? 'Write' : 'Edit'
   return {
     card: 'diff',
     title: `${verb} ${filePath}`,
     kind: 'edit',
-    diffs: [{ path: filePath, oldText: null, newText: content }],
+    diffs: oldText !== undefined || newText !== undefined
+      ? [{ path: filePath, oldText: oldText ?? null, newText: newText ?? null }]
+      : [],
     locations: [{ path: filePath }],
   }
 }

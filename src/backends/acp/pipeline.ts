@@ -214,6 +214,7 @@ export class AcpPipeline implements BackendPipeline<ActiveSessionMessage> {
       {
         onBaselineCaptured: () => {
           state.captured = true;
+          this.logger.appendLine(`[acp-pipeline] external_edit.baseline tool=${toolCallId}`);
           const callbacks = [...state.callbacks];
           state.callbacks.clear();
           for (const callback of callbacks) {callback();}
@@ -257,9 +258,11 @@ export class AcpPipeline implements BackendPipeline<ActiveSessionMessage> {
           onResult: result => {
             const selected = getSelectedPermissionOption(result);
             const option = params.options.find(candidate => candidate.optionId === selected);
-            resolve(option && option.kind.startsWith('allow')
+            const response: RequestPermissionResponse = option && option.kind.startsWith('allow')
               ? selectedPermissionResponse(option.optionId)
-              : { outcome: { outcome: 'cancelled' } });
+              : { outcome: { outcome: 'cancelled' } };
+            this.logger.appendLine(`[acp-pipeline] permission.reply tool=${params.toolCall.toolCallId} outcome=${response.outcome.outcome}`);
+            resolve(response);
           },
           onSkip: () => resolve({ outcome: { outcome: 'cancelled' } }),
         },

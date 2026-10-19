@@ -21,6 +21,7 @@ import {
   DEFAULT_DSH_PACKAGE_SPEC,
 } from "./backends/dsh/target";
 import { resolveDshLaunch } from "./backends/dsh/resolver";
+import { appendDshBridgePatch, ensureDshBridgePatch } from "./backends/dsh/bridge-launch";
 import {
   commandAfterDshInstall,
   defaultDshArgs,
@@ -432,14 +433,20 @@ async function resolveSelectedDshBackendOptions(
     };
   }
   const nonce = createDshBridgeLaunchNonce();
+  const bridgePatchPath = await ensureDshBridgePatch({
+    modulePath: vscode.Uri.joinPath(context.extensionUri, 'dsh-bridge', 'index.mjs').fsPath,
+    patchDirectory: join(context.globalStorageUri.fsPath, 'dsh'),
+  });
   return {
     local: {
       command: resolution.command,
-      args: resolution.args,
+      // Load the ACPilot bridge as the last DSH patch layer. The module is
+      // referenced by file URL, so this works with a user-owned DSH checkout,
+      // wrapper, or modified package without installing anything into its
+      // profile. Remote endpoints cannot receive a local patch and use ACP
+      // events only.
+      args: appendDshBridgePatch(resolution.command, resolution.args, bridgePatchPath),
       cwd: resolution.cwd,
-      // The bridge is optional. A user's normal `dsh --profile acp` process
-      // speaks ACP directly; an installed ACPilot bridge can use this nonce to
-      // publish its readiness marker for future protocol extensions.
       env: { ACPILOT_DSH_BRIDGE_NONCE: nonce },
       stderr: 'pipe',
       shell: resolution.shell,

@@ -6,7 +6,9 @@ import type { ActiveSessionMessage } from '@agentclientprotocol/sdk';
 import type { BackendPipelineStream } from '../backend/backend';
 import { DshPipeline } from '../backends/dsh/pipeline';
 
-function createStream() {
+function createStream(
+  onPush?: (part: { id?: string; toJSON?: () => { payload?: Record<string, unknown> }; update?: (data: Record<string, unknown>) => void }) => void,
+) {
   const pushed: Array<{ id?: string; toJSON?: () => { payload?: Record<string, unknown> } }> = [];
   const updated: Array<{ id: string; data: Record<string, unknown> }> = [];
   const ids = new Set<string>();
@@ -18,6 +20,7 @@ function createStream() {
         ids.add(part.id);
         parts.set(part.id, part);
       }
+      onPush?.(part);
     }),
     update: vi.fn((id: string, data: Record<string, unknown>) => {
       updated.push({ id, data });
@@ -752,6 +755,63 @@ describe('DshPipeline', () => {
         id: `external-edit-call-${toolName}-no-bridge`,
         data: expect.objectContaining({ status: 'completed' }),
       }));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('starts the bridge-free ExternalEdit baseline before the automatic permission reply', async () => {
+    vi.useFakeTimers();
+    try {
+      let captureBaseline: (() => PromiseLike<unknown>) | undefined;
+      const target = createStream(part => {
+        if ((part as unknown as { kind?: string }).kind !== 'externalEdit') {return;}
+        (part as unknown as {
+          render(stream: {
+            externalEdit(target: unknown, callback: () => PromiseLike<unknown>): PromiseLike<string>;
+          }): void;
+        }).render({
+          externalEdit: (_uris, callback) => {
+            captureBaseline = callback;
+            return Promise.resolve('undo-stop');
+          },
+        });
+      });
+      const pipeline = new DshPipeline({
+        sessionId: 'session-1',
+        directory: 'D:/workspace',
+        stream: target.value,
+        permissionMode: 'full-edit',
+      });
+      const internals = pipeline as unknown as {
+        handleSessionUpdate(update: never, eventSessionId: string): void;
+      };
+
+      internals.handleSessionUpdate({
+        sessionUpdate: 'tool_call',
+        toolCallId: 'call-write-baseline',
+        title: 'write',
+        kind: 'other',
+        status: 'in_progress',
+        rawInput: { file_path: 'src/baseline.ts', content: 'after' },
+      } as never, 'session-1');
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(captureBaseline).toBeDefined();
+      const responsePromise = pipeline.resolvePermission({
+        sessionId: 'session-1',
+        toolCall: { toolCallId: 'call-write-baseline' },
+        options: [{ optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' }],
+      } as never);
+      let settled = false;
+      void responsePromise.then(() => { settled = true; });
+      await Promise.resolve();
+      expect(settled).toBe(false);
+
+      void captureBaseline!();
+      await expect(responsePromise).resolves.toEqual({
+        outcome: { outcome: 'selected', optionId: 'allow-once' },
+      });
     } finally {
       vi.useRealTimers();
     }

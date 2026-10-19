@@ -12,6 +12,7 @@ import { AcpPipeline } from '../acp/pipeline';
 import { resolveToolCallPath } from '../acp/filepath-resolver';
 const DSH_BRIDGE_PERMISSION_WAIT_MS = 1_500;
 const DSH_BRIDGE_TOOL_WAIT_MS = 100;
+const DSH_BRIDGE_EXTERNAL_EDIT_WAIT_MS = 0;
 const DSH_BRIDGE_UNKNOWN_TOOL_WAIT_MS = DSH_BRIDGE_PERMISSION_WAIT_MS;
 const DSH_BRIDGE_CACHE_LIMIT = 256;
 
@@ -314,13 +315,17 @@ export class DshPipeline extends AcpPipeline {
   ): void {
     if (this.bridgeCalls.has(update.toolCallId)) {return;}
     if (inferAcpFilePresentation(update)?.card !== 'diff') {return;}
-    if (this.pendingExternalEditTimers.has(update.toolCallId)) {return;}
+
+    // Start the ExternalEdit checkpoint on the next event-loop turn. This
+    // leaves a same-turn stderr bridge message a chance to cancel the fallback,
+    // while removing the old 100ms window in which a bridge-free DSH mutation
+    // could race ahead of baseline capture.
     const timer = setTimeout(() => {
       this.pendingExternalEditTimers.delete(update.toolCallId);
       if (!this.bridgeCalls.has(update.toolCallId)) {
         this.startBridgeFreeExternalEdit(update);
       }
-    }, DSH_BRIDGE_TOOL_WAIT_MS);
+    }, DSH_BRIDGE_EXTERNAL_EDIT_WAIT_MS);
     this.pendingExternalEditTimers.set(update.toolCallId, timer);
   }
 

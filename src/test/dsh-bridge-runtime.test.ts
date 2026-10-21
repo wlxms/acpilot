@@ -19,7 +19,7 @@ describe('DeepSeek Harness bridge runtime', () => {
   it('resolves presenters from the executing Agent scope', () => {
     const bridgePath = JSON.stringify(pathToFileURL(path.resolve(process.cwd(), 'dsh-bridge/index.mjs')).href);
     const script = `
-      const bridge = await import(${bridgePath});
+            const bridge = await import(${bridgePath});
       const writes = [];
       const originalWrite = process.stderr.write.bind(process.stderr);
       process.stderr.write = (chunk) => {
@@ -44,6 +44,7 @@ describe('DeepSeek Harness bridge runtime', () => {
       };
       const handlers = {};
       bridge.apply({
+        llm: { listProviders: () => [] },
         tools,
         on: (name, handler) => { handlers[name] = handler; },
         provide: () => undefined,
@@ -83,7 +84,7 @@ describe('DeepSeek Harness bridge runtime', () => {
     const bridgePath = JSON.stringify(pathToFileURL(path.resolve(process.cwd(), 'dsh-bridge/index.mjs')).href);
     const script = `
       process.env.ACPILOT_DSH_BRIDGE_NONCE = 'test-nonce';
-      const bridge = await import(${bridgePath});
+            const bridge = await import(${bridgePath});
       const writes = [];
       const originalWrite = process.stderr.write.bind(process.stderr);
       process.stderr.write = (chunk) => {
@@ -112,6 +113,7 @@ describe('DeepSeek Harness bridge runtime', () => {
       };
       const handlers = {};
       bridge.apply({
+        llm: { listProviders: () => [] },
         tools: { get: () => undefined },
         on: (name, handler) => { handlers[name] = handler; },
         provide: () => undefined,
@@ -158,7 +160,7 @@ describe('DeepSeek Harness bridge runtime', () => {
     const bridgePath = JSON.stringify(pathToFileURL(path.resolve(process.cwd(), 'dsh-bridge/index.mjs')).href);
     const script = `
       process.env.ACPILOT_DSH_BRIDGE_NONCE = 'test-nonce';
-      const bridge = await import(${bridgePath});
+            const bridge = await import(${bridgePath});
       const writes = [];
       const originalWrite = process.stderr.write.bind(process.stderr);
       process.stderr.write = (chunk) => {
@@ -168,6 +170,7 @@ describe('DeepSeek Harness bridge runtime', () => {
       const agent = { session: { id: 'session-1' } };
       const handlers = {};
       bridge.apply({
+        llm: { listProviders: () => [] },
         tools: {
           get: () => ({
             presentCall: () => ({ card: 'diff', title: 'Write dsh-hello.md', locations: [{ path: 'dsh-hello.md', line: 1 }] }),
@@ -205,11 +208,12 @@ describe('DeepSeek Harness bridge runtime', () => {
     const bridgePath = JSON.stringify(pathToFileURL(path.resolve(process.cwd(), 'dsh-bridge/index.mjs')).href);
     const script = `
       process.env.ACPILOT_DSH_BRIDGE_NONCE = 'test-nonce';
-      const bridge = await import(${bridgePath});
+            const bridge = await import(${bridgePath});
       const handlers = {};
       let nextCalled = false;
       const approval = { config: { policy: 'ask' }, overrideOf: () => 'ask' };
       bridge.apply({
+        llm: { listProviders: () => [] },
         tools: { get: () => ({ presentCall: () => ({ card: 'diff', title: 'Write dsh-hello.md' }) }) },
         get: (name) => name === 'approval' ? approval : undefined,
         on: (name, handler) => { handlers[name] = handler; },
@@ -241,7 +245,7 @@ describe('DeepSeek Harness bridge runtime', () => {
     const bridgePath = JSON.stringify(pathToFileURL(path.resolve(process.cwd(), 'dsh-bridge/index.mjs')).href);
     const script = `
       process.env.ACPILOT_DSH_BRIDGE_NONCE = 'test-nonce';
-      const bridge = await import(${bridgePath});
+            const bridge = await import(${bridgePath});
       const policyChanges = [];
       const session = { id: 'session-1' };
       const agent = { session };
@@ -252,6 +256,7 @@ describe('DeepSeek Harness bridge runtime', () => {
       };
       const handlers = {};
       bridge.apply({
+        llm: { listProviders: () => [] },
         tools: {
           get: () => ({ presentCall: () => ({ card: 'diff', title: 'Write dsh-hello.md' }) }),
         },
@@ -286,7 +291,7 @@ describe('DeepSeek Harness bridge runtime', () => {
     const bridgePath = JSON.stringify(pathToFileURL(path.resolve(process.cwd(), 'dsh-bridge/index.mjs')).href);
     const script = `
       process.env.ACPILOT_DSH_BRIDGE_NONCE = 'test-nonce';
-      const bridge = await import(${bridgePath});
+            const bridge = await import(${bridgePath});
       let policy = 'never';
       const policyChanges = [];
       const session = { id: 'session-1' };
@@ -298,6 +303,7 @@ describe('DeepSeek Harness bridge runtime', () => {
       };
       const handlers = {};
       bridge.apply({
+        llm: { listProviders: () => [] },
         tools: { get: () => ({ presentCall: () => ({ card: 'diff', title: 'Write dsh-hello.md' }) }) },
         get: (name) => name === 'approval' ? approval : undefined,
         on: (name, handler) => { handlers[name] = handler; },
@@ -330,7 +336,7 @@ describe('DeepSeek Harness bridge runtime', () => {
   it('projects DSH result metadata into read and edit cards when no presenter is installed', () => {
     const bridgePath = JSON.stringify(pathToFileURL(path.resolve(process.cwd(), 'dsh-bridge/index.mjs')).href);
     const script = `
-      const bridge = await import(${bridgePath});
+            const bridge = await import(${bridgePath});
       const writes = [];
       const originalWrite = process.stderr.write.bind(process.stderr);
       process.stderr.write = (chunk) => {
@@ -339,6 +345,7 @@ describe('DeepSeek Harness bridge runtime', () => {
       };
       const handlers = {};
       bridge.apply({
+        llm: { listProviders: () => [] },
         tools: { get: () => ({}) },
         on: (name, handler) => { handlers[name] = handler; },
         provide: () => undefined,
@@ -393,12 +400,13 @@ describe('DeepSeek Harness bridge runtime', () => {
     const bridgePath = JSON.stringify(pathToFileURL(path.resolve(process.cwd(), 'dsh-bridge/index.mjs')).href);
     const script = `
       process.env.ACPILOT_DSH_BRIDGE_NONCE = 'test-nonce';
-      const bridge = await import(${bridgePath});
+            const bridge = await import(${bridgePath});
       const writes = [];
       const originalWrite = process.stderr.write.bind(process.stderr);
       process.stderr.write = (chunk) => { writes.push(String(chunk)); return true; };
       const handlers = {};
       bridge.apply({
+        llm: { listProviders: () => [] },
         tools: { get: () => ({ presentCall: () => ({ card: 'diff', title: 'Edit hello.md' }) }) },
         on: (name, handler) => { handlers[name] = handler; },
         provide: () => undefined,

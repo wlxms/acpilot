@@ -5,6 +5,8 @@ export const DSH_BRIDGE_PROTOCOL = 1;
 export const DSH_BRIDGE_MARKER_PREFIX = 'ACPILOT_DSH_BRIDGE_READY\t';
 export const DSH_BRIDGE_TOOL_PREFIX = 'ACPILOT_DSH_BRIDGE_TOOL\t';
 export const DSH_BRIDGE_DIAGNOSTIC_PREFIX = 'ACPILOT_DSH_BRIDGE_DIAGNOSTIC\t';
+/** One-shot model metadata emitted by the bridge after the DSH LLM service is ready. */
+export const DSH_BRIDGE_CATALOG_PREFIX = 'ACPILOT_DSH_BRIDGE_CATALOG\t';
 
 export interface DshBridgeReady {
   plugin: typeof DSH_BRIDGE_PLUGIN_NAME;
@@ -13,6 +15,20 @@ export interface DshBridgeReady {
 }
 
 /** Best-effort bridge diagnostics; never part of the ACP or tool protocol. */
+export interface DshBridgeCatalogModel {
+  provider: string;
+  model: string;
+  name: string;
+  contextWindow?: number;
+  maxOutputTokens?: number;
+  reasoningEfforts?: Array<{ value: string; name: string; description?: string }>;
+  defaultReasoningEffort?: string;
+}
+
+export interface DshBridgeCatalog {
+  protocol: typeof DSH_BRIDGE_PROTOCOL;
+  models: DshBridgeCatalogModel[];
+}
 export interface DshBridgeDiagnostic {
   protocol: typeof DSH_BRIDGE_PROTOCOL;
   event: string;
@@ -122,6 +138,52 @@ export function parseDshBridgeToolLine(line: string): DshBridgeToolMessage | und
   }
 }
 
+export function serializeDshBridgeCatalog(catalog: DshBridgeCatalog): string {
+  return `${DSH_BRIDGE_CATALOG_PREFIX}${JSON.stringify(catalog)}`;
+}
+
+/** Parse only a complete model-capability catalog from the bridge. */
+export function parseDshBridgeCatalogLine(line: string): DshBridgeCatalog | undefined {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith(DSH_BRIDGE_CATALOG_PREFIX)) {return undefined;}
+  try {
+    const value = JSON.parse(trimmed.slice(DSH_BRIDGE_CATALOG_PREFIX.length)) as unknown;
+    if (!isRecord(value) || value.protocol !== DSH_BRIDGE_PROTOCOL || !Array.isArray(value.models)) {
+      return undefined;
+    }
+    const models: DshBridgeCatalogModel[] = [];
+    for (const item of value.models) {
+      if (!isRecord(item)
+          || !nonEmptyString(item.provider)
+          || !nonEmptyString(item.model)
+          || !nonEmptyString(item.name)) {
+        return undefined;
+      }
+      const efforts = Array.isArray(item.reasoningEfforts)
+        ? item.reasoningEfforts.filter((effort): effort is { value: string; name: string; description?: string } =>
+            isRecord(effort) && nonEmptyString(effort.value) && nonEmptyString(effort.name))
+        : undefined;
+      models.push({
+        provider: item.provider,
+        model: item.model,
+        name: item.name,
+        ...(positiveInteger(item.contextWindow) ? { contextWindow: item.contextWindow } : {}),
+        ...(positiveInteger(item.maxOutputTokens) ? { maxOutputTokens: item.maxOutputTokens } : {}),
+        ...(efforts?.length ? { reasoningEfforts: efforts } : {}),
+        ...(nonEmptyString(item.defaultReasoningEffort)
+          ? { defaultReasoningEffort: item.defaultReasoningEffort }
+          : {}),
+      });
+    }
+    return { protocol: DSH_BRIDGE_PROTOCOL, models };
+  } catch {
+    return undefined;
+  }
+}
+
+function positiveInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0;
+}
 /** Parse one bridge diagnostic line for the backend log. */
 export function parseDshBridgeDiagnosticLine(line: string): DshBridgeDiagnostic | undefined {
   const trimmed = line.trim();

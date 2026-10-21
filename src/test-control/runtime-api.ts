@@ -5,7 +5,10 @@ import type { StreamPartRecord } from "../ssp/types";
 import { readAllStreamParts } from "../backend/streaming/deserialize";
 import { SerializableSessionStream } from "../backend/streaming/session-stream";
 import { UserPromptSSP } from "../ssp/impl/user-prompt";
-import { backendOwnsCopilotModel } from "../surfaces/vscode/model-catalog";
+import {
+  autoCopilotModelId,
+  backendOwnsCopilotModel,
+} from "../surfaces/vscode/model-catalog";
 import { SessionTitleService } from "../participant/session-title";
 import { evictTerminalOperations } from "../runtime/operation-eviction";
 import {
@@ -1342,10 +1345,11 @@ export function createRuntimeTestApi(
         const catalog = extensionState.modelCatalog.list();
         const models = await vscode.lm.selectChatModels({ vendor });
         return models
-          .filter(
-            (model) =>
-              model.vendor === vendor &&
-              backendOwnsCopilotModel(catalog, ctx.id, vendor, model.id, ctx.instanceKey),
+          .filter(model =>
+            model.vendor === vendor
+            && (((model as unknown as { targetChatSessionType?: string }).targetChatSessionType) === ctx.scheme
+              || backendOwnsCopilotModel(catalog, ctx.id, vendor, model.id, ctx.instanceKey)
+              || model.id === autoCopilotModelId(vendor, ctx.instanceKey)),
           )
           .map((model, index) => {
             // LanguageModelChat intentionally exposes a smaller public shape
@@ -1366,7 +1370,10 @@ export function createRuntimeTestApi(
               version: model.version,
               maxInputTokens: model.maxInputTokens,
               maxOutputTokens: catalogEntry?.maxOutputTokens,
-              capabilities: catalogEntry?.capabilities,
+              reasoning: catalogEntry?.reasoning,
+              capabilities: catalogEntry?.capabilities ?? (model.name === 'Auto'
+                ? { agentMode: true, toolCalling: true }
+                : undefined),
               isUserSelectable: true,
               targetChatSessionType: ctx.scheme,
               isDefault: index === 0 ? true : undefined,

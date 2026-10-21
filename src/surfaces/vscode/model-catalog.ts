@@ -535,6 +535,18 @@ function toRegistration(
     family: familyForVendor(vendor, backendId),
     maxInputTokens: model.maxInputTokens ?? 128_000,
     maxOutputTokens: model.maxOutputTokens ?? 16_384,
+    ...(model.reasoningEfforts?.length
+      ? {
+          reasoning: {
+            current: model.defaultReasoningEffort,
+            options: model.reasoningEfforts.map(effort => ({
+              value: effort.value,
+              name: effort.name,
+              description: effort.description,
+            })),
+          },
+        }
+      : {}),
     capabilities: {
       // Every catalog entry belongs to the backend Agent vendor.
       agentMode: true,

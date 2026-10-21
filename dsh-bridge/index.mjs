@@ -10,16 +10,18 @@ import path from 'node:path'
 import { readFile } from 'node:fs/promises'
 
 export const name = 'acpilot-dsh-bridge'
-export const inject = ['tools']
+export const inject = ['tools', 'llm']
 export const ACPILOT_DSH_BRIDGE_SERVICE = 'acpilotDshBridge'
 export const ACPILOT_DSH_BRIDGE_PROTOCOL = 1
 export const ACPILOT_DSH_BRIDGE_PLUGIN = '@wlxms/acpilot-dsh-bridge'
 export const ACPILOT_DSH_BRIDGE_TOOL_PREFIX = 'ACPILOT_DSH_BRIDGE_TOOL\t'
 export const ACPILOT_DSH_BRIDGE_DIAGNOSTIC_PREFIX = 'ACPILOT_DSH_BRIDGE_DIAGNOSTIC\t'
+export const ACPILOT_DSH_BRIDGE_CATALOG_PREFIX = 'ACPILOT_DSH_BRIDGE_CATALOG\t'
 
 export function apply(ctx) {
   const nonce = process.env.ACPILOT_DSH_BRIDGE_NONCE
   const tools = ctx.tools
+  const llm = ctx.get?.('llm') ?? ctx.llm
   const bridgeAttached = typeof nonce === 'string' && nonce.trim().length > 0
   const approvalEnabledSessions = new WeakSet()
   /** Most recent tool agent observed for each session; used for identity diagnostics. */
@@ -43,7 +45,79 @@ export function apply(ctx) {
     }
   }
 
+  const emitCatalog = (models) => {
+    if (models.length === 0) return
+    try {
+      process.stderr.write(`${ACPILOT_DSH_BRIDGE_CATALOG_PREFIX}${JSON.stringify({
+        protocol: ACPILOT_DSH_BRIDGE_PROTOCOL,
+        models,
+      })}\n`)
+    } catch {
+      // Catalog diagnostics are optional and must never affect DSH.
+    }
+  }
+
+  const readCatalog = async () => {
+    try {
+      if (!llm || typeof llm.listProviders !== 'function' || typeof llm.listModels !== 'function') return false
+      const providers = llm.listProviders()
+      const models = []
+      for (const provider of providers) {
+        let entries
+        try {
+          entries = await llm.listModels(provider.id)
+        } catch {
+          continue
+        }
+        for (const entry of entries) {
+          let info
+          try {
+            info = await llm.resolveModelInfo(provider.id, entry.id)
+          } catch {
+            continue
+          }
+          models.push({
+            provider: provider.id,
+            model: entry.id,
+            name: info?.name ?? entry.name ?? entry.id,
+            ...(Number.isInteger(info?.context?.contextWindow) && info.context.contextWindow > 0
+              ? { contextWindow: info.context.contextWindow }
+              : {}),
+            ...(Number.isInteger(info?.defaultMaxTokens) && info.defaultMaxTokens > 0
+              ? { maxOutputTokens: info.defaultMaxTokens }
+              : {}),
+            ...(Array.isArray(info?.reasoning?.efforts) && info.reasoning.efforts.length > 0
+              ? {
+                  reasoningEfforts: info.reasoning.efforts.map(effort => ({
+                    value: String(effort.id),
+                    name: String(effort.name),
+                    ...(typeof effort.description === 'string' ? { description: effort.description } : {}),
+                  })),
+                  ...(typeof info.reasoning.defaultEffort === 'string'
+                    ? { defaultReasoningEffort: info.reasoning.defaultEffort }
+                    : {}),
+                }
+              : {}),
+          })
+        }
+      }
+      if (models.length === 0) return false
+      emitCatalog(models)
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  // LLM adapters can register after this plugin's first activation. Probe only
+  // in the background, after bridge handlers are installed. The timer is
+  // unref'd so it cannot keep a short-lived test or DSH CLI process alive.
+  const catalogProbeTimeout = setTimeout(() => {
+    void readCatalog()
+  }, 1000)
+  if (typeof catalogProbeTimeout.unref === 'function') catalogProbeTimeout.unref()
   const sessionIdentity = (exec) => {
+
     const id = exec?.agent?.session?.id ?? exec?.agent?.id
     return typeof id === 'string' && id.trim() ? id : undefined
   }

@@ -25,6 +25,57 @@ describe('DshBackend', () => {
     expect(pipeline).toBeInstanceOf(DshPipeline);
   });
 
+  it('merges bridge model metadata into ACP discovery without changing models', async () => {
+    const backend = new DshBackend();
+    const lines: string[] = [];
+    backend.setLogger({ appendLine: message => lines.push(message) });
+    const internals = backend as unknown as {
+      onLocalStderrLine(line: string): void;
+      configModels(directory?: string): Promise<{ data?: Array<Record<string, unknown>> }>;
+      getAdvertisedModels(directory?: string): Array<Record<string, unknown>>;
+    };
+
+    internals.onLocalStderrLine(
+      'ACPILOT_DSH_BRIDGE_CATALOG\t'
+        + JSON.stringify({
+          protocol: 1,
+          models: [{
+            provider: 'deepseek-official',
+            model: 'deepseek-v4-flash',
+            name: 'DeepSeek V4.1 Flash',
+            contextWindow: 1_000_000,
+            maxOutputTokens: 256_000,
+            reasoningEfforts: [
+              { value: 'off', name: 'Off' },
+              { value: 'high', name: 'High' },
+            ],
+            defaultReasoningEffort: 'high',
+          }],
+        }),
+    );
+    internals.getAdvertisedModels = () => [{
+      id: 'deepseek-v4-flash',
+      name: 'deepseek-v4-flash',
+      provider: 'deepseek-official',
+    }];
+
+    await expect(internals.configModels('D:/workspace')).resolves.toEqual({
+      data: [{
+        id: 'deepseek-v4-flash',
+        name: 'deepseek-v4-flash',
+        provider: 'deepseek-official',
+        maxInputTokens: 1_000_000,
+        maxOutputTokens: 256_000,
+        reasoningEfforts: [
+          { value: 'off', name: 'Off' },
+          { value: 'high', name: 'High' },
+        ],
+        defaultReasoningEffort: 'high',
+      }],
+    });
+    expect(lines).toContain('[dsh-backend] bridge.catalog models=1');
+  });
+
   it('forwards ordinary local stderr diagnostics to the backend logger', () => {
     const backend = new DshBackend();
     const lines: string[] = [];

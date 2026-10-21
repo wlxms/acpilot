@@ -67,6 +67,104 @@ describe('language model provider routing', () => {
     dispose();
   });
 
+  it('exposes a reasoning selector with only the model-advertised levels', async () => {
+    const modelId = canonicalCopilotModelId('dsh', 'deepseek-official', 'deepseek-v4-flash', 'dsh:local');
+    const ctx = {
+      id: 'dsh',
+      instanceKey: 'dsh:local',
+      storageNamespace: 'dsh/local',
+      displayName: 'DeepSeek Harness',
+      scheme: 'acpilot.dsh',
+      vendor: 'dsh',
+      backend: { isRunning: () => true } as Backend,
+    } as unknown as BackendContext;
+    const state = {
+      outputChannel: { appendLine: vi.fn() },
+      bus: new AppEventBus(),
+      modelCatalog: {
+        list: () => [{
+          vendor: 'dsh',
+          copilotModelId: modelId,
+          modelId: 'deepseek-v4-flash',
+          providerID: 'deepseek-official',
+          displayName: 'DeepSeek V4.1 Flash',
+          maxInputTokens: 1_000_000,
+          maxOutputTokens: 256_000,
+          reasoning: {
+            current: 'high',
+            options: [
+              { value: 'off', name: 'Off' },
+              { value: 'low', name: 'Low' },
+              { value: 'high', name: 'High' },
+              { value: 'max', name: 'Max' },
+            ],
+          },
+          capabilities: {},
+          backendId: 'dsh',
+          backendInstanceKey: 'dsh:local',
+        }],
+        refresh: async () => undefined,
+      },
+    } as unknown as ExtensionState;
+    const { provider, dispose } = createLanguageModelChatProvider(state, ctx);
+    const models = await provider.provideLanguageModelChatInformation!(
+      { silent: true } as vscode.PrepareLanguageModelChatModelOptions,
+      { isCancellationRequested: false } as vscode.CancellationToken,
+    ) ?? [];
+    const model = models.find(entry => entry.id === modelId) as unknown as Record<string, unknown>;
+
+    expect(model).toMatchObject({
+      maxInputTokens: 1_000_000,
+      maxOutputTokens: 256_000,
+      configurationSchema: {
+        properties: {
+          contextWindow: expect.objectContaining({
+            enum: [1_000_000],
+            enumItemLabels: ['1M'],
+            default: 1_000_000,
+          }),
+          reasoningEffort: expect.objectContaining({
+            enum: ['off', 'low', 'high', 'max'],
+            enumItemLabels: ['Off', 'Low', 'High', 'Max'],
+            default: 'high',
+          }),
+        },
+      },
+    });
+    dispose();
+  });
+
+  it('omits the reasoning selector entirely for a model without levels', async () => {
+    const modelId = canonicalCopilotModelId('dsh', 'zai-coding-cn', 'glm-5.3', 'dsh:local');
+    const ctx = {
+      id: 'dsh', instanceKey: 'dsh:local', storageNamespace: 'dsh/local',
+      displayName: 'DeepSeek Harness', scheme: 'acpilot.dsh', vendor: 'dsh',
+      backend: { isRunning: () => true } as Backend,
+    } as unknown as BackendContext;
+    const state = {
+      outputChannel: { appendLine: vi.fn() }, bus: new AppEventBus(),
+      modelCatalog: {
+        list: () => [{
+          vendor: 'dsh', copilotModelId: modelId, modelId: 'glm-5.3',
+          providerID: 'zai-coding-cn', displayName: 'GLM-5.3',
+          maxInputTokens: 1_000_000, maxOutputTokens: 131_072,
+          capabilities: {}, backendId: 'dsh', backendInstanceKey: 'dsh:local',
+        }],
+        refresh: async () => undefined,
+      },
+    } as unknown as ExtensionState;
+    const { provider, dispose } = createLanguageModelChatProvider(state, ctx);
+    const models = await provider.provideLanguageModelChatInformation!(
+      { silent: true } as vscode.PrepareLanguageModelChatModelOptions,
+      { isCancellationRequested: false } as vscode.CancellationToken,
+    ) ?? [];
+    const model = models.find(entry => entry.id === modelId) as unknown as Record<string, unknown>;
+    const properties = (model.configurationSchema as { properties?: Record<string, unknown> } | undefined)?.properties;
+
+    expect(properties).not.toHaveProperty('reasoningEffort');
+    dispose();
+  });
+
   it('clears stale catalog entries when lazy backend startup fails', async () => {
     let running = true;
     const start = vi.fn(async () => ({ error: 'backend offline' }));

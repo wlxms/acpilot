@@ -10,9 +10,11 @@ import {
   type AcpBackendOptions,
 } from '../acp/adapter';
 import {
+  parseDshBridgeCatalogLine,
   parseDshBridgeDiagnosticLine,
   parseDshBridgeReadyLine,
   parseDshBridgeToolLine,
+  type DshBridgeCatalogModel,
   type DshBridgeToolMessage,
 } from './bridge-protocol';
 import { DshPipeline } from './pipeline';
@@ -30,6 +32,8 @@ export type DshBackendOptions = AcpBackendOptions;
 export class DshBackend extends AcpBackend {
   private readonly pipelines = new Map<string, DshPipeline>();
   private readonly pendingBridgeMessages = new Map<string, DshBridgeToolMessage[]>();
+  /** Exact model metadata emitted after the DSH LLM service is ready. */
+  private bridgeCatalog = new Map<string, DshBridgeCatalogModel>();
 
   constructor(options: DshBackendOptions = {}) {
     super({
@@ -42,6 +46,28 @@ export class DshBackend extends AcpBackend {
     });
   }
 
+  protected override async configModels(directory?: string) {
+    const result = await super.configModels(directory);
+    if (result.error !== undefined || this.bridgeCatalog.size === 0) {return result;}
+    return {
+      data: (result.data ?? []).map(model => {
+        const key = `${model.provider ?? ''}/${model.id}`;
+        const bridge = this.bridgeCatalog.get(key);
+        if (!bridge) {return model;}
+        return {
+          ...model,
+          maxInputTokens: bridge.contextWindow ?? model.maxInputTokens,
+          maxOutputTokens: bridge.maxOutputTokens ?? model.maxOutputTokens,
+          ...(bridge.reasoningEfforts?.length
+            ? {
+                reasoningEfforts: bridge.reasoningEfforts,
+                defaultReasoningEffort: bridge.defaultReasoningEffort,
+              }
+            : {}),
+        };
+      }),
+    };
+  }
   override createPipeline(options: BackendPipelineOptions): BackendPipeline<ActiveSessionMessage> {
     const pipeline = new DshPipeline(options);
     this.pipelines.set(options.sessionId, pipeline);
@@ -76,6 +102,12 @@ export class DshBackend extends AcpBackend {
     const ready = parseDshBridgeReadyLine(line);
     if (ready) {
       this.logMessage(`bridge.ready protocol=${ready.protocol}`);
+      return;
+    }
+    const catalog = parseDshBridgeCatalogLine(line);
+    if (catalog) {
+      this.bridgeCatalog = new Map(catalog.models.map(model => [`${model.provider}/${model.model}`, model]));
+      this.logMessage(`bridge.catalog models=${this.bridgeCatalog.size}`);
       return;
     }
     const diagnostic = parseDshBridgeDiagnosticLine(line);

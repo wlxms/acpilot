@@ -31,6 +31,7 @@
 
 import * as vscode from 'vscode';
 import type { ExtensionState, BackendContext } from '../../types';
+import type { CopilotModelRegistration } from './model-types';
 import { BackendRuntimeChangedError, type BackendRuntimeGuard } from '../../backend/backend';
 import { streamBackendChatResponse } from './backend-chat-client';
 import { normalizePermissionMode } from '../../backend/types';
@@ -164,6 +165,9 @@ export function createLanguageModelChatProvider(
               maxInputTokens: r.maxInputTokens,
               maxOutputTokens: r.maxOutputTokens,
               capabilities: r.capabilities,
+              ...(modelConfigurationSchema(r)
+                ? { configurationSchema: modelConfigurationSchema(r) }
+                : {}),
               isBYOK: true,
               isUserSelectable: true,
               targetChatSessionType: ctx.scheme,
@@ -268,9 +272,7 @@ export function createLanguageModelChatProvider(
           runtime,
           model: { providerID: route.providerID, modelID: route.modelID },
           messages,
-          modelOptions: options.modelOptions === undefined
-            ? undefined
-            : { ...options.modelOptions },
+          modelOptions: mergeModelOptions(options),
           purpose: options.modelOptions?.acpilotPurpose === 'title-generation'
             ? 'title-generation'
             : 'chat',
@@ -407,6 +409,56 @@ function resolveAutoModelRoute(
  * The id must identify a current registration owned by this backend/vendor.
  * No provider/model metadata fallback is accepted.
  */
+function mergeModelOptions(
+  options: vscode.ProvideLanguageModelChatResponseOptions,
+): Record<string, unknown> | undefined {
+  const merged: Record<string, unknown> = { ...(options.modelOptions ?? {}) };
+  const configuration = (options as unknown as {
+    modelConfiguration?: Record<string, unknown>;
+  }).modelConfiguration;
+  if (typeof configuration?.reasoningEffort === 'string' && configuration.reasoningEffort.length > 0) {
+    merged.reasoningEffort = configuration.reasoningEffort;
+  }
+  return Object.keys(merged).length > 0 ? merged : undefined;
+}
+function modelConfigurationSchema(
+  model: CopilotModelRegistration,
+): Record<string, unknown> | undefined {
+  const properties: Record<string, unknown> = {
+    contextWindow: {
+      type: 'number',
+      title: 'Context window',
+      description: 'The maximum context window reported by the backend. Changing this value is not supported.',
+      enum: [model.maxInputTokens],
+      enumItemLabels: [formatTokenWindow(model.maxInputTokens)],
+      default: model.maxInputTokens,
+      readOnly: true,
+    },
+  };
+  if (model.reasoning?.options.length) {
+    properties.reasoningEffort = {
+      type: 'string',
+      title: 'Reasoning effort',
+      description: 'Reasoning length supported by this exact model.',
+      enum: model.reasoning.options.map(option => option.value),
+      enumItemLabels: model.reasoning.options.map(option => option.name),
+      enumDescriptions: model.reasoning.options.map(option => option.description ?? ''),
+      default: model.reasoning.current ?? model.reasoning.options[0].value,
+      group: 'navigation',
+    };
+  }
+  return { properties };
+}
+
+function formatTokenWindow(tokens: number): string {
+  if (tokens >= 1_000_000) {
+    return `${Number((tokens / 1_000_000).toFixed(1))}M`;
+  }
+  if (tokens >= 1_000) {
+    return `${Math.round(tokens / 1_000)}K`;
+  }
+  return String(tokens);
+}
 function resolveModelRoute(
   state: ExtensionState,
   ctx: BackendContext,

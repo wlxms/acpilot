@@ -65,6 +65,7 @@ import type {
   BackendFileAttachment,
   BackendMessageHistory,
   BackendServerStatus,
+  BackendModel,
 } from '../../backend/types';
 import { AcpPipeline } from './pipeline';
 import { createSessionModelProvider } from '../../backend/session-model-provider';
@@ -1316,6 +1317,14 @@ export class AcpBackend implements Backend<ActiveSessionMessage> {
         if (promptOptions?.model) {
           await this.setSessionModel(id, promptOptions.model.modelID, connection!, generation);
         }
+        if (promptOptions?.model && promptOptions.modelOptions?.reasoningEffort !== undefined) {
+          await this.setSessionReasoningEffort(
+            id,
+            promptOptions.modelOptions.reasoningEffort,
+            connection!,
+            generation,
+          );
+        }
         if (promptOptions?.agent) {
           await this.setSessionMode(id, promptOptions.agent, connection!, generation);
         }
@@ -1556,11 +1565,14 @@ export class AcpBackend implements Backend<ActiveSessionMessage> {
   // Config operations (ACP agents own their config; minimal stubs)
   // -------------------------------------------------------------------------
 
+  /** Discover models with backend-specific metadata merged by a subclass. */
+  protected async configModels(directory?: string): Promise<BackendResult<BackendModel[]>> {
+    await this.ensureDiscovery(directory);
+    return { data: this.getAdvertisedModels(directory) };
+  }
+
   readonly config: BackendConfigOperations = {
-    models: async (directory?: string) => {
-      await this.ensureDiscovery(directory);
-      return { data: this.getAdvertisedModels(directory) };
-    },
+    models: (directory?: string) => this.configModels(directory),
     agents: async (directory?: string) => {
       await this.ensureDiscovery(directory);
       return { data: this.getAdvertisedModes(directory) };
@@ -1870,6 +1882,37 @@ export class AcpBackend implements Backend<ActiveSessionMessage> {
     this.sessionConfigOptions.set(sessionId, response.configOptions);
   }
 
+  private async setSessionReasoningEffort(
+    sessionId: string,
+    effort: unknown,
+    connection: ClientConnection,
+    generation: number,
+  ): Promise<void> {
+    if (typeof effort !== 'string' || effort.length === 0) {
+      throw new Error('Invalid reasoning effort: expected a non-empty string.');
+    }
+    const options = this.sessionConfigOptions.get(sessionId) ?? [];
+    const selector = options.find(option => option.type === 'select' && option.category === 'thought_level');
+    if (!selector || selector.type !== 'select') {
+      throw new Error('The selected model does not expose a reasoning effort option.');
+    }
+    const allowed = flattenSelectOptions(selector.options).map(option => option.value);
+    if (!allowed.includes(effort)) {
+      throw new Error('Unsupported reasoning effort "' + effort + '" for this model; expected one of: ' + allowed.join(', ') + '.');
+    }
+    if (selector.currentValue === effort) {return;}
+    const response = await this.requestSessionConfigOption(
+      sessionId,
+      selector.id,
+      effort,
+      connection,
+      generation,
+    );
+    if (!this.isCurrentConnection(connection, generation)) {
+      throw new Error('ACP backend changed while selecting reasoning effort');
+    }
+    this.sessionConfigOptions.set(sessionId, response.configOptions);
+  }
   private async setSessionMode(
     sessionId: string,
     modeId: string,

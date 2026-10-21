@@ -134,6 +134,62 @@ describe('language model provider routing', () => {
     dispose();
   });
 
+  it('refreshes the catalog before signaling a late backend catalog change', async () => {
+    const modelId = canonicalCopilotModelId('dsh', 'deepseek-official', 'deepseek-v4-flash', 'dsh:local');
+    let reasoning = false;
+    let catalogListener: (() => void | Promise<void>) | undefined;
+    const backend = {
+      isRunning: () => true,
+      onDidChangeModelCatalog: (listener: () => void | Promise<void>) => {
+        catalogListener = listener;
+        return () => { catalogListener = undefined; };
+      },
+    } as unknown as Backend;
+    const ctx = {
+      id: 'dsh', instanceKey: 'dsh:local', storageNamespace: 'dsh/local',
+      displayName: 'DeepSeek Harness', scheme: 'acpilot.dsh', vendor: 'dsh', backend,
+    } as unknown as BackendContext;
+    const resolveReasoning = () => reasoning
+      ? { current: 'high', options: [{ value: 'high', name: 'High' }] }
+      : undefined;
+    const refresh = vi.fn(async () => {
+      reasoning = true;
+    });
+    const state = {
+      outputChannel: { appendLine: vi.fn() }, bus: new AppEventBus(),
+      modelCatalog: {
+        refresh,
+        list: () => [{ vendor: 'dsh', copilotModelId: modelId, modelId: 'deepseek-v4-flash',
+          providerID: 'deepseek-official', displayName: 'DeepSeek V4.1 Flash',
+          maxInputTokens: 1_000_000, maxOutputTokens: 256_000,
+          ...(resolveReasoning() ? { reasoning: resolveReasoning() } : {}),
+          capabilities: {}, backendId: 'dsh', backendInstanceKey: 'dsh:local' }],
+      },
+    } as unknown as ExtensionState;
+    const { provider, dispose } = createLanguageModelChatProvider(state, ctx);
+    const changed = vi.fn();
+    const registration = provider.onDidChangeLanguageModelChatInformation?.(changed);
+    await provider.provideLanguageModelChatInformation!(
+      { silent: true } as vscode.PrepareLanguageModelChatModelOptions,
+      { isCancellationRequested: false } as vscode.CancellationToken,
+    );
+    refresh.mockClear();
+    reasoning = false;
+
+    await catalogListener?.();
+    await vi.waitFor(() => expect(changed).toHaveBeenCalledOnce());
+    expect(refresh).toHaveBeenCalledOnce();
+    const models = await provider.provideLanguageModelChatInformation!(
+      { silent: true } as vscode.PrepareLanguageModelChatModelOptions,
+      { isCancellationRequested: false } as vscode.CancellationToken,
+    ) ?? [];
+    const model = models.find(entry => entry.id === modelId) as unknown as Record<string, unknown>;
+    expect(model.configurationSchema).toMatchObject({
+      properties: { reasoningEffort: { enum: ['high'], default: 'high' } },
+    });
+    registration?.dispose();
+    dispose();
+  });
   it('re-queries model capabilities when a late backend catalog change arrives', async () => {
     const modelId = canonicalCopilotModelId('dsh', 'deepseek-official', 'deepseek-v4-flash', 'dsh:local');
     let reasoning = false;

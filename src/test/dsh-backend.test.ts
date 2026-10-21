@@ -76,6 +76,41 @@ describe('DshBackend', () => {
     expect(lines).toContain('[dsh-backend] bridge.catalog models=1');
   });
 
+  it('does not expose ACP-only models when bridge metadata is partial', async () => {
+    const backend = new DshBackend();
+    const internals = backend as unknown as {
+      onLocalStderrLine(line: string): void;
+      configModels(directory?: string): Promise<{ data?: Array<Record<string, unknown>> }>;
+      getAdvertisedModels(directory?: string): Array<Record<string, unknown>>;
+    };
+    internals.getAdvertisedModels = () => [
+      { id: 'deepseek-flash', name: 'DeepSeek-V41-Flash', provider: 'deepseek-official' },
+      { id: 'unresolved-model', name: 'Unresolved', provider: 'deepseek-official' },
+    ];
+    internals.onLocalStderrLine('ACPILOT_DSH_BRIDGE_CATALOG\t' + JSON.stringify({
+      protocol: 1,
+      models: [{ provider: 'deepseek-official', model: 'deepseek-flash', name: 'DeepSeek-V41-Flash', contextWindow: 1_000_000 }],
+    }));
+
+    const result = await internals.configModels('D:/workspace');
+    expect(result.data).toEqual([expect.objectContaining({ id: 'deepseek-flash', maxInputTokens: 1_000_000 })]);
+  });
+
+  it('withholds ACP-only model discovery until bridge metadata is ready', async () => {
+    const backend = new DshBackend();
+    const internals = backend as unknown as {
+      configModels(directory?: string): Promise<{ data?: Array<Record<string, unknown>> }>;
+      getAdvertisedModels(directory?: string): Array<Record<string, unknown>>;
+    };
+    internals.getAdvertisedModels = () => [{
+      id: 'deepseek-flash',
+      name: 'DeepSeek-V41-Flash',
+      provider: 'dsh',
+    }];
+
+    await expect(internals.configModels('D:/workspace')).resolves.toEqual({ data: [] });
+  });
+
   it('notifies the host when the bridge catalog arrives after initial model discovery', () => {
     const backend = new DshBackend();
     const internals = backend as unknown as {

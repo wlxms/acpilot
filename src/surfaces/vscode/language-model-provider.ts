@@ -111,20 +111,34 @@ export function createLanguageModelChatProvider(
     onChangeEmitter.fire();
   });
 
-  // The bridge may publish the same capability catalog more than once while
-  // its LLM services settle. Coalesce those notifications so VS Code does not
-  // run overlapping model-info refreshes for one backend.
-  let modelCatalogChangeTimer: ReturnType<typeof setTimeout> | undefined;
-  const notifyModelCatalogChanged = (): void => {
+  // The bridge can publish several catalog revisions while its LLM services
+  // settle. Refresh the host catalog first so VS Code's re-query sees the new
+  // capabilities, then publish one change notification for the latest revision.
+  let modelCatalogChangePromise: Promise<void> | undefined;
+  let modelCatalogChangeQueued = false;
+  const notifyModelCatalogChanged = (): Promise<void> => {
     cachedModels = [];
-    if (modelCatalogChangeTimer !== undefined) {return;}
-    modelCatalogChangeTimer = setTimeout(() => {
-      modelCatalogChangeTimer = undefined;
+    if (modelCatalogChangePromise) {
+      modelCatalogChangeQueued = true;
+      return modelCatalogChangePromise;
+    }
+    modelCatalogChangePromise = (async () => {
+      do {
+        modelCatalogChangeQueued = false;
+        if (ctx.backend.isRunning() && typeof state.modelCatalog.refresh === 'function') {
+          await state.modelCatalog.refresh(workspaceDirectory());
+        }
+      } while (modelCatalogChangeQueued);
       onChangeEmitter.fire();
-    }, 0);
+    })().catch((refreshError) => {
+      logger.appendLine(`[lm-provider:${vendorId}] Model catalog refresh after metadata change failed: ${refreshError instanceof Error ? refreshError.message : String(refreshError)}`);
+    }).finally(() => {
+      modelCatalogChangePromise = undefined;
+    });
+    return modelCatalogChangePromise;
   };
   const unsubModelCatalogChanged = typeof ctx.backend.onDidChangeModelCatalog === 'function'
-    ? ctx.backend.onDidChangeModelCatalog!(notifyModelCatalogChanged)
+    ? ctx.backend.onDidChangeModelCatalog!(() => { void notifyModelCatalogChanged(); })
     : () => {};
 
   const provider: vscode.LanguageModelChatProvider<BackendLanguageModelChatInformation> = {
@@ -339,10 +353,6 @@ export function createLanguageModelChatProvider(
       unsubSelectionChanged();
       unsubModelsChanged();
       unsubModelCatalogChanged();
-      if (modelCatalogChangeTimer !== undefined) {
-        clearTimeout(modelCatalogChangeTimer);
-        modelCatalogChangeTimer = undefined;
-      }
       onChangeEmitter.dispose();
     },
   };

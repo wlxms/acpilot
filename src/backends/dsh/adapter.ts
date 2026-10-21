@@ -59,13 +59,17 @@ export class DshBackend extends AcpBackend {
 
   protected override async configModels(directory?: string) {
     const result = await super.configModels(directory);
-    if (result.error !== undefined || this.bridgeCatalog.size === 0) {return result;}
+    if (result.error !== undefined) {return result;}
+    // DSH ACP exposes route ids only. Wait for bridge metadata before publishing
+    // a model with a misleading default context window.
+    if (this.bridgeCatalog.size === 0) {return { data: [] }; }
     return {
-      data: (result.data ?? []).map(model => {
-        const key = `${model.provider ?? ''}/${model.id}`;
-        const bridge = this.bridgeCatalog.get(key);
-        if (!bridge) {return model;}
-        return {
+      data: (result.data ?? []).flatMap(model => {
+        const bridge = this.bridgeCatalog.get(`${model.provider ?? ''}/${model.id}`);
+        // A route-only ACP entry has no trustworthy context window. Expose it
+        // only after the bridge supplies exact model metadata.
+        if (!bridge) {return [];}
+        return [{
           ...model,
           maxInputTokens: bridge.contextWindow ?? model.maxInputTokens,
           maxOutputTokens: bridge.maxOutputTokens ?? model.maxOutputTokens,
@@ -75,7 +79,7 @@ export class DshBackend extends AcpBackend {
                 defaultReasoningEffort: bridge.defaultReasoningEffort,
               }
             : {}),
-        };
+        }];
       }),
     };
   }

@@ -65,7 +65,10 @@ export class DshBackend extends AcpBackend {
     if (this.bridgeCatalog.size === 0) {return { data: [] }; }
     return {
       data: (result.data ?? []).flatMap(model => {
-        const bridge = this.bridgeCatalog.get(`${model.provider ?? ''}/${model.id}`);
+        const route = parseDshAcpModelRoute(model);
+        const bridge = route
+          ? this.bridgeCatalog.get(`${route.provider}/${route.model}`)
+          : undefined;
         // A route-only ACP entry has no trustworthy context window. Expose it
         // only after the bridge supplies exact model metadata.
         if (!bridge) {return [];}
@@ -174,6 +177,35 @@ function formatDiagnosticValue(value: unknown): string {
   catch {return String(value);}
 }
 
+/** Decode the opaque ACP model selector into DSH's provider/model route. */
+function parseDshAcpModelRoute(
+  model: { id: string; provider?: string },
+): { provider: string; model: string } | undefined {
+  const id = model.id.trim();
+  if (!id) {return undefined;}
+  try {
+    const parsed = JSON.parse(id) as unknown;
+    if (Array.isArray(parsed)
+      && parsed.length === 2
+      && typeof parsed[0] === 'string'
+      && parsed[0].length > 0
+      && typeof parsed[1] === 'string'
+      && parsed[1].length > 0) {
+      return { provider: parsed[0], model: parsed[1] };
+    }
+  } catch {
+    // Ordinary provider/model ids below are not JSON.
+  }
+  const provider = model.provider?.trim();
+  if (provider && provider !== 'dsh') {
+    return { provider, model: id };
+  }
+  const separator = id.indexOf('/');
+  if (separator > 0 && separator < id.length - 1) {
+    return { provider: id.slice(0, separator), model: id.slice(separator + 1) };
+  }
+  return undefined;
+}
 class SimpleEventEmitter<T> {
   private readonly listeners = new Set<(value: T) => void>();
 

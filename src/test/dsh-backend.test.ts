@@ -76,6 +76,47 @@ describe('DshBackend', () => {
     expect(lines).toContain('[dsh-backend] bridge.catalog models=1');
   });
 
+  it('maps opaque DSH ACP model values to bridge provider/model metadata', async () => {
+    const backend = new DshBackend();
+    const internals = backend as unknown as {
+      onLocalStderrLine(line: string): void;
+      configModels(directory?: string): Promise<{ data?: Array<Record<string, unknown>> }>;
+      getAdvertisedModels(directory?: string): Array<Record<string, unknown>>;
+    };
+    internals.onLocalStderrLine(
+      'ACPILOT_DSH_BRIDGE_CATALOG\t'
+        + JSON.stringify({
+          protocol: 1,
+          models: [{
+            provider: 'deepseek-official',
+            model: 'deepseek-flash',
+            name: 'DeepSeek-V4-Flash',
+            contextWindow: 1_000_000,
+            maxOutputTokens: 256_000,
+            reasoningEfforts: [{ value: 'high', name: 'High' }],
+            defaultReasoningEffort: 'high',
+          }],
+        }),
+    );
+    internals.getAdvertisedModels = () => [{
+      id: '["deepseek-official","deepseek-flash"]',
+      name: 'DeepSeek-V4-Flash',
+      provider: 'dsh',
+    }];
+
+    await expect(internals.configModels('D:/workspace')).resolves.toEqual({
+      data: [{
+        id: '["deepseek-official","deepseek-flash"]',
+        name: 'DeepSeek-V4-Flash',
+        provider: 'dsh',
+        maxInputTokens: 1_000_000,
+        maxOutputTokens: 256_000,
+        reasoningEfforts: [{ value: 'high', name: 'High' }],
+        defaultReasoningEffort: 'high',
+      }],
+    });
+  });
+
   it('does not expose ACP-only models when bridge metadata is partial', async () => {
     const backend = new DshBackend();
     const internals = backend as unknown as {

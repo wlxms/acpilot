@@ -111,6 +111,22 @@ export function createLanguageModelChatProvider(
     onChangeEmitter.fire();
   });
 
+  // The bridge may publish the same capability catalog more than once while
+  // its LLM services settle. Coalesce those notifications so VS Code does not
+  // run overlapping model-info refreshes for one backend.
+  let modelCatalogChangeTimer: ReturnType<typeof setTimeout> | undefined;
+  const notifyModelCatalogChanged = (): void => {
+    cachedModels = [];
+    if (modelCatalogChangeTimer !== undefined) {return;}
+    modelCatalogChangeTimer = setTimeout(() => {
+      modelCatalogChangeTimer = undefined;
+      onChangeEmitter.fire();
+    }, 0);
+  };
+  const unsubModelCatalogChanged = typeof ctx.backend.onDidChangeModelCatalog === 'function'
+    ? ctx.backend.onDidChangeModelCatalog!(notifyModelCatalogChanged)
+    : () => {};
+
   const provider: vscode.LanguageModelChatProvider<BackendLanguageModelChatInformation> = {
     onDidChangeLanguageModelChatInformation: onChangeEmitter.event,
 
@@ -322,6 +338,11 @@ export function createLanguageModelChatProvider(
       unsubBackendReady();
       unsubSelectionChanged();
       unsubModelsChanged();
+      unsubModelCatalogChanged();
+      if (modelCatalogChangeTimer !== undefined) {
+        clearTimeout(modelCatalogChangeTimer);
+        modelCatalogChangeTimer = undefined;
+      }
       onChangeEmitter.dispose();
     },
   };

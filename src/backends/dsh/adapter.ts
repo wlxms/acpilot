@@ -34,6 +34,17 @@ export class DshBackend extends AcpBackend {
   private readonly pendingBridgeMessages = new Map<string, DshBridgeToolMessage[]>();
   /** Exact model metadata emitted after the DSH LLM service is ready. */
   private bridgeCatalog = new Map<string, DshBridgeCatalogModel>();
+  /** Notified after bridge metadata invalidates the backend model catalog. */
+  private readonly bridgeCatalogChangedEmitter = new SimpleEventEmitter<void>();
+
+  /**
+   * Subscribe to bridge model-capability updates. The DSH bridge can publish its
+   * catalog after ACP model discovery, so the host must re-query the catalog
+   * instead of retaining the earlier model list.
+   */
+  onDidChangeModelCatalog(listener: () => void): () => void {
+    return this.bridgeCatalogChangedEmitter.on(listener);
+  }
 
   constructor(options: DshBackendOptions = {}) {
     super({
@@ -108,6 +119,7 @@ export class DshBackend extends AcpBackend {
     if (catalog) {
       this.bridgeCatalog = new Map(catalog.models.map(model => [`${model.provider}/${model.model}`, model]));
       this.logMessage(`bridge.catalog models=${this.bridgeCatalog.size}`);
+      this.bridgeCatalogChangedEmitter.emit();
       return;
     }
     const diagnostic = parseDshBridgeDiagnosticLine(line);
@@ -156,4 +168,19 @@ function formatDiagnosticValue(value: unknown): string {
   if (typeof value === 'number' || typeof value === 'boolean') {return String(value);}
   try {return JSON.stringify(value);}
   catch {return String(value);}
+}
+
+class SimpleEventEmitter<T> {
+  private readonly listeners = new Set<(value: T) => void>();
+
+  on(listener: (value: T) => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  emit(value: T): void {
+    for (const listener of [...this.listeners]) {
+      listener(value);
+    }
+  }
 }

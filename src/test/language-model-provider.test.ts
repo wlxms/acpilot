@@ -134,6 +134,52 @@ describe('language model provider routing', () => {
     dispose();
   });
 
+  it('re-queries model capabilities when a late backend catalog change arrives', async () => {
+    const modelId = canonicalCopilotModelId('dsh', 'deepseek-official', 'deepseek-v4-flash', 'dsh:local');
+    let reasoning = false;
+    let catalogListener: (() => void) | undefined;
+    const backend = {
+      isRunning: () => true,
+      onDidChangeModelCatalog: (listener: () => void) => {
+        catalogListener = listener;
+        return () => { catalogListener = undefined; };
+      },
+    } as unknown as Backend;
+    const ctx = {
+      id: 'dsh', instanceKey: 'dsh:local', storageNamespace: 'dsh/local',
+      displayName: 'DeepSeek Harness', scheme: 'acpilot.dsh', vendor: 'dsh', backend,
+    } as unknown as BackendContext;
+    const state = {
+      outputChannel: { appendLine: vi.fn() }, bus: new AppEventBus(),
+      modelCatalog: {
+        refresh: async () => undefined,
+        list: () => [{
+          vendor: 'dsh', copilotModelId: modelId, modelId: 'deepseek-v4-flash',
+          providerID: 'deepseek-official', displayName: 'DeepSeek V4.1 Flash',
+          maxInputTokens: 1_000_000, maxOutputTokens: 256_000,
+          ...(reasoning ? { reasoning: { current: 'high', options: [{ value: 'high', name: 'High' }] } } : {}),
+          capabilities: {}, backendId: 'dsh', backendInstanceKey: 'dsh:local',
+        }],
+      },
+    } as unknown as ExtensionState;
+    const { provider, dispose } = createLanguageModelChatProvider(state, ctx);
+    const changed = vi.fn();
+    const eventRegistration = provider.onDidChangeLanguageModelChatInformation?.(changed);
+    const query = async () => (await provider.provideLanguageModelChatInformation!(
+      { silent: true } as vscode.PrepareLanguageModelChatModelOptions,
+      { isCancellationRequested: false } as vscode.CancellationToken,
+    ) ?? []).find(model => model.id === modelId) as unknown as Record<string, unknown>;
+
+    expect((await query()).configurationSchema).toEqual({ properties: expect.objectContaining({ contextWindow: expect.anything() }) });
+    reasoning = true;
+    catalogListener?.();
+    await vi.waitFor(() => expect(changed).toHaveBeenCalledOnce());
+    expect((await query()).configurationSchema).toEqual({ properties: expect.objectContaining({
+      reasoningEffort: expect.objectContaining({ enum: ['high'], default: 'high' }),
+    })});
+    eventRegistration?.dispose();
+    dispose();
+  });
   it('omits the reasoning selector entirely for a model without levels', async () => {
     const modelId = canonicalCopilotModelId('dsh', 'zai-coding-cn', 'glm-5.3', 'dsh:local');
     const ctx = {

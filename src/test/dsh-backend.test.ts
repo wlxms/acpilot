@@ -76,6 +76,32 @@ describe('DshBackend', () => {
     expect(lines).toContain('[dsh-backend] bridge.catalog models=1');
   });
 
+  it('notifies the host when the bridge catalog arrives after initial model discovery', () => {
+    const backend = new DshBackend();
+    const internals = backend as unknown as {
+      onLocalStderrLine(line: string): void;
+      bridgeCatalog: Map<string, unknown>;
+    };
+    const listener = vi.fn();
+    backend.onDidChangeModelCatalog?.(listener);
+    internals.onLocalStderrLine(
+      'ACPILOT_DSH_BRIDGE_CATALOG\t'
+        + JSON.stringify({
+          protocol: 1,
+          models: [{
+            provider: 'deepseek-official',
+            model: 'deepseek-flash',
+            name: 'DeepSeek V4.1 Flash',
+            contextWindow: 1_000_000,
+            reasoningEfforts: [{ value: 'high', name: 'High' }],
+          }],
+        }),
+    );
+
+    expect(internals.bridgeCatalog.size).toBe(1);
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+
   it('forwards ordinary local stderr diagnostics to the backend logger', () => {
     const backend = new DshBackend();
     const lines: string[] = [];

@@ -61,8 +61,41 @@ describe('ACP local transport lifecycle', () => {
     children.push(spawned);
     await expect(spawned.ready).rejects.toThrow('readiness timed out');
   });
-});
 
+  it('includes recent stderr when a local agent exits before readiness', async () => {
+    const spawned = spawnAcpAgent({
+      command: process.execPath,
+      args: nodeScript("process.stderr.write('native module mismatch\\n'); process.exit(7);"),
+      stderr: 'pipe',
+      readiness: { parse: parseDshBridgeReadyLine, timeoutMs: 1_000 },
+    });
+    children.push(spawned);
+
+    await expect(spawned.ready).rejects.toThrow(
+      /code=7, signal=none[\s\S]*native module mismatch/,
+    );
+  });
+
+  it('reports unexpected exit status and recent stderr after readiness', async () => {
+    const nonce = 'transport-exit-context';
+    const marker = serializeDshBridgeReady(nonce);
+    const exits: string[] = [];
+    const spawned = spawnAcpAgent({
+      command: process.execPath,
+      args: nodeScript(`process.stderr.write(${JSON.stringify(marker + '\n')}); setTimeout(() => { process.stderr.write('profile boot failed\\n'); process.exit(3); }, 10);`),
+      stderr: 'pipe',
+      readiness: { parse: parseDshBridgeReadyLine, timeoutMs: 1_000 },
+      onExit: message => exits.push(message),
+    });
+    children.push(spawned);
+
+    await expect(spawned.ready).resolves.toMatchObject({ nonce });
+    await new Promise(resolve => setTimeout(resolve, 100));
+    expect(exits).toHaveLength(1);
+    expect(exits[0]).toContain('code=3, signal=none');
+    expect(exits[0]).toContain('profile boot failed');
+  });
+});
 describe('ACP remote transport lifecycle', () => {
   it('closes the underlying WebSocket when disposed', async () => {
     const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });

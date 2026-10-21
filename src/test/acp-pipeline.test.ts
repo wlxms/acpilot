@@ -102,6 +102,62 @@ describe('AcpPipeline', () => {
     });
   });
 
+  it('adds a visible error card when a permission-gated external edit fails', async () => {
+    const target = stream();
+    const pipeline = new AcpPipeline({
+      sessionId: 'session-1',
+      stream: target.value,
+      permissionMode: 'full-edit',
+      directory: 'D:/workspace',
+    });
+
+    const permissionPromise = pipeline.resolvePermission({
+      sessionId: 'session-1',
+      toolCall: {
+        toolCallId: 'call-gated-edit',
+        kind: 'edit',
+        title: 'edit',
+        rawInput: { path: 'src/app.ts' },
+        locations: [{ path: 'src/app.ts' }],
+      },
+      options: [{ optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' }],
+    } as never);
+    await Promise.resolve();
+    const external = target.pushed[0] as unknown as {
+      render(stream: { externalEdit(target: unknown, callback: () => PromiseLike<unknown>): PromiseLike<string> }): void;
+    };
+    external.render({
+      externalEdit: (_uris, callback) => Promise.resolve(callback()).then(() => 'undo-stop'),
+    });
+    await permissionPromise;
+
+    await pipeline.run((async function* () {
+      yield update({
+        sessionUpdate: 'tool_call',
+        toolCallId: 'call-gated-edit',
+        title: 'edit',
+        status: 'in_progress',
+        rawInput: { path: 'src/app.ts' },
+      });
+      yield update({
+        sessionUpdate: 'tool_call_update',
+        toolCallId: 'call-gated-edit',
+        status: 'failed',
+        rawOutput: 'Error: file has not been read',
+      });
+      yield stop('end_turn');
+    })(), { isCancellationRequested: false });
+
+    const failure = target.updated
+      .find(item => item.id === 'call-gated-edit')?.data as Record<string, unknown> | undefined;
+    expect(failure).toMatchObject({
+      state: {
+        status: 'error',
+        error: expect.stringContaining('file has not been read'),
+      },
+    });
+  });
+
   it('rejects mutating permission requests in read-only mode before rendering approval UI', async () => {
     const target = stream();
     const pipeline = new AcpPipeline({

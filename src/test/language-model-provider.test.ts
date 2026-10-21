@@ -48,8 +48,14 @@ describe('language model provider routing', () => {
       { silent: false } as vscode.PrepareLanguageModelChatModelOptions,
       token,
     ) ?? [];
-    expect(models).toHaveLength(1);
+    expect(models).toHaveLength(2);
     expect(models[0]).toEqual(expect.objectContaining({
+      name: 'Auto',
+      isBYOK: true,
+      isUserSelectable: true,
+    }));
+    expect(models[1]).toEqual(expect.objectContaining({
+      id: canonicalCopilotModelId('acp', 'acp', 'remote-model', 'acp:target-a'),
       isBYOK: true,
       isUserSelectable: true,
     }));
@@ -57,7 +63,7 @@ describe('language model provider routing', () => {
     await expect(provider.provideLanguageModelChatInformation!(
       { silent: false } as vscode.PrepareLanguageModelChatModelOptions,
       token,
-    )).resolves.toEqual([]);
+    )).resolves.toEqual([expect.objectContaining({ name: 'Auto' })]);
     dispose();
   });
 
@@ -108,12 +114,14 @@ describe('language model provider routing', () => {
     await expect(provider.provideLanguageModelChatInformation!(
       { silent: true } as vscode.PrepareLanguageModelChatModelOptions,
       { isCancellationRequested: false } as vscode.CancellationToken,
-    )).resolves.toEqual([]);
+    )).resolves.toEqual([expect.objectContaining({ name: 'Auto' })]);
 
-    expect(start).toHaveBeenCalledOnce();
-    expect(catalog.list()).toEqual([]);
-    expect(catalog.resolve('opencode', 'opencode', staleId, 'opencode')).toEqual({
-      kind: 'not-found',
+    expect(start).not.toHaveBeenCalled();
+    expect(catalog.list()).toEqual([
+      expect.objectContaining({ modelId: 'stale-model' }),
+    ]);
+    expect(catalog.resolve('opencode', 'opencode', staleId, 'opencode')).toMatchObject({
+      kind: 'backend',
     });
     dispose();
     catalog.dispose();
@@ -153,13 +161,13 @@ describe('language model provider routing', () => {
     await expect(provider.provideLanguageModelChatInformation!(
       { silent: true } as vscode.PrepareLanguageModelChatModelOptions,
       token,
-    )).resolves.toEqual([]);
+    )).resolves.toEqual([expect.objectContaining({ name: 'Auto' })]);
     await expect(provider.provideLanguageModelChatInformation!(
       { silent: true } as vscode.PrepareLanguageModelChatModelOptions,
       token,
-    )).resolves.toEqual([]);
+    )).resolves.toEqual([expect.objectContaining({ name: 'Auto' })]);
 
-    expect(start).toHaveBeenCalledTimes(2);
+    expect(start).not.toHaveBeenCalled();
     expect(clearBackend).not.toHaveBeenCalled();
     expect(modelsChanged).not.toHaveBeenCalled();
     dispose();

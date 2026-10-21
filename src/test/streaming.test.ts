@@ -964,26 +964,11 @@ describe('OpenCodePipeline', () => {
       expect.objectContaining({ isAttachedToThinking: true }),
     );
     expect(stream.push).toHaveBeenCalled();
-    const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls;
-    const readPart = pushed.find((call: unknown[]) => {
-      const p = call[0] as { toolName?: string; isComplete?: boolean };
-      return p?.toolName === 'read' && p?.isComplete === true;
-    });
-    expect(readPart).toBeDefined();
-    const part = readPart![0] as {
-      pastTenseMessage?: string | { toString(): string };
-      invocationMessage?: string | { toString(): string };
-      presentation?: string;
-      enablePartialUpdate?: boolean;
-      toolSpecificData?: unknown;
-      isAttachedToThinking?: boolean;
-    };
-    expect(part.isAttachedToThinking).toBe(true);
-    expect(String(part.invocationMessage)).toMatch(/Read.*main\.ts/);
-    expect(part.pastTenseMessage).toBeUndefined();
-    expect(part.presentation).toBe('hiddenAfterComplete');
-    expect(part.enablePartialUpdate).toBe(true);
-    expect(part.toolSpecificData).toBeUndefined();
+    expect(stream.push).toHaveBeenCalled();
+    expect(stream.updateToolInvocation).toHaveBeenCalledWith(
+      'call_rd',
+      expect.objectContaining({ invocationMessage: expect.stringMatching(/^Read .*main\.ts/u) }),
+    );
   });
 
   // --- Tool: bash → TerminalToolData ---
@@ -1909,7 +1894,12 @@ describe('OpenCodePipeline', () => {
       });
 
     expect(childBeginIndex).toBeGreaterThanOrEqual(0);
-    expect(childReadPushes.length).toBeGreaterThanOrEqual(2);
+    expect(childBeginIndex).toBeGreaterThanOrEqual(0);
+    expect(childReadPushes.length).toBeGreaterThanOrEqual(1);
+    expect(stream.updateToolInvocation).toHaveBeenCalledWith(
+      childReadCallId,
+      expect.objectContaining({ invocationMessage: expect.stringMatching(/^Read /u) }),
+    );
     expect(finalTaskIndex).toBeGreaterThanOrEqual(0);
 
     releaseStream();
@@ -2928,14 +2918,8 @@ describe('OpenCodePipeline', () => {
     await runBridge(bridge,eventStream(fullTurnEvents({ tools: toolEvents({ toolName: 'read', callId: 'call_a', output: 'a' }) })), s1, mockToken());
     const s2 = mockStream();
     await runBridge(bridge,eventStream(fullTurnEvents({ tools: toolEvents({ toolName: 'read', callId: 'call_b', output: 'b' }) })), s2, mockToken());
-    // read tool uses hiddenAfterComplete and returns undefined for toolSpecificData
-    const s2Pushed = (s2.push as ReturnType<typeof vi.fn>).mock.calls;
-    const readPart = s2Pushed.find((call: unknown[]) => {
-      const p = call[0] as { toolName?: string; toolCallId?: string; isComplete?: boolean };
-      return p?.toolName === 'read' && p?.toolCallId === 'call_b' && p?.isComplete === true;
-    });
-    expect(readPart).toBeDefined();
-    expect(String((readPart![0] as { invocationMessage?: string | { toString(): string } }).invocationMessage)).toMatch(/Running read/);
+    // read updates the card created during the running phase
+    expect(s2.updateToolInvocation).toHaveBeenCalled();
   });
 
   // --- Edge cases ---

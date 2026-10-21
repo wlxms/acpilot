@@ -56,6 +56,62 @@ describe('ExternalEditSSP', () => {
     ssp.update({ status: 'completed' });
     expect(ssp.payload.status).toBe('completed');
   });
+  it('does not start the VS Code external edit lifecycle before the edit succeeds', () => {
+    const stream = {
+      ...mockStream(),
+      externalEdit: vi.fn(),
+    };
+    const ssp = new ExternalEditSSP({
+      toolCallId: 'c-deferred-start',
+      editId: '',
+      status: 'pending',
+      uri: '/test.ts',
+    }, undefined, { turnIndex: 0 });
+    ssp.update({ status: 'error', error: 'preflight failed' });
+    ssp.render(stream);
+    expect(stream.externalEdit).not.toHaveBeenCalled();
+  });
+
+  it('renders an explicit failure message when an external edit errors', () => {
+    const stream = mockStream();
+    const ssp = new ExternalEditSSP({
+      toolCallId: 'c-failed',
+      editId: '',
+      status: 'error',
+      error: 'file has not been read',
+    });
+    ssp.render(stream);
+    expect(stream.progress).toHaveBeenCalledWith(
+      expect.stringContaining('file has not been read'),
+    );
+  });
+
+  it('does not emit an after snapshot when an external edit errors', async () => {
+    const stream = {
+      ...mockStream(),
+      externalEdit: vi.fn(async (_target: unknown, callback: () => PromiseLike<unknown>) => {
+        await callback();
+        return 'undo-failed';
+      }),
+    };
+    const ssp = new ExternalEditSSP({
+      toolCallId: 'c-failed-after',
+      editId: '',
+      status: 'pending',
+      uri: '/test.ts',
+    });
+    const afterSnapshots: unknown[] = [];
+    ssp.onSnapshot(snapshot => {
+      if (snapshot.phase === 'after') {afterSnapshots.push(snapshot);}
+    });
+
+    ssp.render(stream);
+    ssp.update({ status: 'error', error: 'file has not been read' });
+    await ssp.whenMetadataSettled();
+
+    expect(afterSnapshots).toHaveLength(0);
+  });
+
 });
 
 // ===========================================================================

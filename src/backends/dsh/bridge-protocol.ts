@@ -4,11 +4,19 @@ export const DSH_BRIDGE_PLUGIN_NAME = '@wlxms/acpilot-dsh-bridge';
 export const DSH_BRIDGE_PROTOCOL = 1;
 export const DSH_BRIDGE_MARKER_PREFIX = 'ACPILOT_DSH_BRIDGE_READY\t';
 export const DSH_BRIDGE_TOOL_PREFIX = 'ACPILOT_DSH_BRIDGE_TOOL\t';
+export const DSH_BRIDGE_DIAGNOSTIC_PREFIX = 'ACPILOT_DSH_BRIDGE_DIAGNOSTIC\t';
 
 export interface DshBridgeReady {
   plugin: typeof DSH_BRIDGE_PLUGIN_NAME;
   protocol: typeof DSH_BRIDGE_PROTOCOL;
   nonce: string;
+}
+
+/** Best-effort bridge diagnostics; never part of the ACP or tool protocol. */
+export interface DshBridgeDiagnostic {
+  protocol: typeof DSH_BRIDGE_PROTOCOL;
+  event: string;
+  [key: string]: unknown;
 }
 
 /**
@@ -109,6 +117,23 @@ export function parseDshBridgeToolLine(line: string): DshBridgeToolMessage | und
     if (typeof value.isError !== 'boolean') {return undefined;}
     if (value.presentation !== undefined && !isPresentation(value.presentation)) {return undefined;}
     return value as unknown as DshBridgeToolResultMessage;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Parse one bridge diagnostic line for the backend log. */
+export function parseDshBridgeDiagnosticLine(line: string): DshBridgeDiagnostic | undefined {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith(DSH_BRIDGE_DIAGNOSTIC_PREFIX)) {return undefined;}
+  try {
+    const value = JSON.parse(trimmed.slice(DSH_BRIDGE_DIAGNOSTIC_PREFIX.length)) as unknown;
+    if (!isRecord(value)
+      || value.protocol !== DSH_BRIDGE_PROTOCOL
+      || !nonEmptyString(value.event)) {
+      return undefined;
+    }
+    return value as unknown as DshBridgeDiagnostic;
   } catch {
     return undefined;
   }

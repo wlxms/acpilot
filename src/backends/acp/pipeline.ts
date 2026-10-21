@@ -97,7 +97,14 @@ export class AcpPipeline implements BackendPipeline<ActiveSessionMessage> {
   }
 
   async resolvePermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
+    const toolCallId = params.toolCall.toolCallId;
+    this.logger.appendLine(
+      `[acp-pipeline] permission.begin session=${params.sessionId} call=${toolCallId} `
+        + `kind=${params.toolCall.kind ?? 'unknown'} options=${params.options.length} `
+        + `mode=${this.permissionMode} interactive=${this.allowUserInteraction}`,
+    );
     if (params.options.length === 0) {
+      this.logger.appendLine(`[acp-pipeline] permission.reply call=${toolCallId} outcome=cancelled reason=no-options`);
       return { outcome: { outcome: 'cancelled' } };
     }
 
@@ -107,6 +114,7 @@ export class AcpPipeline implements BackendPipeline<ActiveSessionMessage> {
     if (this.permissionMode === 'read-only'
       && !isReadOnlyAcpTool(params.toolCall.kind)) {
       this.logger.appendLine(`[acp-pipeline] Rejected ${params.toolCall.kind ?? 'unknown'} tool in read-only mode`);
+      this.logger.appendLine(`[acp-pipeline] permission.reply call=${toolCallId} outcome=cancelled reason=read-only`);
       return { outcome: { outcome: 'cancelled' } };
     }
 
@@ -114,8 +122,10 @@ export class AcpPipeline implements BackendPipeline<ActiveSessionMessage> {
       const option = selectAutomaticPermissionOption(params.options);
       if (option) {
         this.logger.appendLine(`[acp-pipeline] Automatically allowed ${params.toolCall.kind ?? 'unknown'} in read-only mode`);
+        this.logger.appendLine(`[acp-pipeline] permission.reply call=${toolCallId} outcome=selected option=${option.optionId} reason=read-only-auto`);
         return selectedPermissionResponse(option.optionId);
       }
+      this.logger.appendLine(`[acp-pipeline] permission.reply call=${toolCallId} outcome=cancelled reason=read-only-no-option`);
       return { outcome: { outcome: 'cancelled' } };
     }
 
@@ -125,18 +135,22 @@ export class AcpPipeline implements BackendPipeline<ActiveSessionMessage> {
     const filePaths = resolveToolCallPaths(params.toolCall, this.directory);
 
     if (!this.sss) {
+      this.logger.appendLine(`[acp-pipeline] permission.reply call=${toolCallId} outcome=cancelled reason=missing-stream`);
       return { outcome: { outcome: 'cancelled' } };
     }
     if (filePaths.length === 0) {
       if (automaticResponse) {
         const mode = this.permissionMode === 'full-edit' ? 'full-edit' : 'non-interactive LM';
         this.logger.appendLine(`[acp-pipeline] Automatically allowed ${params.toolCall.kind ?? 'unknown'} in ${mode}`);
+        this.logger.appendLine(`[acp-pipeline] permission.reply call=${toolCallId} outcome=${automaticResponse.outcome.outcome} reason=automatic`);
         return automaticResponse;
       }
       if (!this.allowUserInteraction) {
         this.logger.appendLine(`[acp-pipeline] Rejected ${params.toolCall.kind ?? 'unknown'}: no allow option for non-interactive LM`);
+        this.logger.appendLine(`[acp-pipeline] permission.reply call=${toolCallId} outcome=cancelled reason=non-interactive`);
         return { outcome: { outcome: 'cancelled' } };
       }
+      this.logger.appendLine(`[acp-pipeline] permission.wait-ui call=${toolCallId} reason=no-file-paths`);
       return this.requestPermissionChoice(params);
     }
 
@@ -150,6 +164,10 @@ export class AcpPipeline implements BackendPipeline<ActiveSessionMessage> {
           clearTimeout(timeout);
           timeout = undefined;
         }
+        this.logger.appendLine(
+          `[acp-pipeline] permission.reply call=${toolCallId} outcome=${response.outcome.outcome}`
+            + (response.outcome.outcome === 'selected' ? ` option=${response.outcome.optionId}` : ''),
+        );
         resolve(response);
       };
 
@@ -162,11 +180,15 @@ export class AcpPipeline implements BackendPipeline<ActiveSessionMessage> {
           this.logger.appendLine(`[acp-pipeline] Rejected ${params.toolCall.kind ?? 'unknown'}: no allow option for non-interactive LM`);
           settle({ outcome: { outcome: 'cancelled' } });
         } else {
+          this.logger.appendLine(`[acp-pipeline] permission.wait-ui call=${toolCallId} files=${filePaths.length}`);
           void this.requestPermissionChoice(params).then(settle);
         }
       });
 
-      timeout = setTimeout(() => settle({ outcome: { outcome: 'cancelled' } }), 30_000);
+      timeout = setTimeout(() => {
+        this.logger.appendLine(`[acp-pipeline] permission.timeout call=${toolCallId} ms=30000`);
+        settle({ outcome: { outcome: 'cancelled' } });
+      }, 30_000);
       // A synchronous renderer may capture the baseline during push(), before
       // the timeout is assigned. Avoid leaving that timer alive after settle.
       if (settled) {
@@ -364,11 +386,43 @@ export class AcpPipeline implements BackendPipeline<ActiveSessionMessage> {
       case 'tool_call_update': {
         const externalEditId = this.externalEditTargets.get(update.toolCallId);
         if (externalEditId && (update.status === 'completed' || update.status === 'failed')) {
-          target.update(externalEditId, {
-            status: update.status === 'failed' ? 'error' : 'completed',
-            error: update.status === 'failed' ? toolOutputToText(update) : undefined,
-          });
+          if (update.status === 'failed') {
+            target.update(externalEditId, { status: 'error' });
+          } else {
+            target.update(externalEditId, { status: 'completed', error: undefined });
+          }
           this.clearExternalEditTracking(update.toolCallId);
+        }
+
+        if (externalEditId && update.status === 'failed') {
+          const output = toolOutputToText(update);
+          const partId = this.toolTargets.get(update.toolCallId);
+          if (partId) {
+            target.update(partId, {
+              state: {
+                status: 'error',
+                output,
+                error: output || 'External edit failed',
+              },
+            });
+          } else {
+            target.push(new ToolInvocationSSP({
+              partId: `tool-${update.toolCallId}`,
+              toolName: update.title ?? 'edit',
+              callId: update.toolCallId,
+              state: {
+                status: 'error',
+                input: (update.rawInput as Record<string, unknown>) ?? {},
+                title: update.title ?? undefined,
+                output,
+                error: output || 'External edit failed',
+              },
+              sessionId: eventSessionId ?? this.sessionId,
+            }));
+            this.toolTargets.set(update.toolCallId, update.toolCallId);
+            this.toolStatuses.set(update.toolCallId, 'error');
+          }
+          break;
         }
 
         const partId = this.toolTargets.get(update.toolCallId);

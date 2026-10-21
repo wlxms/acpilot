@@ -12,6 +12,7 @@ import {
   registerLanguageModelChatProvider,
 } from '../surfaces/vscode/language-model-provider';
 import {
+  autoCopilotModelId,
   canonicalCopilotModelId,
   createCopilotModelCatalog,
 } from '../surfaces/vscode/model-catalog';
@@ -110,7 +111,7 @@ function fixture(
 async function getProvider(f = fixture()) {
   const { provider, dispose } = createLanguageModelChatProvider(f.state, f.ctx);
   const models = await provider.provideLanguageModelChatInformation!({ silent: true }, token()) ?? [];
-  return { ...f, provider, dispose, model: models[0] };
+  return { ...f, provider, dispose, model: models[0], models };
 }
 
 describe('language model provider backend route', () => {
@@ -132,7 +133,7 @@ describe('language model provider backend route', () => {
 
     try {
       await expect(provider.provideLanguageModelChatInformation!({ silent: true }, token()))
-        .resolves.toEqual([]);
+        .resolves.toEqual([expect.objectContaining({ name: 'Auto' })]);
 
       catalogModels.push({
         id: 'ready-model',
@@ -144,6 +145,7 @@ describe('language model provider backend route', () => {
       expect(changed).toHaveBeenCalledOnce();
       await expect(provider.provideLanguageModelChatInformation!({ silent: true }, token()))
         .resolves.toEqual([
+          expect.objectContaining({ name: 'Auto' }),
           expect.objectContaining({
             id: 'opencode/ready-provider/ready-model',
             name: 'Ready Model',
@@ -237,8 +239,14 @@ describe('language model provider backend route', () => {
 
     releaseSecondRefresh();
     const [firstModels, secondModels] = await Promise.all([firstInfo, secondInfo]);
-    expect(firstModels.map(model => model.id)).toEqual(['first/first-provider/first-model']);
-    expect(secondModels.map(model => model.id)).toEqual(['second/second-provider/second-model']);
+    expect(firstModels.map(model => model.id)).toEqual([
+      autoCopilotModelId('first', 'first'),
+      'first/first-provider/first-model',
+    ]);
+    expect(secondModels.map(model => model.id)).toEqual([
+      autoCopilotModelId('second', 'second'),
+      'second/second-provider/second-model',
+    ]);
 
     releaseFirstRefresh();
     firstProvider.dispose();
@@ -246,15 +254,49 @@ describe('language model provider backend route', () => {
     state.modelCatalog.dispose();
   });
 
+  it('always exposes Auto without starting the backend', async () => {
+    const f = fixture();
+    f.backend.isRunning = vi.fn(() => false);
+    f.backend.start = vi.fn(async () => ({ data: { url: '', status: 'running' as const } }));
+    const { provider, dispose } = createLanguageModelChatProvider(f.state, f.ctx);
+
+    const models = await provider.provideLanguageModelChatInformation!({ silent: true }, token()) ?? [];
+
+    expect(f.backend.start).not.toHaveBeenCalled();
+    expect(models[0]).toMatchObject({
+      id: autoCopilotModelId('opencode', 'opencode'),
+      name: 'Auto',
+      isDefault: true,
+      isUserSelectable: true,
+      targetChatSessionType: 'acpilot.opencode',
+    });
+    expect(models.map(model => model.id)).not.toContain('opencode/opencode/big-pickle');
+    dispose();
+  });
+
+  it('keeps Auto available when the backend has no native models', async () => {
+    const f = fixture(undefined, []);
+    f.backend.isRunning = vi.fn(() => false);
+    f.backend.start = vi.fn(async () => ({ data: { url: '', status: 'running' as const } }));
+    const { provider, dispose } = createLanguageModelChatProvider(f.state, f.ctx);
+
+    const models = await provider.provideLanguageModelChatInformation!({ silent: true }, token()) ?? [];
+
+    expect(f.backend.start).not.toHaveBeenCalled();
+    expect(models.map(model => model.id)).toEqual([autoCopilotModelId('opencode', 'opencode')]);
+    dispose();
+  });
+
   it('exposes the backend catalog through its single vendor', async () => {
     const f = await getProvider();
     expect(f.listModels).not.toHaveBeenCalled();
-    expect(f.model).toMatchObject({
+    expect(f.models[0].id).toBe(autoCopilotModelId('opencode', 'opencode'));
+    expect(f.models[1]).toMatchObject({
       id: 'opencode/opencode/big-pickle',
       capabilities: { agentMode: true, toolCalling: true },
     });
-    expect(f.model.targetChatSessionType).toBe('acpilot.opencode');
-    expect(f.model.isUserSelectable).toBe(true);
+    expect(f.models[1].targetChatSessionType).toBe('acpilot.opencode');
+    expect(f.models[1].isUserSelectable).toBe(true);
     f.dispose();
   });
 
@@ -276,33 +318,24 @@ describe('language model provider backend route', () => {
     f.ctx.instanceKey = 'opencode:replacement';
     releaseRefresh();
 
-    await expect(info).resolves.toEqual([]);
+    const models = await info ?? [];
+    expect(models[0]).toEqual(expect.objectContaining({ name: 'Auto' }));
     dispose();
   });
 
-  it('settles a lazy-start model query when its cancellation token fires', async () => {
+  it('does not start a stopped backend while reporting model information', async () => {
     const f = fixture();
     f.backend.isRunning = () => false;
-    let releaseStart!: () => void;
-    const pendingStart = new Promise<{ data: { url: string; status: 'running' } }>(resolve => {
-      releaseStart = () => resolve({ data: { url: '', status: 'running' } });
-    });
-    f.backend.start = vi.fn(() => pendingStart);
-    const requestToken = cancellableToken();
+    f.backend.start = vi.fn(async () => ({ data: { url: '', status: 'running' as const } }));
     const { provider, dispose } = createLanguageModelChatProvider(f.state, f.ctx);
-    const info = provider.provideLanguageModelChatInformation!({ silent: true }, requestToken);
 
-    try {
-      await vi.waitFor(() => expect(f.backend.start).toHaveBeenCalledOnce());
-      requestToken.cancel();
-      await expect(info).resolves.toEqual([]);
-    } finally {
-      releaseStart();
-      dispose();
-    }
+    const models = await provider.provideLanguageModelChatInformation!({ silent: true }, token()) ?? [];
+    expect(models[0]).toEqual(expect.objectContaining({ name: 'Auto' }));
+    expect(f.backend.start).not.toHaveBeenCalled();
+    dispose();
   });
 
-  it('settles a model query when the backend runtime is invalidated', async () => {
+  it('keeps Auto available when the backend runtime changes before discovery', async () => {
     const f = fixture();
     Object.assign(f.ctx, {
       runtimeGeneration: 0,
@@ -310,29 +343,16 @@ describe('language model provider backend route', () => {
       instanceKey: 'opencode',
     });
     f.backend.isRunning = () => false;
-    let releaseStart!: () => void;
-    const pendingStart = new Promise<{ data: { url: string; status: 'running' } }>(resolve => {
-      releaseStart = () => resolve({ data: { url: '', status: 'running' } });
-    });
-    f.backend.start = vi.fn(() => pendingStart);
-    const requestToken = cancellableToken();
     const { provider, dispose } = createLanguageModelChatProvider(f.state, f.ctx);
-    const info = provider.provideLanguageModelChatInformation!({ silent: true }, requestToken);
+    f.ctx.runtimeGeneration = 1;
+    f.ctx.instanceKey = 'opencode:replacement';
 
-    try {
-      await vi.waitFor(() => expect(f.backend.start).toHaveBeenCalledOnce());
-      f.ctx.runtimeGeneration = 1;
-      f.ctx.acceptingRequests = false;
-      f.state.bus.emit('backend-runtime-changing', {
-        backendId: 'opencode',
-        runtimeGeneration: 1,
-        instanceKey: 'opencode',
-      });
-      await expect(info).resolves.toEqual([]);
-    } finally {
-      releaseStart();
-      dispose();
-    }
+    await expect(provider.provideLanguageModelChatInformation!({ silent: true }, token()))
+      .resolves.toEqual([expect.objectContaining({
+        id: autoCopilotModelId('opencode', 'opencode:replacement'),
+        name: 'Auto',
+      })]);
+    dispose();
   });
 
   it('settles while a catalog refresh is pending when the request is cancelled', async () => {
@@ -347,46 +367,51 @@ describe('language model provider backend route', () => {
     try {
       await vi.waitFor(() => expect(f.state.modelCatalog.refresh).toHaveBeenCalledOnce());
       requestToken.cancel();
-      await expect(info).resolves.toEqual([]);
+      const models = await info ?? [];
+    expect(models[0]).toEqual(expect.objectContaining({ name: 'Auto' }));
     } finally {
       releaseRefresh();
       dispose();
     }
   });
 
-  it('invalidates the catalog when a lazy backend start fails', async () => {
-    const f = await getProvider();
-    const previousEntries = f.state.modelCatalog.list();
-    const previousResolve = f.state.modelCatalog.resolve;
-    let entries = previousEntries;
-    f.state.modelCatalog.list = () => entries;
-    f.state.modelCatalog.resolve = (
-      backendId: string,
-      vendor: string,
-      modelId: string,
-      instanceKey: string,
-    ) => entries.length === 0
-      ? { kind: 'not-found' as const }
-      : previousResolve(backendId, vendor, modelId, instanceKey);
-    f.state.modelCatalog.clearBackend = vi.fn(() => {
-      entries = [];
-    });
+  it('keeps Auto selectable when no native model can be discovered', async () => {
+    const f = fixture(undefined, []);
     f.backend.isRunning = () => false;
     f.backend.start = vi.fn(async () => ({ error: 'backend offline' }));
+    const { provider, dispose } = createLanguageModelChatProvider(f.state, f.ctx);
 
-    await expect(f.provider.provideLanguageModelChatInformation!({ silent: true }, token()))
-      .resolves.toEqual([]);
+    await expect(provider.provideLanguageModelChatInformation!({ silent: true }, token()))
+      .resolves.toEqual([expect.objectContaining({ name: 'Auto' })]);
+    expect(f.backend.start).not.toHaveBeenCalled();
+    dispose();
+  });
 
-    expect(f.state.modelCatalog.clearBackend).toHaveBeenCalledWith('opencode');
-    expect(f.state.modelCatalog.list()).toEqual([]);
-    await expect(f.provider.provideLanguageModelChatResponse!(
-      f.model,
+  it('resolves Auto to the default selection when one is available', async () => {
+    const invoke = vi.fn(async (request) => {
+      request.stream.push(new AssistantTextSSP({ partId: 'part-auto', delta: 'auto response' }));
+      return {
+        completed: true,
+        pipeline: { completed: true, userMessageId: null, sessionTitle: null, sessionTitleSource: null, hadSubagentTasks: false },
+      };
+    });
+    const f = await getProvider(fixture(invoke));
+    f.ctx.selection = {
+      get: () => ({ model: { providerID: 'opencode', modelID: 'big-pickle' } }),
+    } as unknown as BackendContext['selection'];
+    const auto = (await f.provider.provideLanguageModelChatInformation!({ silent: true }, token()) ?? [])[0];
+
+    await f.provider.provideLanguageModelChatResponse!(
+      auto,
       messages(),
       {} as vscode.ProvideLanguageModelChatResponseOptions,
       { report: vi.fn() },
       token(),
-    )).rejects.toThrow('Unable to resolve model');
-    expect(f.invoke).not.toHaveBeenCalled();
+    );
+
+    expect(invoke).toHaveBeenCalledWith(expect.objectContaining({
+      model: { providerID: 'opencode', modelID: 'big-pickle' },
+    }));
     f.dispose();
   });
 
@@ -398,7 +423,7 @@ describe('language model provider backend route', () => {
     const f = await getProvider(fixture(invoke));
     const report = vi.fn();
     await f.provider.provideLanguageModelChatResponse!(
-      f.model,
+      f.models[1],
       messages(), {} as vscode.ProvideLanguageModelChatResponseOptions,
       { report }, token(),
     );
@@ -413,7 +438,7 @@ describe('language model provider backend route', () => {
     const f = await getProvider();
 
     await f.provider.provideLanguageModelChatResponse!(
-      f.model,
+      f.models[1],
       messages(),
       {} as vscode.ProvideLanguageModelChatResponseOptions,
       { report: vi.fn() },
@@ -432,7 +457,7 @@ describe('language model provider backend route', () => {
     const report = vi.fn();
 
     await expect(f.provider.provideLanguageModelChatResponse!(
-      f.model,
+      f.models[1],
       messages(),
       {
         tools: [{ name: 'lookup', description: 'Lookup a value' }],
@@ -450,7 +475,7 @@ describe('language model provider backend route', () => {
     const f = await getProvider();
 
     await expect(f.provider.provideLanguageModelChatResponse!(
-      f.model,
+      f.models[1],
       messages(),
       { toolMode: 2 } as vscode.ProvideLanguageModelChatResponseOptions,
       { report: vi.fn() },
@@ -466,7 +491,7 @@ describe('language model provider backend route', () => {
     const report = vi.fn();
 
     await expect(f.provider.provideLanguageModelChatResponse!(
-      f.model,
+      f.models[1],
       messages('use the OpenCode Agent path'),
       {
         tools: [{ name: 'read_file', description: 'Read a file', inputSchema: { type: 'object' } }],
@@ -489,17 +514,20 @@ describe('language model provider backend route', () => {
       return { completed: true, pipeline: { completed: true, userMessageId: null, sessionTitle: null, sessionTitleSource: null, hadSubagentTasks: false } };
     });
     const f = await getProvider(fixture(invoke, [
-      { id: 'shared-model', name: 'OpenAI Shared', provider: 'openai' },
+      { id: 'shared-model', name: '[OI] Shared', provider: 'openai' },
       { id: 'shared-model', name: 'DeepSeek Shared', provider: 'deepseek' },
     ]));
     const models = await f.provider.provideLanguageModelChatInformation!({ silent: true }, token()) ?? [];
     expect(models.map(model => model.id)).toEqual([
+      autoCopilotModelId('opencode', 'opencode'),
       'opencode/openai/shared-model',
       'opencode/deepseek/shared-model',
     ]);
 
+    const deepseekModel = models.find(model => model.id.includes('/deepseek/'));
+    expect(deepseekModel).toBeDefined();
     await f.provider.provideLanguageModelChatResponse!(
-      models[1], messages(), {} as vscode.ProvideLanguageModelChatResponseOptions,
+      deepseekModel!, messages(), {} as vscode.ProvideLanguageModelChatResponseOptions,
       { report: vi.fn() }, token(),
     );
     expect(invoke).toHaveBeenCalledWith(expect.objectContaining({
@@ -512,7 +540,7 @@ describe('language model provider backend route', () => {
     const f = await getProvider();
     const report = vi.fn();
     await expect(f.provider.provideLanguageModelChatResponse!(
-      { ...f.model, id: 'opencode/forged-provider/forged-model' },
+      { ...f.models[1], id: 'opencode/forged-provider/forged-model' },
       messages(), {} as vscode.ProvideLanguageModelChatResponseOptions,
       { report }, token(),
     )).rejects.toThrow('Unable to resolve model');
@@ -530,7 +558,7 @@ describe('language model provider backend route', () => {
       return result;
     });
     const f = await getProvider(fixture(invoke));
-    await f.provider.provideLanguageModelChatResponse!(f.model, messages(), {} as vscode.ProvideLanguageModelChatResponseOptions, { report: vi.fn() }, token());
+    await f.provider.provideLanguageModelChatResponse!(f.models[1], messages(), {} as vscode.ProvideLanguageModelChatResponseOptions, { report: vi.fn() }, token());
     expect(invoke.mock.results[0]?.value).toBeDefined();
     const result = await invoke.mock.results[0]!.value;
     expect((result as BackendModelInvocationResult & { flush?: ReturnType<typeof vi.spyOn> }).flush).toHaveBeenCalledOnce();
@@ -540,7 +568,7 @@ describe('language model provider backend route', () => {
   it('reports backend failures to the Copilot progress sink', async () => {
     const f = await getProvider(fixture(vi.fn(async () => { throw new Error('backend unavailable'); })));
     const report = vi.fn();
-    await expect(f.provider.provideLanguageModelChatResponse!(f.model, messages(), {} as vscode.ProvideLanguageModelChatResponseOptions, { report }, token())).rejects.toThrow('backend unavailable');
+    await expect(f.provider.provideLanguageModelChatResponse!(f.models[1], messages(), {} as vscode.ProvideLanguageModelChatResponseOptions, { report }, token())).rejects.toThrow('backend unavailable');
     expect(report).toHaveBeenCalled();
     expect((report.mock.calls[0][0] as vscode.LanguageModelTextPart).value).toContain('Backend error: backend unavailable');
     f.dispose();
@@ -555,7 +583,7 @@ describe('language model provider backend route', () => {
       return { completed: true, pipeline: { completed: true, userMessageId: null, sessionTitle: null, sessionTitleSource: null, hadSubagentTasks: false } };
     });
     const f = await getProvider(fixture(invoke));
-    await f.provider.provideLanguageModelChatResponse!(f.model, messages(), {} as vscode.ProvideLanguageModelChatResponseOptions, { report: vi.fn() }, requestToken);
+    await f.provider.provideLanguageModelChatResponse!(f.models[1], messages(), {} as vscode.ProvideLanguageModelChatResponseOptions, { report: vi.fn() }, requestToken);
     expect(seen).toBe(true);
     f.dispose();
   });
@@ -615,13 +643,13 @@ describe('language model provider backend route', () => {
 
     const { provider, dispose } = createLanguageModelChatProvider(f.state, f.ctx);
     const modelsA = await provider.provideLanguageModelChatInformation!({ silent: true }, token()) ?? [];
-    const staleModel = modelsA[0];
+    const staleModel = modelsA[1];
     expect(staleModel.id).toBe(targetA.copilotModelId);
 
     current = targetB;
     f.ctx.instanceKey = 'acp:target-b';
     const modelsB = await provider.provideLanguageModelChatInformation!({ silent: true }, token()) ?? [];
-    expect(modelsB[0].id).toBe(targetB.copilotModelId);
+    expect(modelsB[1].id).toBe(targetB.copilotModelId);
 
     const staleReport = vi.fn();
     await expect(provider.provideLanguageModelChatResponse!(
@@ -634,7 +662,7 @@ describe('language model provider backend route', () => {
     expect(invoke).not.toHaveBeenCalled();
 
     await provider.provideLanguageModelChatResponse!(
-      modelsB[0],
+      modelsB[1],
       messages(),
       {} as vscode.ProvideLanguageModelChatResponseOptions,
       { report: vi.fn() },

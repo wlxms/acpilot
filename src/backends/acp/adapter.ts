@@ -229,7 +229,12 @@ export class AcpBackend implements Backend<ActiveSessionMessage> {
     this.sessionTitlePrefix = options.sessionTitlePrefix ?? 'ACP Session';
     this.missingOptionsMessage = options.missingOptionsMessage
       ?? 'No ACP target selected. Add or select an ACP target in ACP Settings.';
-    if (options.logger) {this.log = (m) => options.logger!.appendLine(`[${this.name}-backend] ${m}`);}
+    if (options.logger) {this.setLogger(options.logger);}
+  }
+
+  /** Attach a host logger after backend assembly without changing transport options. */
+  setLogger(logger: { appendLine(message: string): void }): void {
+    this.log = (message) => logger.appendLine(`[${this.name}-backend] ${message}`);
   }
 
   // -------------------------------------------------------------------------
@@ -268,6 +273,18 @@ export class AcpBackend implements Backend<ActiveSessionMessage> {
   /** Allow specialized adapters to report side-channel lifecycle diagnostics. */
   protected logMessage(message: string): void {
     this.log(message);
+  }
+
+  /**
+   * Register the one reverse request ACP needs while a session is running.
+   * The handler lives on the ClientApp builder and therefore must be attached
+   * before connect() snapshots that builder into the live JSON-RPC router.
+   */
+  private createClientApp(): ClientApp {
+    const app = client({ name: this.clientName });
+    app.onRequest(methods.client.session.requestPermission, async (ctx) =>
+      this.handlePermissionRequest(ctx.params));
+    return app;
   }
 
   async start(directory?: string): Promise<BackendResult<BackendServerInfo>> {
@@ -339,6 +356,11 @@ export class AcpBackend implements Backend<ActiveSessionMessage> {
             configuredOnStderrLine?.(line);
             this.onLocalStderrLine(line);
           };
+          const configuredOnExit = configuredLocal.onExit;
+          configuredLocal.onExit = message => {
+            configuredOnExit?.(message);
+            this.log(message);
+          };
         }
         const spawned = spawnAcpAgent(configuredLocal);
         try {
@@ -377,8 +399,9 @@ export class AcpBackend implements Backend<ActiveSessionMessage> {
       connection = { stream, dispose: disposeConnection };
       this.connection = connection;
 
-      // 2. Build the client app + register the permission request handler.
-      app = client({ name: options.clientName ?? this.clientName });
+      // 2. Build the client app with its reverse-request handlers already
+      // installed, then connect the persistent JSON-RPC connection.
+      app = this.createClientApp();
       this.app = app;
 
       // 3. Keep one ACP JSON-RPC connection for the lifetime of the backend.
@@ -389,7 +412,6 @@ export class AcpBackend implements Backend<ActiveSessionMessage> {
       clientConnection = app.connect(stream);
       const connectedClient = clientConnection;
       this.clientConnection = connectedClient;
-      this.registerClientHandlers(connectedClient);
       void connectedClient.closed.then(() => {
         if (this.clientConnection !== connectedClient) {return;}
         const closedCapabilities = this.initializeResponse?.agentCapabilities?.sessionCapabilities;
@@ -1133,17 +1155,41 @@ export class AcpBackend implements Backend<ActiveSessionMessage> {
   // Client-side request handlers
   // -------------------------------------------------------------------------
 
-  private registerClientHandlers(connection: ClientConnection): void {
-    if (!this.app) {return;}
-    this.app.onRequest(methods.client.session.requestPermission, async (ctx) => {
-      const params = ctx.params;
-      const resolver = this.permissionResolvers.get(params.sessionId);
-      if (resolver && this.permissionResolverConnections.get(params.sessionId) === connection) {
-        return resolver(params);
+  private async handlePermissionRequest(params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
+    const resolver = this.permissionResolvers.get(params.sessionId);
+    const resolverConnection = this.permissionResolverConnections.get(params.sessionId);
+    const connectionMatches = resolverConnection === this.clientConnection;
+    const toolCallId = params.toolCall.toolCallId;
+    this.log(
+      `permission.request session=${params.sessionId} call=${toolCallId} `
+        + `kind=${params.toolCall.kind ?? 'unknown'} resolver=${resolver ? 'yes' : 'no'} `
+        + `connection=${connectionMatches ? 'match' : 'mismatch'} `
+        + `options=${params.options.map(option => option.kind).join(',')}`,
+    );
+    if (resolver && connectionMatches) {
+      try {
+        const response = await resolver(params);
+        this.log(
+          `permission.reply session=${params.sessionId} call=${toolCallId} `
+            + `outcome=${response.outcome.outcome}`
+            + (response.outcome.outcome === 'selected'
+              ? ` option=${response.outcome.optionId}`
+              : ''),
+        );
+        return response;
+      } catch (error) {
+        this.log(
+          `permission.error session=${params.sessionId} call=${toolCallId} `
+            + `error=${formatError(error)}`,
+        );
+        throw error;
       }
-      this.log(`permission request rejected without active UI resolver: ${params.toolCall.toolCallId}`);
-      return { outcome: { outcome: 'cancelled' } };
-    });
+    }
+    this.log(
+      `permission.rejected session=${params.sessionId} call=${toolCallId} `
+        + `reason=${resolver === undefined ? 'missing-resolver' : 'stale-connection'}`,
+    );
+    return { outcome: { outcome: 'cancelled' } };
   }
 
   /** Register a permission resolver for a session (called by pipeline wiring). */
@@ -1152,8 +1198,10 @@ export class AcpBackend implements Backend<ActiveSessionMessage> {
     const connection = this.clientConnection;
     if (connection) {
       this.permissionResolverConnections.set(sessionId, connection);
+      this.log(`permission.resolver.registered session=${sessionId}`);
     } else {
       this.permissionResolverConnections.delete(sessionId);
+      this.log(`permission.resolver.registered session=${sessionId} without-connection`);
     }
   }
 

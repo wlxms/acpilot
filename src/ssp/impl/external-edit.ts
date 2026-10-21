@@ -58,6 +58,9 @@ export class ExternalEditSSP extends SerializableStreamPart<
   private onDidComplete: Thenable<string> | null = null;
   private metadataSettled: Promise<void> | null = null;
   private completionRequested = false;
+  /** Once an edit is known to have failed, never start VS Code checkpointing. */
+  private suppressExternalEdit = false;
+  private failureRendered = false;
   private _undoStopId: string | null = null;
   private snapshotListeners: Array<(snapshot: FileSnapshotRecord) => void> = [];
 
@@ -105,8 +108,18 @@ export class ExternalEditSSP extends SerializableStreamPart<
   // ── Render: start externalEdit lifecycle ───────────────────────────────
 
   render(stream: SspStream): void {
+    if (this.payload.status === 'error' || this.suppressExternalEdit) {
+      if (this.failureRendered) {return;}
+      this.failureRendered = true;
+      const detail = this.payload.error?.trim();
+      stream.progress(detail
+        ? `❌ External edit failed: ${detail}`
+        : '❌ External edit failed');
+      return;
+    }
     if (this.editStarted || this.payload.status !== 'pending') {return;}
     if (!stream.externalEdit) {return;}
+    if (this.suppressExternalEdit) {return;}
     this.editStarted = true;
 
     const uris = this.resolveUris();
@@ -144,9 +157,21 @@ export class ExternalEditSSP extends SerializableStreamPart<
     Object.assign(this.payload, data);
 
     if (data.status !== 'completed' && data.status !== 'error') {return;}
-    if (this.completionRequested) {return;}
+    if (this.completionRequested) {
+      // A bridge failure can be followed by a generic ACP terminal update.
+      // Keep the first actionable error instead of letting the later one mask it.
+      if (data.status === 'error' && !this.payload.error?.trim() && data.error?.trim()) {
+        this.payload.error = data.error;
+      }
+      return;
+    }
     this.completionRequested = true;
     this.deferred?.resolve();
+    if (data.status === 'error') {
+      this.suppressExternalEdit = true;
+      this.metadataSettled = Promise.resolve();
+      return;
+    }
     this.settleCompletion();
   }
 

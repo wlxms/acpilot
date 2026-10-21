@@ -237,6 +237,7 @@ export class OpenCodeBackend implements Backend<OpenCodeStreamEvent> {
 
   private readonly serverManager = new OpenCodeServerManager();
   private readonly eventBroker = new GlobalEventBroker();
+  private log: (message: string) => void = () => {};
   private rawClient: OpenCodeClient | null = null;
   /** Native model-provider sessions owned by this backend runtime. */
   private readonly transientSessions = new Set<TransientSessionRef>();
@@ -267,6 +268,10 @@ export class OpenCodeBackend implements Backend<OpenCodeStreamEvent> {
   // Lifecycle
   // =======================================================================
 
+  setLogger(logger: { appendLine(message: string): void }): void {
+    this.log = (message) => logger.appendLine(`[${this.name}-backend] ${message}`);
+  }
+
   async start(directory?: string): Promise<BackendResult<BackendServerInfo>> {
     // A stop owns the old client until its transient-session cleanup and
     // server teardown finish. Do not let start() reuse that client midway
@@ -296,6 +301,7 @@ export class OpenCodeBackend implements Backend<OpenCodeStreamEvent> {
 
   private async performStart(directory?: string): Promise<BackendResult<BackendServerInfo>> {
     const generation = this.runtimeGeneration;
+    this.log(`start requested${directory ? ` cwd=${directory}` : ''}`);
     try {
       const url = await this.serverManager.start(directory);
       const rawClient = this.serverManager.getClient();
@@ -311,6 +317,7 @@ export class OpenCodeBackend implements Backend<OpenCodeStreamEvent> {
         this.runtimeGeneration += 1;
       }
       this.rawClient = rawClient;
+      this.log(`started at ${url}`);
       return {
         data: {
           url,
@@ -319,6 +326,7 @@ export class OpenCodeBackend implements Backend<OpenCodeStreamEvent> {
       };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      this.log(`start failed: ${msg}`);
       return { error: msg };
     }
   }
@@ -355,6 +363,7 @@ export class OpenCodeBackend implements Backend<OpenCodeStreamEvent> {
   }
 
   private async performStop(): Promise<void> {
+    this.log('stop requested');
     const stoppingGeneration = this.runtimeGeneration;
     this.runtimeGeneration += 1;
     const stopGeneration = this.runtimeGeneration;
@@ -400,6 +409,7 @@ export class OpenCodeBackend implements Backend<OpenCodeStreamEvent> {
       if (this.runtimeGeneration === stopGeneration && this.rawClient === stoppingClient) {
         this.rawClient = null;
       }
+      this.log('stopped');
     }
   }
 

@@ -24,4 +24,37 @@ describe('DshBackend', () => {
     });
     expect(pipeline).toBeInstanceOf(DshPipeline);
   });
+
+  it('forwards ordinary local stderr diagnostics to the backend logger', () => {
+    const backend = new DshBackend();
+    const lines: string[] = [];
+    backend.setLogger({ appendLine: message => lines.push(message) });
+
+    const observeStderr = (backend as unknown as {
+      onLocalStderrLine(line: string): void;
+    }).onLocalStderrLine.bind(backend);
+    observeStderr('profile boot failed');
+
+    expect(lines).toEqual(['[dsh-backend] stderr: profile boot failed']);
+  });
+
+  it('formats bridge diagnostics for the backend log', () => {
+    const backend = new DshBackend();
+    const lines: string[] = [];
+    backend.setLogger({ appendLine: message => lines.push(message) });
+
+    const observeStderr = (backend as unknown as {
+      onLocalStderrLine(line: string): void;
+    }).onLocalStderrLine.bind(backend);
+    observeStderr(
+      'ACPILOT_DSH_BRIDGE_DIAGNOSTIC\t'
+        + '{"protocol":1,"event":"pre-execute.ask","sessionId":"session-1",'
+        + '"toolCallId":"call-edit","toolName":"edit","card":"diff"}',
+    );
+
+    expect(lines).toEqual([
+      '[dsh-backend] bridge.diagnostic event=pre-execute.ask '
+        + 'sessionId=session-1 toolCallId=call-edit toolName=edit card=diff',
+    ]);
+  });
 });

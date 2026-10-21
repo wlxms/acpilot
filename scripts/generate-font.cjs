@@ -2,6 +2,7 @@
 // Glyphs (filename → codepoint):
 //   opencode.svg   → U+E001 — OpenCode bracket logomark
 //   acpilot-a.svg  → U+E002 — Agent Client Protocol (ACP) official logomark (status bar)
+//   dsh-logo.svg   → U+E003 — DeepSeek Harness official whale logomark
 // Uses fantasticon with Windows glob workaround
 
 const path = require('path');
@@ -35,7 +36,7 @@ generateFonts({
   name: 'opencode-icon',
   fontTypes: [FontAssetType.WOFF],
   normalize: true,
-  codepoints: { opencode: 0xE001, 'acpilot-a': 0xE002 },
+  codepoints: { opencode: 0xE001, 'acpilot-a': 0xE002, 'dsh-logo': 0xE003 },
 })
   .then(() => {
     // Remove fantasticon's extra generated files (css, html, json, ts)
@@ -45,7 +46,7 @@ generateFonts({
     }
     console.log('✅ Font generated successfully!');
     console.log(`   WOFF: ${path.join(dir, 'opencode-icon.woff')}`);
-    console.log(`   Codepoints: opencode=U+E001, acpilot-a=U+E002`);
+    console.log(`   Codepoints: opencode=U+E001, acpilot-a=U+E002, dsh-logo=U+E003`);
   })
   .catch((e) => {
     console.error('❌ Error:', e.message);

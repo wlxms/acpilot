@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import {
   DSH_BRIDGE_MARKER_PREFIX,
+  DSH_BRIDGE_DIAGNOSTIC_PREFIX,
   DSH_BRIDGE_TOOL_PREFIX,
   createDshBridgeLaunchNonce,
+  parseDshBridgeDiagnosticLine,
   parseDshBridgeReadyLine,
   parseDshBridgeToolLine,
   serializeDshBridgeToolMessage,
@@ -90,5 +92,24 @@ describe('DeepSeek Harness bridge protocol', () => {
     expect(parseDshBridgeToolLine(`${DSH_BRIDGE_TOOL_PREFIX}${JSON.stringify({
       type: 'tool_call', protocol: 1, sessionId: '', toolCallId: 'c', toolName: 'read',
     })}`)).toBeUndefined();
+  });
+
+  it('parses bridge diagnostics without treating them as tool messages', () => {
+    const line = `${DSH_BRIDGE_DIAGNOSTIC_PREFIX}${JSON.stringify({
+      protocol: 1,
+      event: 'pre-execute.ask',
+      sessionId: 'session-1',
+      toolCallId: 'call-1',
+      toolName: 'edit',
+      card: 'diff',
+    })}`;
+    expect(parseDshBridgeDiagnosticLine(line)).toMatchObject({
+      protocol: 1,
+      event: 'pre-execute.ask',
+      toolCallId: 'call-1',
+      toolName: 'edit',
+    });
+    expect(parseDshBridgeToolLine(line)).toBeUndefined();
+    expect(parseDshBridgeDiagnosticLine(`${DSH_BRIDGE_DIAGNOSTIC_PREFIX}not-json`)).toBeUndefined();
   });
 });

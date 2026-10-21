@@ -39,8 +39,9 @@ export interface LocalSpawnOptions {
   stderr?: 'inherit' | 'pipe';
   /** Optional stderr readiness contract. Its promise must settle before ACP connect. */
   readiness?: LocalReadinessOptions;
-  /** Receives non-protocol stderr lines when stderr is piped. */
   onStderrLine?: (line: string) => void;
+  /** Receives bounded stderr context when the local agent exits unexpectedly. */
+  onExit?: (message: string) => void;
 }
 
 export interface RemoteConnectOptions {
@@ -79,6 +80,7 @@ export function spawnAcpAgent(opts: LocalSpawnOptions): SpawnedAcpAgent {
   const stream = ndJsonStream(output, input);
   let stderrReader: Interface | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  const recentStderr: string[] = [];
   let readinessSettled = false;
   let resolveReady!: (value: unknown) => void;
   let rejectReady!: (error: unknown) => void;
@@ -98,6 +100,11 @@ export function spawnAcpAgent(opts: LocalSpawnOptions): SpawnedAcpAgent {
   };
 
   const forwardStderrLine = (line: string): void => {
+    const trimmed = line.trim();
+    if (trimmed) {
+      recentStderr.push(trimmed);
+      if (recentStderr.length > 12) {recentStderr.shift();}
+    }
     opts.onStderrLine?.(line);
   };
 
@@ -147,10 +154,15 @@ export function spawnAcpAgent(opts: LocalSpawnOptions): SpawnedAcpAgent {
   };
   child.once('error', error => failBeforeReady(error));
   child.once('exit', (code, signal) => {
+    const exitStatus = `code=${code ?? "null"}, signal=${signal ?? "none"}`;
     if (!readinessSettled) {
-      failBeforeReady(new Error(
-        `ACP local process exited before readiness (code=${code ?? 'null'}, signal=${signal ?? 'none'})`,
-      ));
+      const detail = recentStderr.length > 0 ? "\n" + recentStderr.join("\n") : "";
+      failBeforeReady(new Error(`ACP local process exited before readiness (${exitStatus})${detail}`));
+      return;
+    }
+    if (code !== 0 || signal) {
+      const detail = recentStderr.length > 0 ? ": " + recentStderr.join(" | ") : "";
+      opts.onExit?.(`ACP local process exited (${exitStatus})${detail}`);
     }
   });
 

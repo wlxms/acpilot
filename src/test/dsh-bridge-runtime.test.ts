@@ -389,4 +389,44 @@ describe('DeepSeek Harness bridge runtime', () => {
       locations: [{ path: 'src/a.ts' }],
     });
   });
+  it('preflights impossible edits before the permission gate', async () => {
+    const bridgePath = JSON.stringify(pathToFileURL(path.resolve(process.cwd(), 'dsh-bridge/index.mjs')).href);
+    const script = `
+      process.env.ACPILOT_DSH_BRIDGE_NONCE = 'test-nonce';
+      const bridge = await import(${bridgePath});
+      const writes = [];
+      const originalWrite = process.stderr.write.bind(process.stderr);
+      process.stderr.write = (chunk) => { writes.push(String(chunk)); return true; };
+      const handlers = {};
+      bridge.apply({
+        tools: { get: () => ({ presentCall: () => ({ card: 'diff', title: 'Edit hello.md' }) }) },
+        on: (name, handler) => { handlers[name] = handler; },
+        provide: () => undefined,
+      });
+      let nextCalled = false;
+      const decision = await handlers['tools/pre-execute']({
+        agent: { session: { id: 'session-1', header: { cwd: process.cwd() } } },
+        callId: 'call-1', rootCallId: 'call-1', name: 'edit',
+        arguments: { file_path: path.join(process.cwd(), 'dsh-bridge', 'index.mjs'), old_string: 'does-not-exist', new_string: 'x' },
+      }, async () => { nextCalled = true; return { kind: 'allow' }; });
+      process.stderr.write = originalWrite;
+      const prefix = 'ACPILOT_DSH_BRIDGE_TOOL\\t';
+      const messages = writes.filter((line) => line.startsWith(prefix)).map((line) => JSON.parse(line.slice(prefix.length)));
+      process.stdout.write(JSON.stringify({ decision, nextCalled, calls: messages.filter((message) => message.type === 'tool_call').length }));
+    `;
+    const raw = execFileSync(process.execPath, ['--input-type=module', '-e', script], {
+      cwd: process.cwd(),
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const result = JSON.parse(raw) as {
+      decision: { kind?: string; reason?: string };
+      nextCalled: boolean;
+      calls: number;
+    };
+    expect(result.nextCalled).toBe(false);
+    expect(result.calls).toBe(1);
+    expect(result.decision.kind).toBe('deny');
+    expect(result.decision.reason).toContain('old_string was not found');
+  });
 });

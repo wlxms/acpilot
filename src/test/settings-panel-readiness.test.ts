@@ -55,11 +55,37 @@ describe('SettingsPanel webview HTML', () => {
   });
 });
 
+describe('SettingsPanel backend runtime and logs', () => {
+  it('contains explicit backend start controls, navigation messages, and horizontal log tabs', () => {
+    expect(panelSource).toContain("type: 'startBackend'");
+    expect(panelSource).toContain("type: 'stopBackend'");
+    expect(panelSource).toContain("msg.type === 'navigateSettings'");
+    expect(panelSource).toContain('id="backend-log-tabs"');
+    expect(panelSource).toContain('id="backend-log-output"');
+  });
+
+  it('tracks the backend selected by the settings navigation for log filtering', () => {
+    expect(panelSource).toContain("type: 'setLogBackend'");
+    expect(panelSource).toContain("backendId: nav");
+  });
+});
 describe('SettingsPanel DSH directory controls', () => {
   it('provides a directory chooser for every DSH directory field', () => {
     expect(panelSource).toContain('id="btn-dsh-launch-cwd-browse"');
     expect(panelSource).toContain('id="btn-dsh-install-directory-browse"');
     expect(panelSource).toContain("type: 'selectDirectory'");
     expect(panelSource).toContain("msg.type === 'directorySelected'");
+  });
+});
+
+describe('SettingsPanel backend logs layout', () => {
+  it('keeps the horizontal backend log tabs inside the scrollable settings body', () => {
+    const mainStart = panelSource.indexOf('<main class="settings-body">');
+    const logsStart = panelSource.indexOf('<section class="backend-logs"');
+    const mainEnd = panelSource.indexOf('</main>', logsStart);
+
+    expect(mainStart).toBeGreaterThan(-1);
+    expect(logsStart).toBeGreaterThan(mainStart);
+    expect(mainEnd).toBeGreaterThan(logsStart);
   });
 });

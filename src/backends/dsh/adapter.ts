@@ -10,6 +10,7 @@ import {
   type AcpBackendOptions,
 } from '../acp/adapter';
 import {
+  parseDshBridgeDiagnosticLine,
   parseDshBridgeReadyLine,
   parseDshBridgeToolLine,
   type DshBridgeToolMessage,
@@ -77,8 +78,16 @@ export class DshBackend extends AcpBackend {
       this.logMessage(`bridge.ready protocol=${ready.protocol}`);
       return;
     }
+    const diagnostic = parseDshBridgeDiagnosticLine(line);
+    if (diagnostic) {
+      this.logMessage(
+        `bridge.diagnostic event=${diagnostic.event} ${formatDiagnosticFields(diagnostic)}`.trim(),
+      );
+      return;
+    }
     const message = parseDshBridgeToolLine(line);
     if (!message) {
+      this.logMessage(`stderr: ${line}`);
       return;
     }
     this.logMessage(`bridge.${message.type} session=${message.sessionId} call=${message.toolCallId} tool=${message.toolName}`);
@@ -98,4 +107,21 @@ export class DshBackend extends AcpBackend {
     if (pending.length > 128) {pending.splice(0, pending.length - 128);}
     this.pendingBridgeMessages.set(message.sessionId, pending);
   }
+}
+
+function formatDiagnosticFields(diagnostic: Record<string, unknown>): string {
+  return Object.entries(diagnostic)
+    .filter(([key]) => key !== 'protocol' && key !== 'event')
+    .map(([key, value]) => `${key}=${formatDiagnosticValue(value)}`)
+    .join(' ');
+}
+
+function formatDiagnosticValue(value: unknown): string {
+  if (value === null) {return 'null';}
+  if (typeof value === 'string') {
+    return /^[^\s=]+$/.test(value) ? value : JSON.stringify(value);
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') {return String(value);}
+  try {return JSON.stringify(value);}
+  catch {return String(value);}
 }

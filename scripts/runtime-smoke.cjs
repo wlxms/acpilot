@@ -162,7 +162,7 @@ async function waitForOpenCodeModels(port, trace) {
     }
     models = result;
     trace('listLanguageModels opencode result', { attempts, count: models.length });
-    if (models.length > 0) {
+    if (models.length > 0 && models.some(model => model.name !== 'Auto')) {
       return models;
     }
 
@@ -249,6 +249,9 @@ async function waitForOpenCodeModels(port, trace) {
       const vendors = new Set(models.map(model => model.vendor));
       if (vendors.size > 1) {
         throw new Error(`${backendId} language-model listing crossed vendor boundaries`);
+      }
+      if (backendId !== 'reasonix' && !models.some(model => model.name === 'Auto')) {
+        throw new Error(`${backendId} language-model listing did not expose the Auto entry`);
       }
       for (const model of models) {
       if (model.isUserSelectable === false) {

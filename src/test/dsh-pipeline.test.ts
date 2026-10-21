@@ -563,6 +563,132 @@ describe('DshPipeline', () => {
     expect((target.pushed[0] as unknown as { kind?: string }).kind).toBe('toolInvocation');
   });
 
+  it('keeps a DSH read on one card when ACP updates after the bridge call', () => {
+    const target = createStream();
+    const pipeline = new DshPipeline({
+      sessionId: 'session-1',
+      directory: 'D:/workspace',
+      stream: target.value,
+    });
+    const internals = pipeline as unknown as {
+      handleSessionUpdate(update: never, eventSessionId: string): void;
+    };
+    pipeline.handleBridgeMessage({
+      type: 'tool_call',
+      protocol: 1,
+      sessionId: 'session-1',
+      toolCallId: 'call-read-bridge-order',
+      rootToolCallId: 'call-read-bridge-order',
+      toolName: 'read',
+      rawInput: { file_path: 'D:/Temp/随手便签.txt' },
+      presentation: {
+        card: 'generic',
+        title: 'Read D:/Temp/随手便签.txt',
+        kind: 'read',
+        locations: [{ path: 'D:/Temp/随手便签.txt', line: 1 }],
+      },
+    });
+    internals.handleSessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'call-read-bridge-order',
+      title: 'read',
+      kind: 'other',
+      status: 'in_progress',
+      rawInput: { file_path: 'D:/Temp/随手便签.txt' },
+    } as never, 'session-1');
+    internals.handleSessionUpdate({
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'call-read-bridge-order',
+      status: 'in_progress',
+      rawInput: { file_path: 'D:/Temp/随手便签.txt' },
+    } as never, 'session-1');
+    pipeline.handleBridgeMessage({
+      type: 'tool_result',
+      protocol: 1,
+      sessionId: 'session-1',
+      toolCallId: 'call-read-bridge-order',
+      rootToolCallId: 'call-read-bridge-order',
+      toolName: 'read',
+      isError: false,
+      presentation: { card: 'read', path: 'D:/Temp/随手便签.txt', offset: 1, totalLines: 1 },
+    });
+
+    const rows = target.pushed.filter(part => (part as unknown as { kind?: string }).kind === 'toolInvocation');
+    const rendered: Array<{ invocationMessage?: unknown }> = [];
+    for (const row of rows) {
+      (row as unknown as {
+        render(stream: { push(part: unknown): void; markdown(value: unknown): void; progress(value: string): void }): void;
+      }).render({
+        push(part) { rendered.push(part as typeof rendered[number]); },
+        markdown() {},
+        progress() {},
+      });
+    }
+    expect(rendered).toHaveLength(1);
+    expect(String(rendered[0]?.invocationMessage)).toMatch(/^Read /u);
+  });
+
+
+  it('keeps a DSH read on one card when bridge call arrives before ACP', () => {
+    const target = createStream();
+    const pipeline = new DshPipeline({
+      sessionId: 'session-1',
+      directory: 'D:/workspace',
+      stream: target.value,
+    });
+    const internals = pipeline as unknown as {
+      handleSessionUpdate(update: never, eventSessionId: string): void;
+    };
+    pipeline.handleBridgeMessage({
+      type: 'tool_call',
+      protocol: 1,
+      sessionId: 'session-1',
+      toolCallId: 'call-read-bridge-first',
+      rootToolCallId: 'call-read-bridge-first',
+      toolName: 'read',
+      rawInput: { file_path: 'D:/Temp/随手便签.txt' },
+      presentation: {
+        card: 'generic',
+        title: 'Read D:/Temp/随手便签.txt',
+        kind: 'read',
+        locations: [{ path: 'D:/Temp/随手便签.txt', line: 1 }],
+      },
+    });
+    internals.handleSessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'call-read-bridge-first',
+      title: 'read',
+      kind: 'other',
+      status: 'in_progress',
+      rawInput: { file_path: 'D:/Temp/随手便签.txt' },
+    } as never, 'session-1');
+    pipeline.handleBridgeMessage({
+      type: 'tool_result',
+      protocol: 1,
+      sessionId: 'session-1',
+      toolCallId: 'call-read-bridge-first',
+      rootToolCallId: 'call-read-bridge-first',
+      toolName: 'read',
+      isError: false,
+      presentation: { card: 'read', path: 'D:/Temp/随手便签.txt', offset: 1, totalLines: 1 },
+    });
+
+    const rows = target.pushed.filter(part => (part as unknown as { kind?: string }).kind === 'toolInvocation');
+    const rendered: Array<{ invocationMessage?: unknown }> = [];
+    for (const row of rows) {
+      (row as unknown as {
+        render(stream: { push(part: unknown): void; markdown(value: unknown): void; progress(value: string): void }): void;
+      }).render({
+        push(part) { rendered.push(part as typeof rendered[number]); },
+        markdown() {},
+        progress() {},
+      });
+    }
+    expect(rendered).toHaveLength(1);
+    expect(String(rendered[0]?.invocationMessage)).toMatch(/^Read /u);
+  });
+
+
   it('renders an unknown bridge-free tool after the bounded bridge window', async () => {
     vi.useFakeTimers();
     try {
@@ -717,50 +843,40 @@ describe('DshPipeline', () => {
       toolName: 'edit',
       rawInput: { file_path: 'src/no-bridge-edit.md', old_string: 'before', new_string: 'after' },
     },
-  ])('starts ExternalEdit before a bridge-free $toolName can complete', async ({ toolName, rawInput }) => {
-    vi.useFakeTimers();
-    try {
-      const target = createStream();
-      const pipeline = new DshPipeline({
-        sessionId: 'session-1',
-        directory: 'D:/workspace',
-        stream: target.value,
-        permissionMode: 'full-edit',
-      });
-      const internals = pipeline as unknown as {
-        handleSessionUpdate(update: never, eventSessionId: string): void;
-      };
+  ])('starts ExternalEdit only after a bridge-free $toolName succeeds', async ({ toolName, rawInput }) => {
+    const target = createStream();
+    const pipeline = new DshPipeline({
+      sessionId: 'session-1',
+      directory: 'D:/workspace',
+      stream: target.value,
+      permissionMode: 'full-edit',
+    });
+    const internals = pipeline as unknown as {
+      handleSessionUpdate(update: never, eventSessionId: string): void;
+    };
 
-      internals.handleSessionUpdate({
-        sessionUpdate: 'tool_call',
-        toolCallId: `call-${toolName}-no-bridge`,
-        title: toolName,
-        kind: 'other',
-        status: 'in_progress',
-        rawInput,
-      } as never, 'session-1');
-      await vi.advanceTimersByTimeAsync(101);
+    internals.handleSessionUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: `call-${toolName}-no-bridge`,
+      title: toolName,
+      kind: 'other',
+      status: 'in_progress',
+      rawInput,
+    } as never, 'session-1');
+    expect(target.pushed).toHaveLength(0);
 
-      expect(target.pushed).toHaveLength(1);
-      expect((target.pushed[0] as unknown as { kind?: string }).kind).toBe('externalEdit');
+    internals.handleSessionUpdate({
+      sessionUpdate: 'tool_call_update',
+      toolCallId: `call-${toolName}-no-bridge`,
+      status: 'completed',
+      rawOutput: 'done',
+    } as never, 'session-1');
 
-      internals.handleSessionUpdate({
-        sessionUpdate: 'tool_call_update',
-        toolCallId: `call-${toolName}-no-bridge`,
-        status: 'completed',
-        rawOutput: 'done',
-      } as never, 'session-1');
-
-      expect(target.updated).toContainEqual(expect.objectContaining({
-        id: `external-edit-call-${toolName}-no-bridge`,
-        data: expect.objectContaining({ status: 'completed' }),
-      }));
-    } finally {
-      vi.useRealTimers();
-    }
+    expect(target.pushed).toHaveLength(1);
+    expect((target.pushed[0] as unknown as { kind?: string }).kind).toBe('externalEdit');
   });
 
-  it('starts the bridge-free ExternalEdit baseline before the automatic permission reply', async () => {
+  it('starts the bridge-free ExternalEdit baseline after an automatic permission reply succeeds', async () => {
     vi.useFakeTimers();
     try {
       let captureBaseline: (() => PromiseLike<unknown>) | undefined;

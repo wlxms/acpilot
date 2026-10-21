@@ -4,7 +4,9 @@ import {
   applySessionTitle,
   cleanGeneratedTitle,
   generateTitleWithVsCodeLm,
+  isPlaceholderSessionTitle,
   pickTitleModels,
+  SessionTitleService,
 } from '../participant/session-title';
 import type { ExtensionState, BackendContext } from '../types';
 
@@ -45,6 +47,33 @@ describe('applySessionTitle', () => {
       }),
     );
     expect(updateMeta.mock.calls[0]?.[1]).not.toHaveProperty('requestDetails');
+  });
+});
+
+describe('DSH session title fallback', () => {
+  it('treats DSH and DeepSeek Harness defaults as placeholder titles', async () => {
+    expect(isPlaceholderSessionTitle('DSH Session 12345678')).toBe(true);
+    expect(isPlaceholderSessionTitle('New DeepSeek Harness Session')).toBe(true);
+    expect(isPlaceholderSessionTitle('DeepSeek Harness Session abc12345')).toBe(true);
+    expect(isPlaceholderSessionTitle('Fix DSH session title generation')).toBe(false);
+
+    const service = new SessionTitleService(
+      {
+        backends: new Map(),
+        outputChannel: { appendLine: vi.fn() },
+        bus: { emit: vi.fn() },
+      } as unknown as ExtensionState,
+      {
+        vendor: 'dsh',
+        backend: { sessions: { get: vi.fn() } },
+      } as unknown as BackendContext,
+    );
+
+    await expect(service.resolveFinalTurnTitle({
+      backendSessionId: 'dsh-default-title',
+      pipelineTitle: 'DSH Session 12345678',
+      pipelineTitleSource: 'backend',
+    })).resolves.toBeUndefined();
   });
 });
 

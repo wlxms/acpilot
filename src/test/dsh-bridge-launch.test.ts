@@ -38,6 +38,26 @@ describe('DSH bridge launch overlay', () => {
     expect(args).toEqual(['--profile', 'acp', '--patch', 'user.patch.yml', '--resume', 'session-1']);
   });
 
+  it('inserts the bridge before app arguments passed through a pnpm run alias', () => {
+    const args = ['run', 'dsh', '--', '--profile', 'acp', '--resume', 'session-1'];
+    const result = appendDshBridgePatch(
+      'C:\\Users\\Administrator\\AppData\\Roaming\\npm\\pnpm.cmd',
+      args,
+      'C:\\acpilot\\bridge.patch.yml',
+    );
+
+    expect(result).toEqual([
+      'run',
+      'dsh',
+      '--',
+      '--patch',
+      'C:\\acpilot\\bridge.patch.yml',
+      '--profile',
+      'acp',
+      '--resume',
+      'session-1',
+    ]);
+  });
   it('keeps pnpm dsh wrapper arguments before the DSH launcher overlay', () => {
     const args = ['dsh', '--profile', 'acp'];
     const result = appendDshBridgePatch('C:\\Users\\Administrator\\AppData\\Roaming\\npm\\pnpm.cmd', args, 'C:\\acpilot\\bridge.patch.yml');
@@ -54,6 +74,20 @@ describe('DSH bridge launch overlay', () => {
 
     expect(result).toEqual([
       'apps/cli/lib/bin.js', '--patch', 'C:\\acpilot\\bridge.patch.yml', '--profile', 'acp',
+    ]);
+  });
+
+  it('quotes a bridge patch path when a Windows shell launcher is used', () => {
+    const result = appendDshBridgePatch(
+      'C:\\Users\\Administrator\\AppData\\Roaming\\Code - Insiders\\User\\globalStorage\\dsh.cmd',
+      ['--profile', 'acp'],
+      'C:\\Users\\Administrator\\AppData\\Roaming\\Code - Insiders\\User\\globalStorage\\bridge.patch.yml',
+      { shell: true },
+    );
+
+    expect(result).toEqual([
+      '--profile', 'acp',
+      '--patch', '"C:\\Users\\Administrator\\AppData\\Roaming\\Code - Insiders\\User\\globalStorage\\bridge.patch.yml"',
     ]);
   });
 });

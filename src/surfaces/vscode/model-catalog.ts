@@ -8,6 +8,10 @@ import type { CopilotModelRegistration, ResolutionResult } from './model-types';
 /** Maximum time a backend model provider may hold up one catalog refresh. */
 export const MODEL_CATALOG_PROVIDER_TIMEOUT_MS = 2_000;
 
+/** Synthetic model shown before a backend has produced a native catalog. */
+export const AUTO_MODEL_PROVIDER_ID = '__acpilot_auto__';
+export const AUTO_MODEL_ID = 'auto';
+
 /**
  * Build the canonical VS Code model identity for one backend model.
  *
@@ -26,6 +30,20 @@ export function canonicalCopilotModelId(
     components.push(backendInstanceKey);
   }
   return components.map(encodeURIComponent).join('/');
+}
+
+/** Canonical identity of the synthetic Auto model for one backend instance. */
+export function autoCopilotModelId(vendor: string, backendInstanceKey: string): string {
+  return canonicalCopilotModelId(vendor, AUTO_MODEL_PROVIDER_ID, AUTO_MODEL_ID, backendInstanceKey);
+}
+
+/** Whether a VS Code model identity is the synthetic Auto entry. */
+export function isAutoCopilotModelId(
+  vendor: string,
+  modelId: string,
+  backendInstanceKey: string,
+): boolean {
+  return modelId === autoCopilotModelId(vendor, backendInstanceKey);
 }
 
 /** Whether a VS Code model identity belongs to the requested backend catalog. */

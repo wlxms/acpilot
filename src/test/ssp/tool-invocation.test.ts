@@ -103,6 +103,24 @@ describe('ToolInvocationSSP', () => {
       expect(part.pastTenseMessage).toBeUndefined();
     });
 
+    it('read with a DSH file_path input renders a clickable read card', () => {
+      const stream = mockStream();
+      const ssp = new ToolInvocationSSP({
+        partId: 'p1',
+        toolName: 'read',
+        callId: 'c1',
+        state: toolState({
+          status: 'running',
+          input: { file_path: 'd:\\Temp\\agent-note-2026-10-21.md' },
+        }),
+      });
+      ssp.render(stream);
+
+      const part = lastPushedPart(stream);
+      expect(String(part.invocationMessage)).toMatch(/^Read /u);
+      expect(String(part.invocationMessage)).not.toContain('file_path');
+    });
+
     it('bash completed SHOULD set pastTenseMessage (contrast with read)', () => {
       const stream = mockStream();
       const ssp = new ToolInvocationSSP({
@@ -183,6 +201,26 @@ describe('ToolInvocationSSP', () => {
       // In our SSP model, render always pushes (no progressive check in pushToolInvocation
       // for the push vs update distinction — that's handled by updateToolInvocation in fallback).
       // For proposed API path, each render pushes a new part with enablePartialUpdate=true.
+    });
+
+    it('completed read updates the running card instead of pushing an after card', () => {
+      const stream = mockStream();
+      const ssp = new ToolInvocationSSP({
+        partId: 'p1',
+        toolName: 'read',
+        callId: 'c1',
+        state: toolState({ status: 'running', input: { file_path: 'D:/Temp/a.md' } }),
+      });
+      ssp.render(stream);
+      expect(countPushes(stream)).toBe(1);
+
+      ssp.update({ state: { status: 'completed', output: 'content' } });
+      ssp.render(stream);
+
+      expect(countPushes(stream)).toBe(1);
+      expect(stream.updateToolInvocation).toHaveBeenCalledWith('c1', expect.objectContaining({
+        invocationMessage: expect.stringMatching(/^Read /u),
+      }));
     });
 
     it('completed should always push a new part with isComplete=true', () => {
@@ -271,6 +309,28 @@ describe('ToolInvocationSSP', () => {
       expect(data?.values).toHaveLength(1);
       expect(data.values[0]).toBeInstanceOf(vscode.Location);
       expect(data.values[0].range.start.line).toBe(11);
+    });
+
+    it('read with DSH presentation renders a resource card instead of raw file_path', () => {
+      const stream = mockStream();
+      const ssp = new ToolInvocationSSP({
+        partId: 'p1', toolName: 'read', callId: 'c1',
+        state: toolState({
+          status: 'running',
+          input: { filePath: 'D:/Temp/hello.txt' },
+          metadata: {
+            dshPresentation: {
+              card: 'read',
+              path: 'D:/Temp/hello.txt',
+              offset: 1,
+            },
+          },
+        }),
+      });
+      ssp.render(stream);
+      const part = lastPushedPart(stream);
+      expect(part.toolSpecificData).toMatchObject({ values: [expect.anything()] });
+      expect(String(part.invocationMessage)).not.toContain('file_path');
     });
 
     it('read → undefined (no toolSpecificData)', () => {
@@ -591,13 +651,32 @@ describe('ToolInvocationSSP', () => {
         }),
       });
       ssp.render(stream);
-      const part = lastPushedPart(stream);
-      expect(part.isAttachedToThinking).toBe(true);
-      expect(part.isError).toBe(true);
-      expect(part.pastTenseMessage).toBeTruthy();
+      const toolPart = (stream.push as ReturnType<typeof vi.fn>).mock.calls[0]?.[0];
+      expect(toolPart.isAttachedToThinking).toBe(true);
+      expect(toolPart.isError).toBe(true);
+      expect(toolPart.pastTenseMessage).toBeTruthy();
+    });
+    it('keeps the edit row and appends a visible error detail below it', () => {
+      const stream = mockStream();
+      const ssp = new ToolInvocationSSP({
+        partId: 'p1', toolName: 'edit', callId: 'c1',
+        state: toolState({
+          status: 'error',
+          input: { filePath: 'hello.txt' },
+          output: 'Error: old_string was not found in "hello.txt"',
+          error: 'Error: old_string was not found in "hello.txt"',
+        }),
+      });
+      ssp.render(stream);
+      const tool = (stream.push as ReturnType<typeof vi.fn>).mock.calls[0]?.[0];
+      expect(tool.isError).toBe(true);
+      expect(countPushes(stream)).toBe(2);
+      const warning = (stream.push as ReturnType<typeof vi.fn>).mock.calls[1]?.[0];
+      const WarningPart = (vscode as unknown as { ChatResponseWarningPart?: new (value: string) => unknown }).ChatResponseWarningPart;
+      expect(warning).toBeInstanceOf(WarningPart);
+      expect(String(warning.value)).toBe('edit failed: old_string was not found in "hello.txt"');
     });
   });
-
   // ════════════════════════════════════════════════════════════════════════
   // Subagent nesting
   // ════════════════════════════════════════════════════════════════════════

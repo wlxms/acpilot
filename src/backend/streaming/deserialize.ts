@@ -304,7 +304,11 @@ export function finalizeIncompleteStates(
         const payload = record.payload as Record<string, unknown>;
         return {
           ...record,
-          payload: { ...payload, status: 'completed' },
+          payload: {
+            ...payload,
+            status: 'error',
+            error: 'External edit was interrupted before completion',
+          },
         };
       }
     }

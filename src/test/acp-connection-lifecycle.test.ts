@@ -25,6 +25,8 @@ interface InProcessAgent {
 
 interface InProcessAgentOptions {
   onSessionNew?: (sessionId: string) => void | Promise<void>;
+  requestPermissionOnPrompt?: boolean;
+  onPermissionResult?: (result: { outcome: { outcome: string; optionId?: string } }) => void;
 }
 
 function createInProcessAgent(options: InProcessAgentOptions = {}): InProcessAgent {
@@ -86,6 +88,20 @@ function createInProcessAgent(options: InProcessAgentOptions = {}): InProcessAge
       }],
     }))
     .onRequest(methods.agent.session.prompt, async ({ params, client }) => {
+      if (options.requestPermissionOnPrompt === true) {
+        // Exercise the client-side reverse request over the real transport.
+        // A handler registered after ClientApp.connect() is too late: the SDK
+        // router answers with "Method not found" before it reaches the resolver.
+        const permission = await client.request(methods.client.session.requestPermission, {
+          sessionId: params.sessionId,
+          toolCall: { toolCallId: 'call-permission-probe' },
+          options: [
+            { optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' },
+            { optionId: 'reject-once', name: 'Reject', kind: 'reject_once' },
+          ],
+        });
+        options.onPermissionResult?.(permission);
+      }
       await client.notify(methods.client.session.update, {
         sessionId: params.sessionId,
         update: {
@@ -162,6 +178,46 @@ describe('ACP persistent connection lifecycle', () => {
         sessionUpdate: 'agent_message_chunk',
         content: { text: 'hello from ACP' },
       },
+    });
+  });
+
+  it('receives session/request_permission over the persistent ACP transport', async () => {
+    const permissionResult = vi.fn();
+    const testAgent = createInProcessAgent({
+      requestPermissionOnPrompt: true,
+      onPermissionResult: permissionResult,
+    });
+    agents.push(testAgent);
+    vi.mocked(spawnAcpAgent).mockReturnValueOnce({
+      stream: testAgent.clientStream,
+      process: { kill: vi.fn() } as never,
+    });
+
+    const backend = new AcpBackend({
+      name: 'acp',
+      local: { command: 'in-process-agent' },
+    });
+    backends.push(backend);
+
+    await backend.start('D:/workspace');
+    const created = await backend.sessions.create({ directory: 'D:/workspace' });
+    const sessionId = created.data!.id;
+    backend.createPipeline({
+      sessionId,
+      directory: 'D:/workspace',
+      permissionMode: 'full-edit',
+      stream: {
+        push: vi.fn(),
+        update: vi.fn(),
+        writeMeta: vi.fn(),
+        updateTitle: vi.fn(),
+      } as never,
+    });
+
+    await expect(backend.sessions.prompt(sessionId, 'hello', 'D:/workspace'))
+      .resolves.toEqual({ data: true });
+    expect(permissionResult).toHaveBeenCalledWith({
+      outcome: { outcome: 'selected', optionId: 'allow-once' },
     });
   });
 

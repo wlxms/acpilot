@@ -58,6 +58,11 @@ task / subagent      → 点击展开子代理完整对话
 | `@dsh read package.json` | 通过当前配置的 DeepSeek Harness 命令对话 |
 | `@dsh /model` | 显示 DeepSeek Harness 提供的模型列表 |
 
+## 文档导航
+
+- [docs/README.md](docs/README.md): 当前维护中的文档入口（架构、运行时测试控制、设计规格）
+- [doc/README.md](doc/README.md): 历史归档文档入口（旧实现记录和早期方案）
+- [dsh-bridge/README.md](dsh-bridge/README.md): 可选 DSH bridge 插件说明
 
 ### DeepSeek Harness 配置
 
@@ -78,7 +83,7 @@ ACPilot 也附带了可选的 `dsh-bridge` 插件。普通 DSH ACP profile 不�
 # 类型检查
 npm run lint
 
-# 测试（618 个单元测试）
+# 测试（vitest）
 npm test
 
 # VS Code Extension Host + loopback 控制端点 smoke/e2e
@@ -204,7 +209,7 @@ src/
 ├── settings/                 # Webview 设置面板
 ├── opencode/                 # SDK 封装（server + client）
 ├── types/                    # 共享类型（ExtensionState + vscode proposed API 声明）
-└── test/                     # vitest 测试（555 个用例）
+└── test/                     # vitest 测试
 ```
 
 详细技术文档见 [阶段一架构设计](docs/refactor/copilot-agent-sss-phase1-design.md)。

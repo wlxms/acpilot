@@ -536,7 +536,15 @@ export const window = {
     },
 };
 
+type SessionItemsProviderMock = {
+    provideChatSessionItems(token: unknown): Promise<ChatSessionItem[]> | ChatSessionItem[];
+};
+
 export const chat = {
+    registerChatSessionItemProvider(_type: string, provider: SessionItemsProviderMock) {
+        void provider;
+        return { dispose() {} };
+    },
     createChatParticipant(
         id: string,
         handler: ChatRequestHandler,

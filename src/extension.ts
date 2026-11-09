@@ -29,7 +29,7 @@ import {
 } from "./backends/dsh/installer";
 import { createSessionContentProvider } from "./surfaces/vscode/experimental-session";
 import { createStableHandler } from "./surfaces/vscode/stable-participant";
-import { hasRegisterChatSessionContentProvider } from "./surfaces/vscode/capabilities";
+import { hasCreateChatSessionItemController } from "./surfaces/vscode/capabilities";
 import { registerLanguageModelChatProvider } from "./surfaces/vscode/language-model-provider";
 import { StatusBarManager } from "./statusbar";
 import {
@@ -2008,21 +2008,21 @@ export function activate(context: vscode.ExtensionContext) {
     // provider from registering.
     let sessionController: vscode.ChatSessionItemController | undefined;
     try {
-      if (hasRegisterChatSessionContentProvider()) {
+      if (hasCreateChatSessionItemController()) {
         const { provider, controller } = createSessionContentProvider(
           state!,
           ctx,
           context,
         );
         sessionController = controller;
+        // The controller is keyed by the contributed chatSessions type. The
+        // content registration uses the same type as the URI scheme so both
+        // halves of the proposed API resolve to the same provider.
         const registration = vscode.chat.registerChatSessionContentProvider(
           ctx.scheme,
           provider,
-          // Keep the participant in the legacy positional slot for hosts that
-          // still use it as the default request implementation. Current hosts
-          // obtain the same implementation from createChatParticipant above.
           participant,
-          { supportsChangingSessionType: true },
+          { supportsInterruptions: true },
         );
 
         context.subscriptions.push(registration);

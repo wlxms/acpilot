@@ -22,6 +22,8 @@ interface LanguageModelProviderContribution {
 }
 
 interface ExtensionManifest {
+  activationEvents?: string[];
+  enabledApiProposals?: string[];
   contributes?: {
     icons?: Record<string, IconContribution>;
     chatSessions?: ChatSessionContribution[];
@@ -34,6 +36,16 @@ function readManifest(): ExtensionManifest {
 }
 
 describe('chat session contributions', () => {
+  it('declares the proposed API and activation events used by current Agent sessions', () => {
+    const manifest = readManifest();
+
+    expect(manifest.enabledApiProposals).toContain('chatSessionsProvider');
+    expect(manifest.activationEvents).toEqual(expect.arrayContaining([
+      'onChatSession:acpilot.opencode',
+      'onChatSession:acpilot.dsh',
+    ]));
+  });
+
   it('keeps DeepSeek Harness as its own Agent target and vendor', () => {
     const manifest = readManifest();
     const contribution = manifest.contributes?.chatSessions?.find(

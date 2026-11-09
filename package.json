@@ -21,7 +21,9 @@
     "Other"
   ],
   "activationEvents": [
-    "onStartupFinished"
+    "onStartupFinished",
+    "onChatSession:acpilot.opencode",
+    "onChatSession:acpilot.dsh"
   ],
   "main": "./out/extension.js",
   "contributes": {

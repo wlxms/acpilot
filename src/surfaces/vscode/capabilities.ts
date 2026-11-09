@@ -178,10 +178,18 @@ export function hasRegisterChatSessionContentProvider(): boolean {
 }
 
 /**
- * Check whether `ChatSessionContentProvider` (experimental) is available.
- * This surface would allow fully custom rendering of chat session content
- * beyond the current participant model.
+ * Check whether the current controller-based chat session API is available.
+ * It is the recommended replacement for registerChatSessionItemProvider().
  */
+export function hasCreateChatSessionItemController(): boolean {
+  try {
+    const chat = vscode.chat as Record<string, unknown>;
+    return typeof chat.createChatSessionItemController === 'function';
+  } catch {
+    return false;
+  }
+}
+
 export function hasChatSessionContentProviderAPI(): boolean {
   const vsc = vscode as Record<string, unknown>;
   return (

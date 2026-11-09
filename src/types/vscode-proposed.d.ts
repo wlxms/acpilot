@@ -210,8 +210,16 @@ declare module 'vscode' {
   // ---------------------------------------------------------------------------
 
   /**
-   * Provides content for chat sessions of a specific type (URI scheme).
+   * Compatibility provider shape accepted by registerChatSessionItemProvider().
+   * New integrations should use ChatSessionItemController instead.
    */
+  export interface ChatSessionItemProvider {
+    provideChatSessionItems(token: CancellationToken): Thenable<ChatSessionItem[]> | ChatSessionItem[];
+    onDidChangeChatSessionItems?: Event<void>;
+    onDidCommitChatSessionItem?: Event<{ original: ChatSessionItem; modified: ChatSessionItem }>;
+    resolveChatSessionItem?(item: ChatSessionItem, token: CancellationToken): Thenable<ChatSessionItem | undefined> | ChatSessionItem | undefined;
+  }
+
   export interface ChatSessionContentProvider {
     /**
      * Provide the content for a chat session identified by its resource URI.
@@ -253,6 +261,26 @@ declare module 'vscode' {
     readonly detail?: string;
     readonly icon?: ThemeIcon;
     readonly default?: boolean;
+    readonly locked?: boolean;
+    readonly slashCommand?: string;
+    readonly tooltip?: string;
+    readonly modelMetadata?: ChatSessionProviderOptionModelMetadata;
+  }
+
+  export interface ChatSessionProviderOptionModelMetadata {
+    readonly name: string;
+    readonly id: string;
+    readonly vendor?: string;
+    readonly version?: string;
+    readonly family?: string;
+    readonly tooltip?: string;
+    readonly pricing?: string;
+    readonly maxInputTokens?: number;
+    readonly maxOutputTokens?: number;
+    readonly capabilities?: {
+      readonly vision?: boolean;
+      readonly toolCalling?: boolean;
+    };
   }
 
   /**
@@ -279,8 +307,11 @@ declare module 'vscode' {
    */
   export interface ChatSessionCapabilities {
     /**
-     * Whether this provider supports changing the session type mid-session
-     * (e.g. hand-off from local to cloud).
+     * Whether sessions can be interrupted and resumed without side-effects.
+     */
+    supportsInterruptions?: boolean;
+    /**
+     * Legacy field retained for older host compatibility.
      */
     supportsChangingSessionType?: boolean;
   }
@@ -305,7 +336,12 @@ declare module 'vscode' {
     readonly legacyResource?: Uri;
     timing?: {
       readonly created: number;
+      readonly lastRequestStarted?: number;
+      readonly lastRequestEnded?: number;
+      readonly startTime?: number;
+      readonly endTime?: number;
     };
+    metadata?: { readonly [key: string]: unknown };
   }
 
   export class ChatSessionChangedFile {
@@ -337,6 +373,7 @@ declare module 'vscode' {
   }
 
   export interface ChatSessionItemCollection extends Iterable<readonly [id: Uri, chatSessionItem: ChatSessionItem]> {
+    forEach(callback: (item: ChatSessionItem, collection: ChatSessionItemCollection) => unknown, thisArg?: unknown): void;
     readonly size: number;
     replace(items: Iterable<ChatSessionItem>): void;
     add(item: ChatSessionItem): void;
@@ -463,12 +500,23 @@ declare module 'vscode' {
     ): Disposable;
 
     /**
-     * Creates a ChatSessionItemController for managing chat session items
-     * and input state for a given chat session type.
+     * Registers the legacy chat session item provider API.
      *
-     * The controller is essential for picker support: it creates tracked
-     * inputState objects via createChatSessionInputState() that VSCode
-     * monitors, enabling onDidChange to fire when users change selections.
+     * Current VS Code versions keep this entry point as a compatibility bridge.
+     * Prefer createChatSessionItemController(), which supports tracked input state,
+     * new-session creation, and lifecycle updates.
+     */
+    export function registerChatSessionItemProvider(
+      chatSessionType: string,
+      provider: ChatSessionItemProvider,
+    ): Disposable;
+
+    /**
+     * Creates the current ChatSessionItemController for a session type.
+     *
+     * The refresh handler receives a cancellation token and is expected to call
+     * controller.items.replace(). VS Code tracks input states created from this
+     * controller and routes new-session and fork actions through it.
      *
      * @param chatSessionType - Must match the `type` in the `chatSessions`
      *   contribution in package.json.

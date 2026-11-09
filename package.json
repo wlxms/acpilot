@@ -21,7 +21,9 @@
     "Other"
   ],
   "activationEvents": [
-    "onStartupFinished"
+    "onStartupFinished",
+    "onChatSession:acpilot.opencode",
+    "onChatSession:acpilot.dsh"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -229,7 +231,8 @@
     "test:integration": "npm run test:runtime",
     "test:runtime": "npm run compile && node scripts/runtime-smoke.cjs",
     "generate-font": "node scripts/generate-font.cjs",
-    "vscode:prepublish": "npm run generate-font && npm run compile"
+    "vscode:prepublish": "npm run generate-font && npm run compile",
+    "launch:insiders": "powershell -NoProfile -Command \"& 'C:\\Program Files\\Microsoft VS Code Insiders\\bin\\code-insiders.cmd' --enable-proposed-api wlxms.acpilot\""
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

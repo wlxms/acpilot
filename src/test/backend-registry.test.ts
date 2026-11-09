@@ -25,6 +25,14 @@ describe('built-in backend registry', () => {
     expect(dsh.modelProvider?.vendor).toBe('dsh');
   });
 
+  it('registers Chat surfaces only for backends declared in the manifest', () => {
+    const chatBackends = BUILTIN_BACKENDS
+      .filter((backend) => backend.contributesToChat)
+      .map((backend) => backend.id);
+
+    expect(chatBackends).toEqual(['opencode', 'dsh']);
+  });
+
   it('rejects a descriptor whose vendor differs from its model provider', () => {
     const descriptor = BUILTIN_BACKENDS[0];
     const backend = {

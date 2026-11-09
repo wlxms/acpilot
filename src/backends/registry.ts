@@ -33,6 +33,13 @@ export interface BuiltinBackendDescriptor {
   readonly scheme: string;
   /** Agent-session Language Model vendor owned by this backend. */
   readonly vendor: string;
+  /**
+   * Whether this backend exposes a chatSessions contribution and
+   * languageModelChatProviders vendor to VS Code. Internal backends (ACP and
+   * Reasonix) remain available to settings/runtime code without creating
+   * undeclared Chat surfaces.
+   */
+  readonly contributesToChat: boolean;
   /** Factory that creates the backend instance from the registry */
   readonly factory: () => Backend;
   /** Whether activation should start this backend immediately. Defaults to true. */
@@ -80,6 +87,7 @@ export const BUILTIN_BACKENDS: BuiltinBackendDescriptor[] = [
     displayName: 'OpenCode',
     scheme: 'acpilot.opencode',
     vendor: 'opencode',
+    contributesToChat: true,
     factory: () => createBackend('opencode'),
   },
   {
@@ -87,6 +95,7 @@ export const BUILTIN_BACKENDS: BuiltinBackendDescriptor[] = [
     displayName: 'ACP Agent',
     scheme: 'acpilot.acp',
     vendor: 'acp',
+    contributesToChat: false,
     factory: () => createBackend('acp'),
   },
   {
@@ -94,6 +103,7 @@ export const BUILTIN_BACKENDS: BuiltinBackendDescriptor[] = [
     displayName: 'DeepSeek Harness',
     scheme: 'acpilot.dsh',
     vendor: 'dsh',
+    contributesToChat: true,
     factory: () => createBackend('dsh'),
   },
   {
@@ -101,6 +111,7 @@ export const BUILTIN_BACKENDS: BuiltinBackendDescriptor[] = [
     displayName: 'Reasonix',
     scheme: 'acpilot.reasonix',
     vendor: 'reasonix',
+    contributesToChat: false,
     factory: () => createBackend('reasonix'),
     autoStart: false,
     isEnabled: (context) => context.getBooleanSetting(

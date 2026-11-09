@@ -1985,6 +1985,10 @@ export function activate(context: vscode.ExtensionContext) {
 
   // -- Register surfaces per backend (participant / session provider / LM) ----
   for (const ctx of backends.values()) {
+    const descriptor = BUILTIN_BACKENDS.find((candidate) => candidate.id === ctx.id);
+    if (descriptor?.contributesToChat !== true) {
+      continue;
+    }
     // `chatSessions.canDelegate` contributes the agent metadata, but it does
     // not install the request implementation. The participant registration is
     // the implementation VS Code invokes for requests addressed to the

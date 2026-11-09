@@ -35,6 +35,10 @@ export interface LocalSpawnOptions {
   env?: NodeJS.ProcessEnv;
   /** Use the platform shell when the configured command is a script launcher. */
   shell?: boolean | string;
+  /** Hide the console window for Desktop's Electron Node process on Windows. */
+  windowsHide?: boolean;
+  /** Give an opted-in process time to finish stdin-EOF cleanup before killing it. */
+  shutdownGracePeriodMs?: number;
   /** Pipe stderr when the caller needs a readiness handshake or line logging. */
   stderr?: 'inherit' | 'pipe';
   /** Optional stderr readiness contract. Its promise must settle before ACP connect. */
@@ -68,10 +72,20 @@ export interface SpawnedAcpAgent {
  */
 export function spawnAcpAgent(opts: LocalSpawnOptions): SpawnedAcpAgent {
   const needsStderrPipe = opts.stderr === 'pipe' || opts.readiness !== undefined || opts.onStderrLine !== undefined;
-  const child = spawn(opts.command, opts.args ?? [], {
+  const usesWindowsCmd = process.platform === 'win32'
+    && (opts.shell === true || (typeof opts.shell === 'string' && /(?:^|[\\/])cmd(?:\.exe)?$/i.test(opts.shell)));
+  // Node joins shell arguments without quoting the executable path. Preserve
+  // caller-owned argument quoting while protecting launchers under Code - Insiders.
+  const executable = usesWindowsCmd && /\s/.test(opts.command) && !opts.command.startsWith('"')
+    ? `"${opts.command}"`
+    : opts.command;
+  const command = usesWindowsCmd ? [executable, ...(opts.args ?? [])].join(' ') : executable;
+  const args = usesWindowsCmd ? [] : opts.args ?? [];
+  const child = spawn(command, args, {
     cwd: opts.cwd,
     env: { ...process.env, ...opts.env },
     shell: opts.shell,
+    windowsHide: opts.windowsHide,
     stdio: ['pipe', 'pipe', needsStderrPipe ? 'pipe' : 'inherit'],
   });
 
@@ -80,6 +94,8 @@ export function spawnAcpAgent(opts: LocalSpawnOptions): SpawnedAcpAgent {
   const stream = ndJsonStream(output, input);
   let stderrReader: Interface | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let shutdownTimer: ReturnType<typeof setTimeout> | undefined;
+  let disposed = false;
   const recentStderr: string[] = [];
   let readinessSettled = false;
   let resolveReady!: (value: unknown) => void;
@@ -154,6 +170,7 @@ export function spawnAcpAgent(opts: LocalSpawnOptions): SpawnedAcpAgent {
   };
   child.once('error', error => failBeforeReady(error));
   child.once('exit', (code, signal) => {
+    if (shutdownTimer) {clearTimeout(shutdownTimer);}
     const exitStatus = `code=${code ?? "null"}, signal=${signal ?? "none"}`;
     if (!readinessSettled) {
       const detail = recentStderr.length > 0 ? "\n" + recentStderr.join("\n") : "";
@@ -171,9 +188,22 @@ export function spawnAcpAgent(opts: LocalSpawnOptions): SpawnedAcpAgent {
     process: child,
     ready,
     dispose: () => {
+      if (disposed) {return;}
+      disposed = true;
       stderrReader?.close();
       if (timer) {clearTimeout(timer);}
-      if (!child.killed && child.exitCode === null) {child.kill();}
+      const terminate = () => {
+        if (!child.killed && child.exitCode === null) {child.kill();}
+      };
+      const gracePeriod = opts.shutdownGracePeriodMs;
+      if (gracePeriod !== undefined && Number.isFinite(gracePeriod) && gracePeriod > 0
+          && !child.killed && child.exitCode === null) {
+        shutdownTimer = setTimeout(terminate, Math.min(gracePeriod, 10_000));
+        shutdownTimer.unref();
+        child.stdin?.end();
+      } else {
+        terminate();
+      }
     },
   };
 }

@@ -1,5 +1,6 @@
 import type {
   ActiveSessionMessage,
+  SessionConfigOption,
 } from '@agentclientprotocol/sdk';
 import type {
   BackendPipeline,
@@ -11,6 +12,9 @@ import {
 } from '../acp/adapter';
 import {
   parseDshBridgeCatalogLine,
+  parseDshDesktopSavedSelectionLine,
+  DSH_DESKTOP_SAVED_SELECTION_PREFIX,
+  type DshDesktopSavedSelection,
   parseDshBridgeDiagnosticLine,
   parseDshBridgeReadyLine,
   parseDshBridgeToolLine,
@@ -30,6 +34,7 @@ export type DshBackendOptions = AcpBackendOptions;
  * installing ACPilot's plugin.
  */
 export class DshBackend extends AcpBackend {
+  private desktopSavedSelection: DshDesktopSavedSelection | undefined;
   private readonly pipelines = new Map<string, DshPipeline>();
   private readonly pendingBridgeMessages = new Map<string, DshBridgeToolMessage[]>();
   /** Exact model metadata emitted after the DSH LLM service is ready. */
@@ -74,6 +79,8 @@ export class DshBackend extends AcpBackend {
         if (!bridge) {return [];}
         return [{
           ...model,
+          displayProviderID: route!.provider,
+          name: bridge.name ?? model.name ?? route!.model,
           maxInputTokens: bridge.contextWindow ?? model.maxInputTokens,
           maxOutputTokens: bridge.maxOutputTokens ?? model.maxOutputTokens,
           ...(bridge.reasoningEfforts?.length
@@ -86,6 +93,30 @@ export class DshBackend extends AcpBackend {
       }),
     };
   }
+  protected override async initializeNewSessionConfig(
+    options: SessionConfigOption[],
+    setOption: (configId: string, value: string) => Promise<SessionConfigOption[]>,
+    launchEnv?: NodeJS.ProcessEnv,
+  ): Promise<SessionConfigOption[]> {
+    const saved = this.desktopSavedSelection;
+    if (!saved || saved.nonce !== launchEnv?.ACPILOT_DSH_BRIDGE_NONCE) {return options;}
+    const model = options.find(option => option.type === 'select' && option.category === 'model');
+    const thought = options.find(option => option.type === 'select' && option.category === 'thought_level');
+    if (!model || model.type !== 'select' || !thought || thought.type !== 'select' || thought.currentValue !== '') {return options;}
+    const selected = parseDshAcpModelRoute({ id: model.currentValue });
+    const efforts = thought.options.flatMap(item => 'options' in item ? item.options : [item]);
+    if (selected?.provider !== saved.provider || selected.model !== saved.model
+      || !efforts.some(effort => effort.value === saved.reasoningEffort)) {return options;}
+    try {
+      const updated = await setOption(thought.id, saved.reasoningEffort);
+      this.logMessage('desktop.saved-selection initialized');
+      return updated;
+    } catch {
+      this.logMessage('desktop.saved-selection could not be applied; retaining ACP session defaults');
+      return options;
+    }
+  }
+
   override createPipeline(options: BackendPipelineOptions): BackendPipeline<ActiveSessionMessage> {
     const pipeline = new DshPipeline(options);
     this.pipelines.set(options.sessionId, pipeline);
@@ -101,6 +132,7 @@ export class DshBackend extends AcpBackend {
   }
 
   override async stop(): Promise<void> {
+    this.desktopSavedSelection = undefined;
     for (const pipeline of this.pipelines.values()) {
       pipeline.dispose();
     }
@@ -116,7 +148,15 @@ export class DshBackend extends AcpBackend {
     return true;
   }
 
-  protected override onLocalStderrLine(line: string): void {
+  protected override onLocalStderrLine(line: string, launchEnv?: NodeJS.ProcessEnv): void {
+    if (line.startsWith(DSH_DESKTOP_SAVED_SELECTION_PREFIX)) {
+      const saved = parseDshDesktopSavedSelectionLine(line, launchEnv?.ACPILOT_DSH_BRIDGE_NONCE ?? '');
+      if (saved) {
+        this.desktopSavedSelection = saved;
+        this.logMessage('desktop.saved-selection received');
+      }
+      return;
+    }
     const ready = parseDshBridgeReadyLine(line);
     if (ready) {
       this.logMessage(`bridge.ready protocol=${ready.protocol}`);

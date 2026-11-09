@@ -90,4 +90,32 @@ describe('DSH bridge launch overlay', () => {
       '--patch', '"C:\\Users\\Administrator\\AppData\\Roaming\\Code - Insiders\\User\\globalStorage\\bridge.patch.yml"',
     ]);
   });
+
+  it('keeps Desktop runtime arguments before the last DSH patch layer', () => {
+    const args = [
+      '--expose-internals',
+      'C:\\Program Files\\DSH Desktop\\resources\\app.asar\\node_modules\\@deepseek-ai\\dsh\\lib\\bin.js',
+      '--profile', 'custom', '--patch', 'user.patch.yml', '--resume', 'session-1',
+    ];
+    const result = appendDshBridgePatch(
+      'C:\\Program Files\\DSH Desktop\\DSH Desktop.exe',
+      args,
+      'C:\\ACPilot Storage\\bridge.patch.yml',
+      { dshArgsStart: 2 },
+    );
+
+    expect(result).toEqual([
+      '--expose-internals',
+      'C:\\Program Files\\DSH Desktop\\resources\\app.asar\\node_modules\\@deepseek-ai\\dsh\\lib\\bin.js',
+      '--profile', 'custom', '--patch', 'user.patch.yml',
+      '--patch', 'C:\\ACPilot Storage\\bridge.patch.yml',
+      '--resume', 'session-1',
+    ]);
+  });
+
+  it.each([-1, 0.5, 3, Number.NaN, Number.POSITIVE_INFINITY])('rejects an invalid DSH argument offset %s', (dshArgsStart) => {
+    expect(() => appendDshBridgePatch('DSH Desktop.exe', ['--expose-internals', 'bin.js'], 'bridge.yml', {
+      dshArgsStart,
+    })).toThrow(RangeError);
+  });
 });

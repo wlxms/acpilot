@@ -1,7 +1,7 @@
 {
   "name": "acpilot",
   "displayName": "ACPilot",
-  "version": "0.5.0",
+  "version": "0.5.4",
   "description": "ACP coding assistant powered by ACP backends",
   "publisher": "wlxms",
   "repository": {

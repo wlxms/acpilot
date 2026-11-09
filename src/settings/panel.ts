@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import type { BackendSettingsDescriptor } from '../backend/types';
 import type { PermissionMode } from '../backend/types';
 
-export type DirectoryField = 'launchCwd' | 'installDirectory';
+export type DirectoryField = 'command' | 'launchCwd' | 'installDirectory';
 
 export interface GlobalSettingItem {
   key: string;
@@ -819,8 +819,8 @@ export class SettingsPanel {
           <input type="hidden" id="dsh-target-id">
           <div class="setting-item">
             <div class="setting-label">Command</div>
-            <div class="setting-desc">The DSH executable or wrapper used for local stdio. The default <code>dsh</code> resolves from PATH, the install directory, or a project launcher.</div>
-            <div class="setting-control"><input type="text" id="dsh-command" placeholder="dsh"></div>
+            <div class="setting-desc">A DSH executable, wrapper, or DSH Desktop installation folder. Desktop uses its saved providers, model, and compatible profile plugins. The default <code>dsh</code> resolves from PATH, the install directory, or a project launcher.</div>
+            <div class="setting-control setting-control-with-button"><input type="text" id="dsh-command" placeholder="dsh or a DSH Desktop folder"><button type="button" id="btn-dsh-desktop-browse" class="button-secondary">Browse Desktop</button></div>
           </div>
           <div class="setting-item">
             <div class="setting-label">Workspace / launch directory</div>
@@ -998,6 +998,8 @@ export class SettingsPanel {
   <script>
     const vscode = acquireVsCodeApi();
     let currentData = null;
+    let dshSettingsFormSnapshot = null;
+    let dshSettingsTargetSnapshot = null;
 
     // ── Left navigation switching ──────────────────────────────────────
     document.querySelectorAll('.toc-item').forEach(item => {
@@ -1060,6 +1062,7 @@ export class SettingsPanel {
     document.getElementById('btn-dsh-stop').addEventListener('click', stopDshFromSettings);
     document.getElementById('btn-dsh-install').addEventListener('click', () => installDshFromSettings('installDsh'));
     document.getElementById('btn-dsh-update').addEventListener('click', () => installDshFromSettings('updateDsh'));
+    document.getElementById('btn-dsh-desktop-browse').addEventListener('click', () => requestDirectorySelection('command', 'dsh-command'));
     document.getElementById('btn-dsh-launch-cwd-browse').addEventListener('click', () => requestDirectorySelection('launchCwd', 'dsh-launch-cwd'));
     document.getElementById('btn-dsh-install-directory-browse').addEventListener('click', () => requestDirectorySelection('installDirectory', 'dsh-install-directory'));
     document.getElementById('btn-cancel-acp-target').addEventListener('click', () => {
@@ -1112,7 +1115,7 @@ export class SettingsPanel {
         renderProviders();
         renderGlobalSettings(msg.data.globalSettings);
       } else if (msg.type === 'directorySelected') {
-        const inputId = msg.field === 'launchCwd' ? 'dsh-launch-cwd' : msg.field === 'installDirectory' ? 'dsh-install-directory' : undefined;
+        const inputId = msg.field === 'command' ? 'dsh-command' : msg.field === 'launchCwd' ? 'dsh-launch-cwd' : msg.field === 'installDirectory' ? 'dsh-install-directory' : undefined;
         const input = inputId ? document.getElementById(inputId) : undefined;
         if (input && typeof msg.value === 'string') input.value = msg.value;
       } else if (msg.type === 'backendLogs') {
@@ -1219,6 +1222,7 @@ export class SettingsPanel {
     }
 
     function selectBackendTarget(targetId) {
+      if (targetId.startsWith('dsh:')) dshSettingsTargetSnapshot = null;
       vscode.postMessage({ type: 'setBackendTarget', targetId });
       document.getElementById('backend-chooser-modal').classList.add('hidden');
     }
@@ -1226,6 +1230,14 @@ export class SettingsPanel {
     function requestDirectorySelection(field, inputId) {
       const input = document.getElementById(inputId);
       vscode.postMessage({ type: 'selectDirectory', field, currentValue: input?.value || '' });
+    }
+
+    function dshTargetSnapshot(target) {
+      return JSON.stringify([
+        target?.id?.replace(/^dsh:/, ''), target?.name, target?.command,
+        target?.args, target?.launchCwd, target?.endpoint,
+        target?.installDirectory, target?.packageSpec,
+      ]);
     }
 
     function fillDshSettings(target) {
@@ -1239,6 +1251,8 @@ export class SettingsPanel {
       document.getElementById('dsh-launch-cwd').value = value.launchCwd || '';
       document.getElementById('dsh-install-directory').value = value.installDirectory || '';
       document.getElementById('dsh-package-spec').value = value.packageSpec || '@deepseek-ai/dsh@latest';
+      dshSettingsFormSnapshot = JSON.stringify(readDshSettings());
+      dshSettingsTargetSnapshot = dshTargetSnapshot(currentData?.dshTarget || value);
     }
 
     function openDshSettings(target) {
@@ -1480,6 +1494,13 @@ export class SettingsPanel {
 
     function renderDshSettings(data) {
       if (!data?.dshTarget) return;
+      // Runtime and model refreshes must not replace a draft after focus leaves the form.
+      // A changed saved target still updates the form after Save or a target switch.
+      const formValue = readDshSettings();
+      const targetId = data.dshTarget.id?.replace(/^dsh:/, '') || undefined;
+      if (dshTargetSnapshot(data.dshTarget) === dshSettingsTargetSnapshot
+        && (formValue.targetId !== targetId
+          || JSON.stringify(formValue) !== dshSettingsFormSnapshot)) return;
       const activeElement = document.activeElement;
       const dshIds = ['dsh-target-id', 'dsh-target-name', 'dsh-command', 'dsh-endpoint', 'dsh-args', 'dsh-launch-cwd', 'dsh-install-directory', 'dsh-package-spec'];
       if (activeElement && dshIds.includes(activeElement.id)) return;

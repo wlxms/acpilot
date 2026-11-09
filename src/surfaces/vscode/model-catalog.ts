@@ -526,12 +526,16 @@ function toRegistration(
   model: BackendModel,
   copilotModelId: string,
 ): CopilotModelRegistration {
+  // Native provider ids remain authoritative for routing. A transport adapter
+  // may advertise its actual supplier separately for the model picker.
+  const displayProviderID = model.displayProviderID?.trim() || providerID;
+  const modelName = model.name?.trim() || model.id;
   return {
     vendor,
     copilotModelId,
     modelId: model.id,
     providerID,
-    displayName: model.name ?? model.id,
+    displayName: `${displayProviderID}: ${modelName}`,
     family: familyForVendor(vendor, backendId),
     maxInputTokens: model.maxInputTokens ?? 128_000,
     maxOutputTokens: model.maxOutputTokens ?? 16_384,

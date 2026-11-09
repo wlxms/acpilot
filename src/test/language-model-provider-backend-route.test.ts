@@ -115,6 +115,56 @@ async function getProvider(f = fixture()) {
 }
 
 describe('language model provider backend route', () => {
+  it.each(['opencode', 'dsh'])('exposes supplier names and preserves native routes for %s', async backendId => {
+    const nativeModels: Array<BackendModel & { provider: string }> = backendId === 'opencode'
+      ? [
+          { id: 'deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', provider: 'gateway-a' },
+          { id: 'deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', provider: 'gateway-b' },
+        ]
+      : [
+          { id: '["gateway-a","deepseek-v4.1-flash"]', name: 'DeepSeek V4.1 Flash', provider: 'dsh', displayProviderID: 'gateway-a' },
+          { id: '["gateway-b","deepseek-v4.1-flash"]', name: 'DeepSeek V4.1 Flash', provider: 'dsh', displayProviderID: 'gateway-b' },
+        ];
+    const f = fixture(undefined, nativeModels);
+    Object.assign(f.ctx, { id: backendId, vendor: backendId, instanceKey: backendId, scheme: `acpilot.${backendId}` });
+    const catalog = createCopilotModelCatalog({
+      backends: new Map([[backendId, f.backend]]),
+      backendVendors: new Map([[backendId, backendId]]),
+      logger: f.state.outputChannel,
+    });
+    f.state.modelCatalog = catalog;
+    const { provider, dispose } = createLanguageModelChatProvider(f.state, f.ctx);
+    try {
+      const models = await provider.provideLanguageModelChatInformation!({ silent: true }, token()) ?? [];
+      expect(models.map(model => model.name)).toEqual([
+        'Auto',
+        'gateway-a: DeepSeek V4.1 Flash',
+        'gateway-b: DeepSeek V4.1 Flash',
+      ]);
+      expect(new Set(models.map(model => model.id)).size).toBe(3);
+      expect(models.every(model => model.targetChatSessionType === `acpilot.${backendId}`)).toBe(true);
+      for (const model of models.slice(1)) {
+        await provider.provideLanguageModelChatResponse!(
+          model, messages(), {} as vscode.ProvideLanguageModelChatResponseOptions,
+          { report: vi.fn() }, token(),
+        );
+      }
+      expect(f.invoke).toHaveBeenNthCalledWith(1, expect.objectContaining({
+        model: backendId === 'opencode'
+          ? { providerID: 'gateway-a', modelID: 'deepseek-v4.1-flash' }
+          : { providerID: 'dsh', modelID: '["gateway-a","deepseek-v4.1-flash"]' },
+      }));
+      expect(f.invoke).toHaveBeenNthCalledWith(2, expect.objectContaining({
+        model: backendId === 'opencode'
+          ? { providerID: 'gateway-b', modelID: 'deepseek-v4.1-flash' }
+          : { providerID: 'dsh', modelID: '["gateway-b","deepseek-v4.1-flash"]' },
+      }));
+    } finally {
+      dispose();
+      catalog.dispose();
+    }
+  });
+
   it('signals Copilot to re-query after an initially empty catalog becomes ready', async () => {
     const catalogModels: Array<BackendModel & { provider: string }> = [];
     const f = fixture(vi.fn(async () => ({

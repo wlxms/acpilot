@@ -35,7 +35,7 @@ import {
 const SETTINGS_STATE_KEY_PREFIX = 'acp.settingsState';
 const ACP_TARGET_STATE_KEY = 'acp.remoteTargets.v1';
 const ACP_TARGET_SECRET_PREFIX = 'acp.remoteTargetToken';
-const DSH_TARGET_STATE_KEY = 'dsh.targets.v1';
+export const DSH_TARGET_STATE_KEY = 'dsh.targets.v1';
 
 function settingsStateKey(backendId: string): string {
   return `${SETTINGS_STATE_KEY_PREFIX}.${backendId}`;

@@ -93,4 +93,23 @@ describe('chat session contributions', () => {
     expect(contribution).toBeDefined();
     expect(contribution?.requiresCustomModels).toBe(true);
   });
+
+  it('keeps local caches and development-only files out of the VSIX', () => {
+    const ignore = readFileSync(join(process.cwd(), '.vscodeignore'), 'utf8')
+      .split(/\r?\n/)
+      .filter(Boolean);
+
+    expect(ignore).toEqual(expect.arrayContaining([
+      'tmp/',
+      'build/',
+      '.vscode/',
+      '.acpilot/',
+      '.sisyphus/',
+      'node_modules-recovery-old/',
+      '.tmp-node-call.json',
+      'doc/',
+      'docs/',
+      'scripts/',
+    ]));
+  });
 });

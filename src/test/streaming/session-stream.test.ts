@@ -765,6 +765,15 @@ describe('finalizeIncompleteStates', () => {
     const result = finalizeIncompleteStates(records, 'completed');
     expect((result[0].payload as { status: string }).status).toBe('skipped');
   });
+
+  it('marks an interrupted external edit as failed instead of completed', () => {
+    const records = [rec('externalEdit', { toolCallId: 'edit-1', editId: '', status: 'pending' })];
+    const result = finalizeIncompleteStates(records, 'completed');
+    expect(result[0].payload).toMatchObject({
+      status: 'error',
+      error: expect.stringContaining('nterrupted'),
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------

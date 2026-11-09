@@ -39,17 +39,26 @@ export function createDshInstallInvocation(
   }
   const packageSpec = options.packageSpec?.trim() || DEFAULT_DSH_PACKAGE_SPEC;
   const platform = options.platform ?? process.platform;
+  const prefixArgument = platform === 'win32'
+    ? quoteWindowsShellArgument(installDirectory)
+    : installDirectory;
   return {
     // npm publishes a .cmd launcher on Windows. `shell` is limited to this
     // user-requested package-manager call so the DSH transport can still run
     // the configured command without constructing a shell command string.
     command: options.npmCommand?.trim() || (platform === 'win32' ? 'npm.cmd' : 'npm'),
-    args: ['install', '--prefix', installDirectory, packageSpec],
+    args: ['install', '--prefix', prefixArgument, packageSpec],
     cwd: installDirectory,
     shell: platform === 'win32',
   };
 }
 
+function quoteWindowsShellArgument(value: string): string {
+  if (!/[\s&|<>^()]/.test(value)) {
+    return value;
+  }
+  return `"${value.replace(/"/g, '\\"')}"`;
+}
 export function resolveDshExecutable(
   installDirectory: string,
   platform: NodeJS.Platform = process.platform,

@@ -85,6 +85,124 @@ describe('DSH launch resolver', () => {
     });
   });
 
+  it('keeps an absolute launcher path explicit instead of substituting one from PATH', () => {
+    const root = tempDirectory('acpilot-dsh-explicit-');
+    const requestedDirectory = join(root, 'installed');
+    const pathDirectory = join(root, 'path');
+    mkdirSync(requestedDirectory, { recursive: true });
+    mkdirSync(pathDirectory, { recursive: true });
+    const requested = join(requestedDirectory, 'dsh.cmd');
+    writeFileSync(requested, '');
+    writeFileSync(join(pathDirectory, 'dsh.cmd'), '');
+
+    const result = resolveDshLaunch(createTarget({
+      command: requested,
+      launchCwd: root,
+    }), {
+      env: {},
+      platform: 'win32',
+      pathValue: pathDirectory,
+    });
+
+    expect(result).toMatchObject({
+      kind: 'local',
+      command: requested,
+      source: 'explicit',
+    });
+  });
+
+  it('prefers the launch directory launcher over an installed or PATH launcher', () => {
+    const root = tempDirectory('acpilot-dsh-project-bin-');
+    const projectBin = join(root, 'node_modules', '.bin');
+    const installDirectory = join(root, 'managed-install');
+    const installBin = join(installDirectory, 'node_modules', '.bin');
+    const pathDirectory = join(root, 'path');
+    mkdirSync(projectBin, { recursive: true });
+    mkdirSync(installBin, { recursive: true });
+    mkdirSync(pathDirectory, { recursive: true });
+    const projectLauncher = join(projectBin, 'dsh.cmd');
+    writeFileSync(projectLauncher, '');
+    writeFileSync(join(installBin, 'dsh.cmd'), '');
+    writeFileSync(join(pathDirectory, 'dsh.cmd'), '');
+
+    const result = resolveDshLaunch(createTarget({
+      launchCwd: root,
+      installDirectory,
+    }), {
+      env: {},
+      platform: 'win32',
+      pathValue: pathDirectory,
+    });
+
+    expect(result).toMatchObject({
+      kind: 'local',
+      command: projectLauncher,
+      source: 'project-bin',
+    });
+  });
+
+  it('prefers a launch directory package script over an installed or PATH launcher', () => {
+    const root = tempDirectory('acpilot-dsh-project-script-priority-');
+    const bin = join(root, 'bin');
+    const installDirectory = join(root, 'managed-install');
+    const installBin = join(installDirectory, 'node_modules', '.bin');
+    mkdirSync(bin, { recursive: true });
+    mkdirSync(installBin, { recursive: true });
+    const pnpm = join(bin, 'pnpm.cmd');
+    writeFileSync(pnpm, '');
+    writeFileSync(join(bin, 'dsh.cmd'), '');
+    writeFileSync(join(installBin, 'dsh.cmd'), '');
+    writeFileSync(join(root, 'package.json'), JSON.stringify({
+      packageManager: 'pnpm@11.7.0',
+      scripts: { dsh: 'node apps/cli/src/bin.ts' },
+    }));
+
+    const result = resolveDshLaunch(createTarget({
+      launchCwd: root,
+      installDirectory,
+    }), {
+      env: {},
+      platform: 'win32',
+      pathValue: bin,
+    });
+
+    expect(result).toMatchObject({
+      kind: 'local',
+      command: pnpm,
+      args: ['dsh', '--profile', 'acp'],
+      cwd: root,
+      source: 'package-script',
+    });
+  });
+
+  it('prefers the managed install launcher over PATH when the launch directory has no local entrypoint', () => {
+    const root = tempDirectory('acpilot-dsh-install-priority-');
+    const launchCwd = join(root, 'workspace');
+    const installDirectory = join(root, 'managed-install');
+    const installBin = join(installDirectory, 'node_modules', '.bin');
+    const pathDirectory = join(root, 'path');
+    mkdirSync(launchCwd, { recursive: true });
+    mkdirSync(installBin, { recursive: true });
+    mkdirSync(pathDirectory, { recursive: true });
+    const installed = join(installBin, 'dsh.cmd');
+    writeFileSync(installed, '');
+    writeFileSync(join(pathDirectory, 'dsh.cmd'), '');
+
+    const result = resolveDshLaunch(createTarget({
+      launchCwd,
+      installDirectory,
+    }), {
+      env: {},
+      platform: 'win32',
+      pathValue: pathDirectory,
+    });
+
+    expect(result).toMatchObject({
+      kind: 'local',
+      command: installed,
+      source: 'install-directory',
+    });
+  });
   it('resolves a project package script when the source checkout has no dsh launcher', () => {
     const root = tempDirectory('acpilot-dsh-project-');
     const bin = join(root, 'bin');
@@ -154,6 +272,24 @@ describe('DSH launch resolver', () => {
       cwd: 'C:\\workspace',
       source: 'explicit',
       shell: true,
+    });
+  });
+
+  it('does not route direct Node commands through a Windows shell', () => {
+    const result = resolveDshLaunch(createTarget({
+      command: 'node',
+      args: ['--import', 'tsx/esm', 'apps/cli/src/bin.ts', '--profile', 'acp'],
+    }), {
+      env: {},
+      platform: 'win32',
+      pathValue: '',
+    });
+
+    expect(result).toMatchObject({
+      kind: 'local',
+      command: 'node',
+      shell: false,
+      args: ['--import', 'tsx/esm', 'apps/cli/src/bin.ts', '--profile', 'acp'],
     });
   });
 

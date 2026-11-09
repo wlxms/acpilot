@@ -24,4 +24,190 @@ describe('DshBackend', () => {
     });
     expect(pipeline).toBeInstanceOf(DshPipeline);
   });
+
+  it('merges bridge model metadata into ACP discovery without changing models', async () => {
+    const backend = new DshBackend();
+    const lines: string[] = [];
+    backend.setLogger({ appendLine: message => lines.push(message) });
+    const internals = backend as unknown as {
+      onLocalStderrLine(line: string): void;
+      configModels(directory?: string): Promise<{ data?: Array<Record<string, unknown>> }>;
+      getAdvertisedModels(directory?: string): Array<Record<string, unknown>>;
+    };
+
+    internals.onLocalStderrLine(
+      'ACPILOT_DSH_BRIDGE_CATALOG\t'
+        + JSON.stringify({
+          protocol: 1,
+          models: [{
+            provider: 'deepseek-official',
+            model: 'deepseek-v4-flash',
+            name: 'DeepSeek V4.1 Flash',
+            contextWindow: 1_000_000,
+            maxOutputTokens: 256_000,
+            reasoningEfforts: [
+              { value: 'off', name: 'Off' },
+              { value: 'high', name: 'High' },
+            ],
+            defaultReasoningEffort: 'high',
+          }],
+        }),
+    );
+    internals.getAdvertisedModels = () => [{
+      id: 'deepseek-v4-flash',
+      name: 'deepseek-v4-flash',
+      provider: 'deepseek-official',
+    }];
+
+    await expect(internals.configModels('D:/workspace')).resolves.toEqual({
+      data: [{
+        id: 'deepseek-v4-flash',
+        name: 'deepseek-v4-flash',
+        provider: 'deepseek-official',
+        maxInputTokens: 1_000_000,
+        maxOutputTokens: 256_000,
+        reasoningEfforts: [
+          { value: 'off', name: 'Off' },
+          { value: 'high', name: 'High' },
+        ],
+        defaultReasoningEffort: 'high',
+      }],
+    });
+    expect(lines).toContain('[dsh-backend] bridge.catalog models=1');
+  });
+
+  it('maps opaque DSH ACP model values to bridge provider/model metadata', async () => {
+    const backend = new DshBackend();
+    const internals = backend as unknown as {
+      onLocalStderrLine(line: string): void;
+      configModels(directory?: string): Promise<{ data?: Array<Record<string, unknown>> }>;
+      getAdvertisedModels(directory?: string): Array<Record<string, unknown>>;
+    };
+    internals.onLocalStderrLine(
+      'ACPILOT_DSH_BRIDGE_CATALOG\t'
+        + JSON.stringify({
+          protocol: 1,
+          models: [{
+            provider: 'deepseek-official',
+            model: 'deepseek-flash',
+            name: 'DeepSeek-V4-Flash',
+            contextWindow: 1_000_000,
+            maxOutputTokens: 256_000,
+            reasoningEfforts: [{ value: 'high', name: 'High' }],
+            defaultReasoningEffort: 'high',
+          }],
+        }),
+    );
+    internals.getAdvertisedModels = () => [{
+      id: '["deepseek-official","deepseek-flash"]',
+      name: 'DeepSeek-V4-Flash',
+      provider: 'dsh',
+    }];
+
+    await expect(internals.configModels('D:/workspace')).resolves.toEqual({
+      data: [{
+        id: '["deepseek-official","deepseek-flash"]',
+        name: 'DeepSeek-V4-Flash',
+        provider: 'dsh',
+        maxInputTokens: 1_000_000,
+        maxOutputTokens: 256_000,
+        reasoningEfforts: [{ value: 'high', name: 'High' }],
+        defaultReasoningEffort: 'high',
+      }],
+    });
+  });
+
+  it('does not expose ACP-only models when bridge metadata is partial', async () => {
+    const backend = new DshBackend();
+    const internals = backend as unknown as {
+      onLocalStderrLine(line: string): void;
+      configModels(directory?: string): Promise<{ data?: Array<Record<string, unknown>> }>;
+      getAdvertisedModels(directory?: string): Array<Record<string, unknown>>;
+    };
+    internals.getAdvertisedModels = () => [
+      { id: 'deepseek-flash', name: 'DeepSeek-V41-Flash', provider: 'deepseek-official' },
+      { id: 'unresolved-model', name: 'Unresolved', provider: 'deepseek-official' },
+    ];
+    internals.onLocalStderrLine('ACPILOT_DSH_BRIDGE_CATALOG\t' + JSON.stringify({
+      protocol: 1,
+      models: [{ provider: 'deepseek-official', model: 'deepseek-flash', name: 'DeepSeek-V41-Flash', contextWindow: 1_000_000 }],
+    }));
+
+    const result = await internals.configModels('D:/workspace');
+    expect(result.data).toEqual([expect.objectContaining({ id: 'deepseek-flash', maxInputTokens: 1_000_000 })]);
+  });
+
+  it('withholds ACP-only model discovery until bridge metadata is ready', async () => {
+    const backend = new DshBackend();
+    const internals = backend as unknown as {
+      configModels(directory?: string): Promise<{ data?: Array<Record<string, unknown>> }>;
+      getAdvertisedModels(directory?: string): Array<Record<string, unknown>>;
+    };
+    internals.getAdvertisedModels = () => [{
+      id: 'deepseek-flash',
+      name: 'DeepSeek-V41-Flash',
+      provider: 'dsh',
+    }];
+
+    await expect(internals.configModels('D:/workspace')).resolves.toEqual({ data: [] });
+  });
+
+  it('notifies the host when the bridge catalog arrives after initial model discovery', () => {
+    const backend = new DshBackend();
+    const internals = backend as unknown as {
+      onLocalStderrLine(line: string): void;
+      bridgeCatalog: Map<string, unknown>;
+    };
+    const listener = vi.fn();
+    backend.onDidChangeModelCatalog?.(listener);
+    internals.onLocalStderrLine(
+      'ACPILOT_DSH_BRIDGE_CATALOG\t'
+        + JSON.stringify({
+          protocol: 1,
+          models: [{
+            provider: 'deepseek-official',
+            model: 'deepseek-flash',
+            name: 'DeepSeek V4.1 Flash',
+            contextWindow: 1_000_000,
+            reasoningEfforts: [{ value: 'high', name: 'High' }],
+          }],
+        }),
+    );
+
+    expect(internals.bridgeCatalog.size).toBe(1);
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+
+  it('forwards ordinary local stderr diagnostics to the backend logger', () => {
+    const backend = new DshBackend();
+    const lines: string[] = [];
+    backend.setLogger({ appendLine: message => lines.push(message) });
+
+    const observeStderr = (backend as unknown as {
+      onLocalStderrLine(line: string): void;
+    }).onLocalStderrLine.bind(backend);
+    observeStderr('profile boot failed');
+
+    expect(lines).toEqual(['[dsh-backend] stderr: profile boot failed']);
+  });
+
+  it('formats bridge diagnostics for the backend log', () => {
+    const backend = new DshBackend();
+    const lines: string[] = [];
+    backend.setLogger({ appendLine: message => lines.push(message) });
+
+    const observeStderr = (backend as unknown as {
+      onLocalStderrLine(line: string): void;
+    }).onLocalStderrLine.bind(backend);
+    observeStderr(
+      'ACPILOT_DSH_BRIDGE_DIAGNOSTIC\t'
+        + '{"protocol":1,"event":"pre-execute.ask","sessionId":"session-1",'
+        + '"toolCallId":"call-edit","toolName":"edit","card":"diff"}',
+    );
+
+    expect(lines).toEqual([
+      '[dsh-backend] bridge.diagnostic event=pre-execute.ask '
+        + 'sessionId=session-1 toolCallId=call-edit toolName=edit card=diff',
+    ]);
+  });
 });

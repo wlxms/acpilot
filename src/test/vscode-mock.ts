@@ -300,6 +300,9 @@ export class MarkdownString {
 export class ChatResponseMarkdownPart {
     constructor(public readonly value: MarkdownString | string) {}
 }
+export class ChatResponseWarningPart {
+    constructor(public readonly value: MarkdownString | string) {}
+}
 
 export class ChatResponseThinkingProgressPart {
     constructor(

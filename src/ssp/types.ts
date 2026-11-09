@@ -220,6 +220,7 @@ export interface ExternalEditStreamPartPayload {
   uri?: string;
   uris?: unknown[];
   status?: 'pending' | 'completed' | 'error';
+  error?: string;
   undoStopId?: string;
   onDidComplete?: unknown;
   subAgentId?: string;

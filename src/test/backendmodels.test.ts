@@ -22,6 +22,47 @@ function makeOptions(backends: Map<string, Backend>, backendVendors: Map<string,
   return { backends, backendVendors, logger: { appendLine: () => undefined } as never };
 }
 
+describe('backend model control metadata', () => {
+  it('keeps the fixed maximum context and per-model reasoning levels in the catalog', async () => {
+    const backend = backendWithModels('dsh', [{
+      id: 'model-a',
+      name: 'Model A',
+      provider: 'provider-a',
+      maxInputTokens: 1_000_000,
+      maxOutputTokens: 256_000,
+      reasoningEfforts: [
+        { value: 'low', name: 'Low' },
+        { value: 'high', name: 'High', description: 'Deep reasoning' },
+      ],
+      defaultReasoningEffort: 'high',
+    }]);
+    const catalog = createCopilotModelCatalog({
+      backends: new Map([['dsh', backend]]),
+      backendVendors: new Map([['dsh', 'dsh']]),
+      logger: { appendLine: () => undefined } as never,
+    });
+
+    await catalog.refresh();
+
+    expect(catalog.list()).toEqual([
+      expect.objectContaining({
+        backendId: 'dsh',
+        modelId: 'model-a',
+        maxInputTokens: 1_000_000,
+        maxOutputTokens: 256_000,
+        reasoning: {
+          current: 'high',
+          options: [
+            { value: 'low', name: 'Low', description: undefined },
+            { value: 'high', name: 'High', description: 'Deep reasoning' },
+          ],
+        },
+      }),
+    ]);
+    catalog.dispose();
+  });
+});
+
 describe('Copilot model catalog single-vendor exposure', () => {
   it('isolates a throwing backend and forwards the workspace directory', async () => {
     const logger = { appendLine: vi.fn() };

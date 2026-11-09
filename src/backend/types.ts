@@ -23,6 +23,13 @@ export interface BackendServerInfo {
 // Models / providers
 // ===========================================================================
 
+/** One selectable reasoning strength for an exact backend model. */
+export interface BackendReasoningEffort {
+  value: string;
+  name: string;
+  description?: string;
+}
+
 export interface BackendModel {
   id: string;
   name?: string;
@@ -36,6 +43,10 @@ export interface BackendModel {
   maxInputTokens?: number;
   /** Max output tokens (from SDK `limit.output`) */
   maxOutputTokens?: number;
+  /** Selectable reasoning strengths reported by the backend for this exact model. */
+  reasoningEfforts?: BackendReasoningEffort[];
+  /** Backend-selected reasoning strength, when one is declared. */
+  defaultReasoningEffort?: string;
   /** Effective API endpoint used by an ordinary Copilot LLM request. */
   apiBaseURL?: string;
   /** Provider wire protocol hint (openai-compatible, anthropic, google). */

@@ -163,10 +163,13 @@ interface TransientCleanupState {
  * accidentally be sent to a backend that does not understand them.
  */
 function mapModelOptions(options: BackendModelOptions | undefined): { variant?: string } {
-  if (!options || typeof options.variant !== 'string' || options.variant.length === 0) {
-    return {};
-  }
-  return { variant: options.variant };
+  if (!options) {return {};}
+  const selected = typeof options.variant === 'string' && options.variant.length > 0
+    ? options.variant
+    : typeof options.reasoningEffort === 'string' && options.reasoningEffort.length > 0
+      ? options.reasoningEffort
+      : undefined;
+  return selected === undefined ? {} : { variant: selected };
 }
 
 /** OpenCode's request-level tool gate for the shared read-only mode. */
@@ -198,6 +201,7 @@ function mapProviderModels(providers: readonly SdkProvider[]): BackendModel[] {
         capabilitiesRaw: capRecord,
         maxInputTokens: limitRecord?.context,
         maxOutputTokens: limitRecord?.output,
+        ...mapReasoningVariants(rawM),
       };
       const providerURL = typeof modelApi?.url === 'string'
         ? modelApi.url
@@ -218,6 +222,34 @@ function mapProviderModels(providers: readonly SdkProvider[]): BackendModel[] {
   return models;
 }
 
+function mapReasoningVariants(model: Record<string, unknown>): Pick<BackendModel, 'reasoningEfforts' | 'defaultReasoningEffort'> {
+  const variants = model.variants;
+  if (!variants || typeof variants !== 'object' || Array.isArray(variants)) {return {};}
+  const entries = Object.keys(variants);
+  if (entries.length === 0) {return {};}
+  return {
+    reasoningEfforts: entries.map(value => ({ value, name: formatReasoningName(value) })),
+    // The highest advertised level is the only deterministic default available
+    // without a model-specific preference. The request path always sends an
+    // explicit selection once the picker has one.
+    defaultReasoningEffort: entries.at(-1),
+  };
+}
+
+const REASONING_NAMES: Readonly<Record<string, string>> = {
+  none: 'None',
+  minimal: 'Minimal',
+  low: 'Low',
+  medium: 'Medium',
+  high: 'High',
+  xhigh: 'Extra High',
+  max: 'Max',
+  thinking: 'Thinking',
+};
+
+function formatReasoningName(value: string): string {
+  return REASONING_NAMES[value] ?? value;
+}
 function inferApiKind(api: { type?: unknown; npm?: unknown; package?: unknown } | undefined): BackendModel['apiKind'] {
   const type = `${api?.type ?? ''} ${api?.npm ?? ''} ${api?.package ?? ''}`.toLowerCase();
   if (type.includes('anthropic')) {return 'anthropic';}
@@ -237,6 +269,7 @@ export class OpenCodeBackend implements Backend<OpenCodeStreamEvent> {
 
   private readonly serverManager = new OpenCodeServerManager();
   private readonly eventBroker = new GlobalEventBroker();
+  private log: (message: string) => void = () => {};
   private rawClient: OpenCodeClient | null = null;
   /** Native model-provider sessions owned by this backend runtime. */
   private readonly transientSessions = new Set<TransientSessionRef>();
@@ -267,6 +300,10 @@ export class OpenCodeBackend implements Backend<OpenCodeStreamEvent> {
   // Lifecycle
   // =======================================================================
 
+  setLogger(logger: { appendLine(message: string): void }): void {
+    this.log = (message) => logger.appendLine(`[${this.name}-backend] ${message}`);
+  }
+
   async start(directory?: string): Promise<BackendResult<BackendServerInfo>> {
     // A stop owns the old client until its transient-session cleanup and
     // server teardown finish. Do not let start() reuse that client midway
@@ -296,6 +333,7 @@ export class OpenCodeBackend implements Backend<OpenCodeStreamEvent> {
 
   private async performStart(directory?: string): Promise<BackendResult<BackendServerInfo>> {
     const generation = this.runtimeGeneration;
+    this.log(`start requested${directory ? ` cwd=${directory}` : ''}`);
     try {
       const url = await this.serverManager.start(directory);
       const rawClient = this.serverManager.getClient();
@@ -311,6 +349,7 @@ export class OpenCodeBackend implements Backend<OpenCodeStreamEvent> {
         this.runtimeGeneration += 1;
       }
       this.rawClient = rawClient;
+      this.log(`started at ${url}`);
       return {
         data: {
           url,
@@ -319,6 +358,7 @@ export class OpenCodeBackend implements Backend<OpenCodeStreamEvent> {
       };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      this.log(`start failed: ${msg}`);
       return { error: msg };
     }
   }
@@ -355,6 +395,7 @@ export class OpenCodeBackend implements Backend<OpenCodeStreamEvent> {
   }
 
   private async performStop(): Promise<void> {
+    this.log('stop requested');
     const stoppingGeneration = this.runtimeGeneration;
     this.runtimeGeneration += 1;
     const stopGeneration = this.runtimeGeneration;
@@ -400,6 +441,7 @@ export class OpenCodeBackend implements Backend<OpenCodeStreamEvent> {
       if (this.runtimeGeneration === stopGeneration && this.rawClient === stoppingClient) {
         this.rawClient = null;
       }
+      this.log('stopped');
     }
   }
 

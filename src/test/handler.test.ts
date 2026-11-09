@@ -2017,6 +2017,59 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     const chatState = ctx.sessionMap.get('chat-title-keep');
     expect(chatState?.title).toBe('Existing Good Title');
   });
+
+  it('generates and applies a first-prompt title for a new DSH session with the backend default title', async () => {
+    const handler = createParticipantHandler(state, ctx);
+    const generatedTitle = '修复 DSH 会话标题';
+
+    backendStatus = 'running';
+    mockSdkClient.session.create.mockResolvedValue({
+      data: { id: 'dsh-session-title', title: 'DSH Session dsh-sess' },
+    });
+    vi.mocked(ctx.backend.sessions.get).mockResolvedValue({
+      data: { id: 'dsh-session-title', title: 'DSH Session dsh-sess', createdAt: new Date() },
+    });
+    vi.mocked(ctx.backend.sessions.update).mockImplementation(async (_id, options) => ({
+      data: { id: 'dsh-session-title', title: options.title ?? '', createdAt: new Date() },
+    }));
+    vi.spyOn(vscode.lm, 'selectChatModels').mockResolvedValue([{
+      id: 'dsh-title-model',
+      vendor: 'dsh',
+      family: 'DeepSeek Harness',
+      name: 'DeepSeek Harness',
+      sendRequest: vi.fn(async () => ({
+        text: (async function* () {
+          yield generatedTitle;
+        })(),
+      })),
+    } as unknown as vscode.LanguageModelChat]);
+    mockSdkClient.global.event.mockResolvedValue({ stream: emptyEventStream() });
+
+    await handler(
+      createRequest({ prompt: '修复 DSH 会话标题', sessionId: 'chat-dsh-title' }),
+      { history: [] },
+      stream,
+      token,
+    );
+
+    const chatState = ctx.sessionMap.get('chat-dsh-title');
+    expect(chatState?.title).toBe(generatedTitle);
+    expect(chatState?.titleSource).toBe('copilot-style');
+    expect(chatState?.provisionalTitle).toBe(false);
+    expect(ctx.backend.sessions.update).toHaveBeenCalledWith(
+      'dsh-session-title',
+      expect.objectContaining({ title: '修复 DSH 会话标题' }),
+    );
+    expect(ctx.sessionStore.updateMeta).toHaveBeenCalledWith(
+      'dsh-session-title',
+      expect.objectContaining({
+        title: generatedTitle,
+        titleSource: 'copilot-style',
+        provisionalTitle: false,
+      }),
+    );
+  });
+
 });
 // ---------------------------------------------------------------------------
 // resolvePromptModel 閳?native model sync tests

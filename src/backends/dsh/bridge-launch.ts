@@ -11,6 +11,11 @@ export interface DshBridgePatchOptions {
   patchDirectory: string;
 }
 
+export interface DshBridgeLaunchOptions {
+  /** Quote generated arguments when the child is launched through cmd.exe. */
+  shell?: boolean;
+}
+
 /**
  * Materialize a launcher-local DSH patch that imports the bridge by file URL.
  *
@@ -55,14 +60,25 @@ export function appendDshBridgePatch(
   command: string,
   args: readonly string[],
   patchPath: string,
+  options: DshBridgeLaunchOptions = {},
 ): string[] {
   const insertionIndex = dshLauncherPrefixLength(command, args);
+  const launchPatchPath = options.shell
+    ? quoteWindowsShellArgument(patchPath)
+    : patchPath;
   return [
     ...args.slice(0, insertionIndex),
     '--patch',
-    patchPath,
+    launchPatchPath,
     ...args.slice(insertionIndex),
   ];
+}
+
+function quoteWindowsShellArgument(value: string): string {
+  if (!/[\s&|<>^()]/.test(value)) {
+    return value;
+  }
+  return `"${value.replace(/"/g, '\\"')}"`;
 }
 
 /**
@@ -82,7 +98,10 @@ function dshLauncherPrefixLength(command: string, args: readonly string[]): numb
   }
   if (executable === 'pnpm' || executable === 'yarn' || executable === 'bun') {
     const dshIndex = findDshScriptIndex(args);
-    return dshIndex >= 0 ? dshIndex + 1 : 0;
+    const separatorIndex = dshIndex >= 0
+      ? args.findIndex((value, index) => index > dshIndex && value === '--')
+      : -1;
+    return separatorIndex >= 0 ? separatorIndex + 1 : dshIndex >= 0 ? dshIndex + 1 : 0;
   }
   if (executable === 'node' || executable === 'nodejs' || executable === 'tsx' || executable === 'ts-node') {
     const scriptIndex = args.findIndex(value => /\.(?:c|m)?js$|\.(?:c|m)?ts$|\.tsx$/i.test(value));

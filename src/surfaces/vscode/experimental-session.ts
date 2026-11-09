@@ -135,10 +135,13 @@ export function isPlaceholderSessionTitle(title: string | undefined): boolean {
     || normalized === 'New OpenCode Session'
     || normalized === 'New ACP Agent Session'
     || normalized === 'New Reasonix Session'
+    || normalized === 'New DeepSeek Harness Session'
     || normalized.startsWith('OpenCode Session ')
     || normalized.startsWith('ACP Session ')
     || normalized.startsWith('ACP Agent Session ')
     || normalized.startsWith('Reasonix Session ')
+    || normalized.startsWith('DSH Session ')
+    || normalized.startsWith('DeepSeek Harness Session ')
     || normalized.startsWith('Session ');
 }
 
@@ -153,7 +156,9 @@ export function createSessionContentProvider(
   const logger = state.outputChannel;
   const directory = getWorkspaceDirectory();
   const backendDisplayName = ctx.displayName;
-  const backendThemeIcon = new vscode.ThemeIcon(ctx.id === 'opencode' ? 'opencode-logo' : 'acpilot-a');
+  const backendThemeIcon = new vscode.ThemeIcon(
+    ctx.id === 'opencode' ? 'opencode-logo' : ctx.id === 'dsh' ? 'dsh-logo' : 'acpilot-a',
+  );
   const newSessionTitle = `New ${backendDisplayName} Session`;
   const offlineSessionTitle = `${backendDisplayName} (offline)`;
 
@@ -2028,6 +2033,7 @@ export function createSessionContentProvider(
       const newResource = createSessionResource(runtime, newSessionId);
 
       const item = ctrl.createChatSessionItem(newResource, getSessionLabel({ id: newSessionId, title }));
+      item.iconPath = backendThemeIcon;
       item.status = vscode.ChatSessionStatus.Completed;
       item.archived = false;
       item.timing = { created: Date.now() };

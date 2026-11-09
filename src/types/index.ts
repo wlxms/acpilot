@@ -8,6 +8,7 @@ import type { SessionTitleSource } from '../backend/serializable/types';
 import type { CopilotModelCatalog } from '../surfaces/vscode/model-catalog';
 import type { AppEventBus } from '../backend/app-event-bus';
 import type { PermissionMode } from '../backend/types';
+import type { BackendLogStore } from '../backend/log-store';
 
 /** Info about a conversation session extracted from SDK response */
 export interface SessionInfo {
@@ -94,6 +95,8 @@ export interface ExtensionState {
   modelCatalog: CopilotModelCatalog;
   /** Output channel for logging */
   outputChannel: vscode.OutputChannel;
+  /** Bounded per-backend diagnostics shown in Settings. */
+  backendLogs?: BackendLogStore;
   /** Status bar controller (shows backend / agent / model) */
   statusBar: StatusBarManager;
   /** Application-level typed event bus (channel-scoped by backendId) */

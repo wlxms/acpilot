@@ -9,6 +9,7 @@ import type {
 } from './backend';
 import { BackendRuntimeChangedError } from './backend';
 import type { BackendModel, BackendResult } from './types';
+import { AUTO_MODEL_ID, AUTO_MODEL_PROVIDER_ID } from '../surfaces/vscode/model-catalog';
 
 const INVOCATION_DRAIN_TIMEOUT_MS = 2_000;
 /** Maximum time spent waiting for one best-effort session cleanup operation. */
@@ -712,6 +713,10 @@ async function invokeSessionModel<TEvent>(
     const attachments = request.prompt.attachments
       ? [...request.prompt.attachments]
       : undefined;
+    const backendModel = request.model.providerID === AUTO_MODEL_PROVIDER_ID
+      && request.model.modelID === AUTO_MODEL_ID
+      ? undefined
+      : request.model;
     promptPromise = Promise.resolve().then(() => {
       assertRuntimeCurrent();
       return backend.sessions.prompt(
@@ -719,7 +724,7 @@ async function invokeSessionModel<TEvent>(
         request.prompt.text,
         directory,
         {
-          model: request.model,
+          model: backendModel,
           agent: request.agent,
           permissionMode: request.permissionMode,
           modelOptions: request.modelOptions === undefined

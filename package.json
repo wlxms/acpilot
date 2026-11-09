@@ -14,6 +14,7 @@
   "enabledApiProposals": [
     "chatParticipantAdditions",
     "chatParticipantPrivate",
+    "chatProvider",
     "chatSessionsProvider"
   ],
   "categories": [
@@ -38,6 +39,13 @@
           "fontPath": "./resources/font-icons/opencode-icon.woff",
           "fontCharacter": "\\E002"
         }
+      },
+      "dsh-logo": {
+        "description": "DeepSeek Harness official whale logomark",
+        "default": {
+          "fontPath": "./resources/font-icons/opencode-icon.woff",
+          "fontCharacter": "\\E003"
+        }
       }
     },
     "commands": [
@@ -54,18 +62,8 @@
         "managementCommand": "acpilot.openSettings"
       },
       {
-        "vendor": "acp",
-        "displayName": "ACP Agent",
-        "managementCommand": "acpilot.openSettings"
-      },
-      {
         "vendor": "dsh",
         "displayName": "DeepSeek Harness",
-        "managementCommand": "acpilot.openSettings"
-      },
-      {
-        "vendor": "reasonix",
-        "displayName": "Reasonix",
         "managementCommand": "acpilot.openSettings"
       }
     ],
@@ -190,68 +188,14 @@
         ]
       },
       {
-        "type": "acpilot.acp",
-        "name": "acp",
-        "displayName": "ACP Agent",
-        "description": "Any standard Agent Client Protocol agent (JSON-RPC 2.0)",
-        "icon": "$(acpilot-a)",
-        "inputPlaceholder": "Ask the ACP agent...",
-        "canDelegate": true,
-        "requiresCustomModels": false,
-        "capabilities": {
-          "supportsFileAttachments": true,
-          "supportsToolAttachments": true,
-          "supportsImageAttachments": true
-        },
-        "commands": [
-          {
-            "name": "new",
-            "description": "Start a new conversation session"
-          },
-          {
-            "name": "help",
-            "description": "Show available commands"
-          }
-        ]
-      },
-      {
         "type": "acpilot.dsh",
         "name": "dsh",
         "displayName": "DeepSeek Harness",
         "description": "AI coding agent powered by DeepSeek Harness",
-        "icon": "$(acpilot-a)",
+        "icon": "$(dsh-logo)",
         "inputPlaceholder": "Ask DeepSeek Harness anything...",
         "canDelegate": true,
         "requiresCustomModels": true,
-        "capabilities": {
-          "supportsFileAttachments": true,
-          "supportsToolAttachments": true,
-          "supportsImageAttachments": true
-        },
-        "commands": [
-          {
-            "name": "new",
-            "description": "Start a new conversation session"
-          },
-          {
-            "name": "help",
-            "description": "Show available commands"
-          },
-          {
-            "name": "model",
-            "description": "Show or change the current model"
-          }
-        ]
-      },
-      {
-        "type": "acpilot.reasonix",
-        "name": "reasonix",
-        "displayName": "Reasonix",
-        "description": "AI coding agent powered by Reasonix ACP",
-        "icon": "$(acpilot-a)",
-        "inputPlaceholder": "Ask Reasonix anything...",
-        "canDelegate": true,
-        "requiresCustomModels": false,
         "capabilities": {
           "supportsFileAttachments": true,
           "supportsToolAttachments": true,

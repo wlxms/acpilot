@@ -6,18 +6,36 @@
  * backend can merge them with standard ACP tool updates.
  */
 
+import path from 'node:path'
+import { readFile } from 'node:fs/promises'
+
 export const name = 'acpilot-dsh-bridge'
-export const inject = ['tools']
+export const inject = ['tools', 'llm']
 export const ACPILOT_DSH_BRIDGE_SERVICE = 'acpilotDshBridge'
 export const ACPILOT_DSH_BRIDGE_PROTOCOL = 1
 export const ACPILOT_DSH_BRIDGE_PLUGIN = '@wlxms/acpilot-dsh-bridge'
 export const ACPILOT_DSH_BRIDGE_TOOL_PREFIX = 'ACPILOT_DSH_BRIDGE_TOOL\t'
+export const ACPILOT_DSH_BRIDGE_DIAGNOSTIC_PREFIX = 'ACPILOT_DSH_BRIDGE_DIAGNOSTIC\t'
+export const ACPILOT_DSH_BRIDGE_CATALOG_PREFIX = 'ACPILOT_DSH_BRIDGE_CATALOG\t'
 
 export function apply(ctx) {
   const nonce = process.env.ACPILOT_DSH_BRIDGE_NONCE
   const tools = ctx.tools
+  const llm = ctx.get?.('llm') ?? ctx.llm
   const bridgeAttached = typeof nonce === 'string' && nonce.trim().length > 0
   const approvalEnabledSessions = new WeakSet()
+  /** Most recent tool agent observed for each session; used for identity diagnostics. */
+  const recentExecAgents = new Map()
+
+  const rememberExecAgent = (sessionId, agent) => {
+    if (!sessionId || !agent || typeof agent !== 'object') return
+    recentExecAgents.delete(sessionId)
+    recentExecAgents.set(sessionId, agent)
+    if (recentExecAgents.size > 256) {
+      const oldest = recentExecAgents.keys().next().value
+      if (typeof oldest === 'string') recentExecAgents.delete(oldest)
+    }
+  }
 
   const emit = (message) => {
     try {
@@ -27,7 +45,79 @@ export function apply(ctx) {
     }
   }
 
+  const emitCatalog = (models) => {
+    if (models.length === 0) return
+    try {
+      process.stderr.write(`${ACPILOT_DSH_BRIDGE_CATALOG_PREFIX}${JSON.stringify({
+        protocol: ACPILOT_DSH_BRIDGE_PROTOCOL,
+        models,
+      })}\n`)
+    } catch {
+      // Catalog diagnostics are optional and must never affect DSH.
+    }
+  }
+
+  const readCatalog = async () => {
+    try {
+      if (!llm || typeof llm.listProviders !== 'function' || typeof llm.listModels !== 'function') return false
+      const providers = llm.listProviders()
+      const models = []
+      for (const provider of providers) {
+        let entries
+        try {
+          entries = await llm.listModels(provider.id)
+        } catch {
+          continue
+        }
+        for (const entry of entries) {
+          let info
+          try {
+            info = await llm.resolveModelInfo(provider.id, entry.id)
+          } catch {
+            continue
+          }
+          models.push({
+            provider: provider.id,
+            model: entry.id,
+            name: info?.name ?? entry.name ?? entry.id,
+            ...(Number.isInteger(info?.context?.contextWindow) && info.context.contextWindow > 0
+              ? { contextWindow: info.context.contextWindow }
+              : {}),
+            ...(Number.isInteger(info?.defaultMaxTokens) && info.defaultMaxTokens > 0
+              ? { maxOutputTokens: info.defaultMaxTokens }
+              : {}),
+            ...(Array.isArray(info?.reasoning?.efforts) && info.reasoning.efforts.length > 0
+              ? {
+                  reasoningEfforts: info.reasoning.efforts.map(effort => ({
+                    value: String(effort.id),
+                    name: String(effort.name),
+                    ...(typeof effort.description === 'string' ? { description: effort.description } : {}),
+                  })),
+                  ...(typeof info.reasoning.defaultEffort === 'string'
+                    ? { defaultReasoningEffort: info.reasoning.defaultEffort }
+                    : {}),
+                }
+              : {}),
+          })
+        }
+      }
+      if (models.length === 0) return false
+      emitCatalog(models)
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  // LLM adapters can register after this plugin's first activation. Probe only
+  // in the background, after bridge handlers are installed. The timer is
+  // unref'd so it cannot keep a short-lived test or DSH CLI process alive.
+  const catalogProbeTimeout = setTimeout(() => {
+    void readCatalog()
+  }, 1000)
+  if (typeof catalogProbeTimeout.unref === 'function') catalogProbeTimeout.unref()
   const sessionIdentity = (exec) => {
+
     const id = exec?.agent?.session?.id ?? exec?.agent?.id
     return typeof id === 'string' && id.trim() ? id : undefined
   }
@@ -52,13 +142,46 @@ export function apply(ctx) {
   }
 
   const ensureApprovalChannel = async (exec) => {
-    if (!bridgeAttached) return
+    if (!bridgeAttached) {
+      emitBridgeDiagnostic('approval.channel', {
+        sessionId: sessionIdentity(exec) ?? null,
+        toolCallId: exec?.callId ?? null,
+        toolName: exec?.name ?? null,
+        status: 'bridge-disabled',
+      })
+      return
+    }
     const agent = exec?.agent
     const session = agent?.session
-    if (!agent || !isRecord(session) || approvalEnabledSessions.has(session)) return
+    if (!agent || !isRecord(session)) {
+      emitBridgeDiagnostic('approval.channel', {
+        sessionId: sessionIdentity(exec) ?? null,
+        toolCallId: exec?.callId ?? null,
+        toolName: exec?.name ?? null,
+        status: 'no-agent-session',
+      })
+      return
+    }
+    if (approvalEnabledSessions.has(session)) {
+      emitBridgeDiagnostic('approval.channel', {
+        sessionId: sessionIdentity(exec) ?? null,
+        toolCallId: exec?.callId ?? null,
+        toolName: exec?.name ?? null,
+        status: 'already-enabled',
+      })
+      return
+    }
 
     const approval = approvalService(agent)
-    if (!approval) return
+    if (!approval) {
+      emitBridgeDiagnostic('approval.channel', {
+        sessionId: sessionIdentity(exec) ?? null,
+        toolCallId: exec?.callId ?? null,
+        toolName: exec?.name ?? null,
+        status: 'approval-service-missing',
+      })
+      return
+    }
 
     let policy
     try {
@@ -70,6 +193,14 @@ export function apply(ctx) {
     }
     if (policy !== 'never' && approval.config?.policy !== 'never') {
       approvalEnabledSessions.add(session)
+      emitBridgeDiagnostic('approval.channel', {
+        sessionId: sessionIdentity(exec) ?? null,
+        toolCallId: exec?.callId ?? null,
+        toolName: exec?.name ?? null,
+        status: 'enabled',
+        overridePolicy: policy ?? null,
+        configPolicy: approval.config?.policy ?? null,
+      })
       return
     }
 
@@ -85,9 +216,26 @@ export function apply(ctx) {
         return
       }
       approvalEnabledSessions.add(session)
-    } catch {
+      emitBridgeDiagnostic('approval.channel', {
+        sessionId: sessionIdentity(exec) ?? null,
+        toolCallId: exec?.callId ?? null,
+        toolName: exec?.name ?? null,
+        status: 'switched-to-ask',
+        overridePolicy: policy ?? null,
+        configPolicy: approval.config?.policy ?? null,
+      })
+    } catch (error) {
       // Keep the normal ask decision fail-closed if a custom approval service
       // cannot be switched to the bridge-compatible policy.
+      emitBridgeDiagnostic('approval.channel', {
+        sessionId: sessionIdentity(exec) ?? null,
+        toolCallId: exec?.callId ?? null,
+        toolName: exec?.name ?? null,
+        status: 'switch-failed',
+        overridePolicy: policy ?? null,
+        configPolicy: approval.config?.policy ?? null,
+        error: error instanceof Error ? error.message : String(error),
+      })
     }
   }
 
@@ -150,9 +298,50 @@ export function apply(ctx) {
     }
     return result.isError ? undefined : fileMutationPresentation(exec)
   }
+
+  /**
+   * Reject an edit that is already known to fail before DSH reaches its
+   * approval gate. A permission request creates ACPilot's ExternalEdit
+   * baseline, and VS Code cannot retract that baseline when the edit later
+   * fails, so a deterministic failure must never cross this boundary.
+   */
+  const preflightEditFailure = async (exec) => {
+    if (exec?.name !== 'edit' || !isRecord(exec.arguments)) return undefined
+    const filePath = firstString(exec.arguments.file_path, exec.arguments.filePath, exec.arguments.path, exec.arguments.filename)
+    const oldString = firstString(exec.arguments.old_string, exec.arguments.oldString, exec.arguments.old_text, exec.arguments.oldText)
+    if (!filePath || oldString === undefined) return undefined
+    const cwd = firstString(exec?.agent?.session?.header?.cwd) ?? process.cwd()
+    const targetPath = path.isAbsolute(filePath) ? filePath : path.resolve(cwd, filePath)
+    let content
+    try {
+      content = await readFile(targetPath, 'utf8')
+    } catch (error) {
+      if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return `cannot edit "${filePath}": not found`
+      return undefined
+    }
+    const needle = String(oldString).replace(/\r\n?/g, '\n')
+    const haystack = String(content).replace(/\r\n?/g, '\n')
+    const matches = haystack.split(needle).length - 1
+    if (matches === 0) return `old_string was not found in "${filePath}"`
+    const replaceAll = exec.arguments.replace_all === true || exec.arguments.replaceAll === true
+    if (!replaceAll && matches > 1) {
+      return `old_string matched ${matches} times in "${filePath}"; provide a more specific old_string or set replace_all to true`
+    }
+    return undefined
+  }
+
   ctx.on('tools/pre-execute', async (exec, next) => {
     const sessionId = sessionIdentity(exec)
     const presentation = callPresentation(exec)
+    rememberExecAgent(sessionId, exec.agent)
+    emitBridgeDiagnostic('pre-execute.begin', {
+      sessionId: sessionId ?? null,
+      toolCallId: exec.callId ?? null,
+      toolName: exec.name ?? null,
+      agentId: exec?.agent?.id ?? null,
+      card: presentation.card,
+      bridgeAttached,
+    })
     if (sessionId) {
       emit({
         type: 'tool_call',
@@ -165,16 +354,43 @@ export function apply(ctx) {
         presentation,
       })
     }
+    const preflightFailure = await preflightEditFailure(exec)
+    emitBridgeDiagnostic('pre-execute.preflight', {
+      sessionId: sessionId ?? null,
+      toolCallId: exec.callId ?? null,
+      toolName: exec.name ?? null,
+      status: preflightFailure ? 'rejected' : 'passed',
+      ...(preflightFailure ? { reason: preflightFailure } : {}),
+    })
+    if (preflightFailure) {
+      return { kind: 'deny', reason: preflightFailure }
+    }
+
     // DSH's pre-execute waterfall is the permission gate. Re-enable a full-
     // access approval channel before delegating so the normal downstream
     // policy listeners still run. Only an allowed downstream decision is
     // converted into `ask`; denials and other decisions remain authoritative.
     // The approval service then runs before tools/execute can dispatch, while
     // monotonic tools.guard() policies continue to run after the approval.
+
     if (presentation.card === 'diff' && bridgeAttached) {
       await ensureApprovalChannel(exec)
       const decision = await next()
+      emitBridgeDiagnostic('pre-execute.downstream', {
+        sessionId: sessionId ?? null,
+        toolCallId: exec.callId ?? null,
+        toolName: exec.name ?? null,
+        decision: decision?.kind ?? null,
+      })
       if (decision?.kind !== 'allow') return decision
+      emitBridgeDiagnostic('pre-execute.ask', {
+        sessionId: sessionId ?? null,
+        toolCallId: exec.callId ?? null,
+        toolName: exec.name ?? null,
+        agentId: exec?.agent?.id ?? null,
+        card: presentation.card,
+        reason: presentationTitle(presentation) ?? `Allow ${exec.name}`,
+      })
       return {
         kind: 'ask',
         reason: presentationTitle(presentation) ?? `Allow ${exec.name}`,
@@ -182,6 +398,44 @@ export function apply(ctx) {
     }
 
     return next()
+  }, { prepend: true })
+
+  // Observe the DSH approval waterfall without changing its outcome. This
+  // wrapper is prepended so it also sees requests that a later ACP handler
+  // forwards to ACPilot; the ACP connection remains the actual answerer.
+  ctx.on('approval/request', async (request, next) => {
+    const sessionId = request?.agent?.session?.id ?? request?.agent?.id ?? null
+    const toolCallId = request?.callId ?? null
+    const toolName = request?.toolName ?? null
+    const recentAgent = typeof sessionId === 'string' ? recentExecAgents.get(sessionId) : undefined
+    emitBridgeDiagnostic('approval.begin', {
+      sessionId,
+      toolCallId,
+      toolName,
+      agentId: request?.agent?.id ?? null,
+      agentMatchesLastExecution: recentAgent === undefined ? null : request.agent === recentAgent,
+      reason: request?.reason ?? null,
+      signalAborted: request?.signal?.aborted ?? null,
+    })
+    let outcome
+    try {
+      outcome = await next()
+    } catch (error) {
+      emitBridgeDiagnostic('approval.error', {
+        sessionId,
+        toolCallId,
+        toolName,
+        error: error instanceof Error ? error.message : String(error),
+      })
+      throw error
+    }
+    emitBridgeDiagnostic('approval.outcome', {
+      sessionId,
+      toolCallId,
+      toolName,
+      outcome: typeof outcome === 'string' ? outcome : typeof outcome,
+    })
+    return outcome
   }, { prepend: true })
 
   ctx.on('tools/result', (exec, result) => {
@@ -220,6 +474,19 @@ export function apply(ctx) {
       ...(nonce ? { nonce } : {}),
       emits: 'stderr',
     }))
+  }
+}
+
+/** Emit a diagnostic without changing the bridge's presentation protocol. */
+function emitBridgeDiagnostic(event, fields) {
+  try {
+    process.stderr.write(`${ACPILOT_DSH_BRIDGE_DIAGNOSTIC_PREFIX}${JSON.stringify({
+      protocol: ACPILOT_DSH_BRIDGE_PROTOCOL,
+      event,
+      ...fields,
+    })}\n`)
+  } catch {
+    // Diagnostics are best-effort and must never affect DSH.
   }
 }
 

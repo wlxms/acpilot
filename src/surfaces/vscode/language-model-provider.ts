@@ -31,9 +31,16 @@
 
 import * as vscode from 'vscode';
 import type { ExtensionState, BackendContext } from '../../types';
+import type { CopilotModelRegistration } from './model-types';
 import { BackendRuntimeChangedError, type BackendRuntimeGuard } from '../../backend/backend';
 import { streamBackendChatResponse } from './backend-chat-client';
 import { normalizePermissionMode } from '../../backend/types';
+import {
+  AUTO_MODEL_ID,
+  AUTO_MODEL_PROVIDER_ID,
+  autoCopilotModelId,
+  isAutoCopilotModelId,
+} from './model-catalog';
 
 // The lightweight VS Code test shim predates this enum. Keep the runtime
 // comparison named while tolerating that older test surface.
@@ -83,30 +90,56 @@ export function createLanguageModelChatProvider(
 
   // Track cached models to avoid unnecessary refresh
   let cachedModels: BackendLanguageModelChatInformation[] = [];
-  let cachedRuntime: { generation: number; instanceKey: string } | undefined;
 
   // Subscribe to bus events that signal model list may have changed.
   // Only react to events from THIS backend's channel.
   const unsubBackendReady = state.bus.on('backend-ready', (e) => {
     if (e.backendId !== ctx.id) {return;}
     cachedModels = [];
-    cachedRuntime = undefined;
     onChangeEmitter.fire();
   });
 
   const unsubSelectionChanged = state.bus.on('selection-changed', (e) => {
     if (e.backendId !== ctx.id) {return;}
     cachedModels = [];
-    cachedRuntime = undefined;
     onChangeEmitter.fire();
   });
 
   const unsubModelsChanged = state.bus.on('models-changed', (e) => {
     if (e.backendId !== ctx.id) {return;}
     cachedModels = [];
-    cachedRuntime = undefined;
     onChangeEmitter.fire();
   });
+
+  // The bridge can publish several catalog revisions while its LLM services
+  // settle. Refresh the host catalog first so VS Code's re-query sees the new
+  // capabilities, then publish one change notification for the latest revision.
+  let modelCatalogChangePromise: Promise<void> | undefined;
+  let modelCatalogChangeQueued = false;
+  const notifyModelCatalogChanged = (): Promise<void> => {
+    cachedModels = [];
+    if (modelCatalogChangePromise) {
+      modelCatalogChangeQueued = true;
+      return modelCatalogChangePromise;
+    }
+    modelCatalogChangePromise = (async () => {
+      do {
+        modelCatalogChangeQueued = false;
+        if (ctx.backend.isRunning() && typeof state.modelCatalog.refresh === 'function') {
+          await state.modelCatalog.refresh(workspaceDirectory());
+        }
+      } while (modelCatalogChangeQueued);
+      onChangeEmitter.fire();
+    })().catch((refreshError) => {
+      logger.appendLine(`[lm-provider:${vendorId}] Model catalog refresh after metadata change failed: ${refreshError instanceof Error ? refreshError.message : String(refreshError)}`);
+    }).finally(() => {
+      modelCatalogChangePromise = undefined;
+    });
+    return modelCatalogChangePromise;
+  };
+  const unsubModelCatalogChanged = typeof ctx.backend.onDidChangeModelCatalog === 'function'
+    ? ctx.backend.onDidChangeModelCatalog!(() => { void notifyModelCatalogChanged(); })
+    : () => {};
 
   const provider: vscode.LanguageModelChatProvider<BackendLanguageModelChatInformation> = {
     onDidChangeLanguageModelChatInformation: onChangeEmitter.event,
@@ -116,105 +149,74 @@ export function createLanguageModelChatProvider(
       token: vscode.CancellationToken,
     ): Promise<BackendLanguageModelChatInformation[]> {
       const runtime = captureRuntimeGuard(state, ctx);
+      const autoModelFor = (instanceKey: string): BackendLanguageModelChatInformation => ({
+        id: autoCopilotModelId(vendorId, instanceKey),
+        name: 'Auto',
+        family: familyForVendor(vendorId, ctx),
+        version: '1',
+        maxInputTokens: 128_000,
+        maxOutputTokens: 16_384,
+        capabilities: { agentMode: true, toolCalling: true },
+        isBYOK: true,
+        isUserSelectable: true,
+        isDefault: true,
+        targetChatSessionType: ctx.scheme,
+      });
       try {
         assertProviderRequestActive(runtime, token);
-        if (!ctx.backend.isRunning()) {
-          // Model information is the first entry point for a native picker.
-          // Backends such as Reasonix are intentionally lazy, so waiting for a
-          // chat participant before starting them would leave a valid vendor
-          // permanently empty in Copilot's model picker.
-          const start = ctx.backend.start;
-          if (typeof start !== 'function') {
-            logger.appendLine(`[lm-provider:${vendorId}] Backend is stopped and cannot be started`);
-            clearBackendCatalog();
-            return [];
-          }
-          let started: Awaited<ReturnType<NonNullable<BackendContext['backend']['start']>>>;
-          try {
-            started = await awaitProviderOperation(
-              start.call(ctx.backend, workspaceDirectory()),
+
+        // Auto is the stable entry point for this backend. It is available
+        // before the backend starts, so the model picker is never empty merely
+        // because startup or model discovery has not completed yet.
+        const autoModel = autoModelFor(runtime.instanceKey);
+        let entries: BackendLanguageModelChatInformation[] = [];
+
+        // Native catalog entries are only trustworthy for a running backend.
+        // A stopped backend can still have a cached snapshot from its previous
+        // runtime; do not offer those stale handles alongside Auto.
+        if (ctx.backend.isRunning()) {
+          if (typeof state.modelCatalog.refresh === 'function') {
+            await awaitProviderOperation(
+              state.modelCatalog.refresh(workspaceDirectory()),
               runtime,
               token,
             );
-          } catch (startError) {
-            // A failed lazy start leaves the backend stopped. Clear the
-            // central catalog as well as the provider cache so an old model
-            // handle cannot resolve against the dead runtime.
-            // Cancellation and runtime invalidation are control flow, not a
-            // failed startup; preserve the existing catalog in that case.
-            if (!(startError instanceof LanguageModelInformationCancelledError)
-              && isRuntimeGuardCurrent(runtime)) {
-              clearBackendCatalog();
-            }
-            throw startError;
           }
           assertProviderRequestActive(runtime, token);
-          if (started.error) {
-            logger.appendLine(`[lm-provider:${vendorId}] Backend start failed: ${String(started.error)}`);
-            clearBackendCatalog();
-            return [];
-          }
+          entries = state.modelCatalog.list()
+            .filter((r) => r.vendor === vendorId
+              && r.backendId === ctx.id
+              && r.backendInstanceKey === runtime.instanceKey)
+            .map((r) => ({
+              id: r.copilotModelId,
+              name: r.displayName,
+              family: r.family ?? familyForVendor(vendorId, ctx),
+              version: '1',
+              maxInputTokens: r.maxInputTokens,
+              maxOutputTokens: r.maxOutputTokens,
+              capabilities: r.capabilities,
+              ...(modelConfigurationSchema(r)
+                ? { configurationSchema: modelConfigurationSchema(r) }
+                : {}),
+              isBYOK: true,
+              isUserSelectable: true,
+              targetChatSessionType: ctx.scheme,
+            }));
         }
 
-        // Refresh after a lazy start so the provider exposes the backend's
-        // current catalog, including ACP session-discovered models.
-        if (typeof state.modelCatalog.refresh === 'function') {
-          await awaitProviderOperation(
-            state.modelCatalog.refresh(workspaceDirectory()),
-            runtime,
-            token,
-          );
-        }
-        assertProviderRequestActive(runtime, token);
-
-        // Only return models matching THIS vendor AND belonging to THIS backend.
-        // The catalog tags every registration with its owning backend id;
-        // filtering by ctx.id keeps backend vendor namespaces isolated.
-        const all = state.modelCatalog.list();
-        const entries: BackendLanguageModelChatInformation[] = all
-          .filter((r) => r.vendor === vendorId
-            && r.backendId === ctx.id
-            && r.backendInstanceKey === runtime.instanceKey)
-          .map((r, i) => ({
-            id: r.copilotModelId,
-            name: r.displayName,
-            // family controls the vendor group name in the model picker
-            family: r.family ?? familyForVendor(vendorId, ctx),
-            version: '1',
-            maxInputTokens: r.maxInputTokens,
-            maxOutputTokens: r.maxOutputTokens,
-            capabilities: r.capabilities,
-            // This is a backend-owned model exposed through VS Code's
-            // language-model API. Marking it as BYOK lets Copilot include
-            // non-Copilot vendors in its Agent model pool.
-            isBYOK: true,
-            isUserSelectable: true,
-            isDefault: i === 0 ? true : undefined,
-            targetChatSessionType: ctx.scheme,
-          }));
-
-        cachedModels = entries;
-        cachedRuntime = { generation: runtime.generation, instanceKey: runtime.instanceKey };
+        cachedModels = [autoModel, ...entries];
         logger.appendLine(
           `[lm-provider:${vendorId}] Reported ${cachedModels.length} models `
-          + `(toolCalling=${cachedModels.filter(model => Boolean(model.capabilities?.toolCalling)).length}, `
+          + `(auto=true, toolCalling=${cachedModels.filter(model => Boolean(model.capabilities?.toolCalling)).length}, `
           + `backendVendor=${vendorId})`,
         );
         return cachedModels;
       } catch (providerError) {
-        if (providerError instanceof LanguageModelInformationCancelledError) {
-          return [];
-        }
+        // Auto is runtime-independent. Even if discovery is cancelled or the
+        // backend runtime is replaced, keep the current vendor's entry point
+        // visible so the user can explicitly retry by selecting it.
         logger.appendLine(`[lm-provider:${vendorId}] Error: ${providerError instanceof Error ? providerError.message : String(providerError)}`);
-        // A transition invalidates the old catalog. Never hand a picker a
-        // model list from the previous ACP target while the replacement is
-        // starting; VS Code will re-query after the ready/change event.
-        if (!isRuntimeGuardCurrent(runtime)
-          || cachedRuntime?.generation !== runtime.generation
-          || cachedRuntime?.instanceKey !== runtime.instanceKey) {
-          return [];
-        }
-        return cachedModels;
+        return [autoModelFor(ctx.instanceKey)];
       }
     },
 
@@ -227,7 +229,52 @@ export function createLanguageModelChatProvider(
     ): Promise<void> {
       const runtime = captureRuntimeGuard(state, ctx);
       assertRuntimeGuard(runtime);
-      const route = resolveModelRoute(state, ctx, vendorId, model, runtime.instanceKey);
+      const autoSelected = isAutoCopilotModelId(vendorId, model.id, runtime.instanceKey);
+      let route = autoSelected
+        ? resolveAutoModelRoute(ctx, runtime.instanceKey)
+        : resolveModelRoute(state, ctx, vendorId, model, runtime.instanceKey);
+      if (!route && autoSelected) {
+        const start = ctx.backend.start;
+        if (typeof start !== 'function') {
+          const message = `Backend "${ctx.displayName}" cannot start from Auto.`;
+          error(progress, message);
+          throw new Error(message);
+        }
+        let started: Awaited<ReturnType<NonNullable<BackendContext['backend']['start']>>>;
+        try {
+          started = await awaitProviderOperation(
+            start.call(ctx.backend, workspaceDirectory()),
+            runtime,
+            token,
+          );
+        } catch (startError) {
+          const message = startError instanceof Error ? startError.message : String(startError);
+          error(progress, `Backend start failed: ${message}`);
+          throw startError;
+        }
+        assertProviderRequestActive(runtime, token);
+        if (started.error) {
+          const message = `Backend start failed: ${String(started.error)}`;
+          error(progress, message);
+          throw new Error(message);
+        }
+        if (typeof state.modelCatalog.refresh === 'function') {
+          await awaitProviderOperation(
+            state.modelCatalog.refresh(workspaceDirectory()),
+            runtime,
+            token,
+          );
+        }
+        assertProviderRequestActive(runtime, token);
+        await ctx.selection?.resolveDefaults?.();
+        // No native model is still a valid Auto request: the backend can use
+        // its own configured default. The session model provider strips the
+        // synthetic identity before prompting.
+        route = resolveAutoModelRoute(ctx, runtime.instanceKey) ?? {
+          providerID: AUTO_MODEL_PROVIDER_ID,
+          modelID: AUTO_MODEL_ID,
+        };
+      }
       if (!route) {
         const message = `Unable to resolve model "${model.id}" for active backend instance `
           + `"${runtime.instanceKey}" (${ctx.displayName}).`;
@@ -255,9 +302,7 @@ export function createLanguageModelChatProvider(
           runtime,
           model: { providerID: route.providerID, modelID: route.modelID },
           messages,
-          modelOptions: options.modelOptions === undefined
-            ? undefined
-            : { ...options.modelOptions },
+          modelOptions: mergeModelOptions(options),
           purpose: options.modelOptions?.acpilotPurpose === 'title-generation'
             ? 'title-generation'
             : 'chat',
@@ -301,31 +346,13 @@ export function createLanguageModelChatProvider(
     },
   };
 
-  function clearBackendCatalog(): void {
-    // A failed lazy start is commonly retried by VS Code after the provider
-    // reports a change.  Do not publish another change when this backend has
-    // already been removed from the catalog: doing so creates a feedback
-    // loop (onDidChange -> provider query -> failed start -> onDidChange) and
-    // needlessly invalidates in-flight catalog refreshes.
-    const hadCachedModels = cachedModels.length > 0;
-    const hadCatalogModels = state.modelCatalog.list().some(
-      model => model.backendId === ctx.id,
-    );
-    cachedModels = [];
-    cachedRuntime = undefined;
-    if (!hadCachedModels && !hadCatalogModels) {
-      return;
-    }
-    state.modelCatalog.clearBackend?.(ctx.id);
-    state.bus.emit('models-changed', { backendId: ctx.id });
-  }
-
   return {
     provider,
     dispose: () => {
       unsubBackendReady();
       unsubSelectionChanged();
       unsubModelsChanged();
+      unsubModelCatalogChanged();
       onChangeEmitter.dispose();
     },
   };
@@ -387,11 +414,82 @@ interface ResolvedModelRoute {
   modelID: string;
 }
 
+/** Resolve Auto to the backend's currently selected default model. */
+function resolveAutoModelRoute(
+  ctx: BackendContext,
+  backendInstanceKey: string,
+): ResolvedModelRoute | undefined {
+  if (ctx.instanceKey !== backendInstanceKey) {
+    return undefined;
+  }
+  const selected = ctx.selection?.get?.().model;
+  if (!selected?.providerID || !selected.modelID) {
+    return undefined;
+  }
+  if (selected.providerID === AUTO_MODEL_PROVIDER_ID && selected.modelID === AUTO_MODEL_ID) {
+    return undefined;
+  }
+  return {
+    providerID: selected.providerID,
+    modelID: selected.modelID,
+  };
+}
+
 /**
  * Resolve the backend-native model selector from the canonical VS Code id.
  * The id must identify a current registration owned by this backend/vendor.
  * No provider/model metadata fallback is accepted.
  */
+function mergeModelOptions(
+  options: vscode.ProvideLanguageModelChatResponseOptions,
+): Record<string, unknown> | undefined {
+  const merged: Record<string, unknown> = { ...(options.modelOptions ?? {}) };
+  const configuration = (options as unknown as {
+    modelConfiguration?: Record<string, unknown>;
+  }).modelConfiguration;
+  if (typeof configuration?.reasoningEffort === 'string' && configuration.reasoningEffort.length > 0) {
+    merged.reasoningEffort = configuration.reasoningEffort;
+  }
+  return Object.keys(merged).length > 0 ? merged : undefined;
+}
+function modelConfigurationSchema(
+  model: CopilotModelRegistration,
+): Record<string, unknown> | undefined {
+  const properties: Record<string, unknown> = {
+    contextWindow: {
+      type: 'number',
+      title: 'Context window',
+      description: 'The maximum context window reported by the backend. Changing this value is not supported.',
+      enum: [model.maxInputTokens],
+      enumItemLabels: [formatTokenWindow(model.maxInputTokens)],
+      default: model.maxInputTokens,
+      readOnly: true,
+    },
+  };
+  if (model.reasoning?.options.length) {
+    properties.reasoningEffort = {
+      type: 'string',
+      title: 'Reasoning effort',
+      description: 'Reasoning length supported by this exact model.',
+      enum: model.reasoning.options.map(option => option.value),
+      enumItemLabels: model.reasoning.options.map(option => option.name),
+      enumDescriptions: model.reasoning.options.map(option => option.description ?? ''),
+      default: model.reasoning.current ?? model.reasoning.options[0].value,
+      group: 'navigation',
+    };
+  }
+  return { properties };
+}
+
+function formatTokenWindow(tokens: number): string {
+  if (tokens >= 1_000_000) {
+    return `${Number((tokens / 1_000_000).toFixed(1))}M`;
+  }
+  if (tokens >= 1_000) {
+    return `${Math.round(tokens / 1_000)}K`;
+  }
+  return String(tokens);
+}
 function resolveModelRoute(
   state: ExtensionState,
   ctx: BackendContext,

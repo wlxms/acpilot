@@ -32,6 +32,19 @@ describe('DSH installer helpers', () => {
     });
   });
 
+  it('quotes a Windows npm prefix when the install directory contains spaces', () => {
+    const invocation = createDshInstallInvocation({
+      installDirectory: 'C:\\Users\\Administrator\\AppData\\Roaming\\Code - Insiders\\User\\globalStorage\\wlxms.acpilot\\dsh',
+      packageSpec: '@deepseek-ai/dsh@latest',
+      platform: 'win32',
+    });
+    expect(invocation.args).toEqual([
+      'install',
+      '--prefix',
+      '"C:\\Users\\Administrator\\AppData\\Roaming\\Code - Insiders\\User\\globalStorage\\wlxms.acpilot\\dsh"',
+      '@deepseek-ai/dsh@latest',
+    ]);
+  });
   it('resolves the installed launcher for both Windows and Unix layouts', () => {
     const winDirectory = join(process.cwd(), '.vitest-dsh-win');
     const unixDirectory = join(process.cwd(), '.vitest-dsh-unix');

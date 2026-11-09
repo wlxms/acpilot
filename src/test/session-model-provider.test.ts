@@ -4,6 +4,7 @@ import type {
   BackendModelInvocationRequest,
 } from '../backend/backend';
 import type { BackendModel } from '../backend/types';
+import { AUTO_MODEL_ID, AUTO_MODEL_PROVIDER_ID } from '../surfaces/vscode/model-catalog';
 import {
   createSessionModelProvider,
   SESSION_MODEL_CLEANUP_TIMEOUT_MS,
@@ -120,6 +121,37 @@ describe('session model provider', () => {
         capabilitiesRaw: { toolcall: false },
       }],
     });
+  });
+
+  it('treats the Auto selection as backend default when prompting', async () => {
+    let releaseEvent!: () => void;
+    const event = new Promise<void>(resolve => { releaseEvent = resolve; });
+    const stream = (async function* () {
+      await event;
+      yield { type: 'done' };
+    })();
+    const prompt = vi.fn(async (_id, _text, _directory, options) => {
+      expect(options.model).toBeUndefined();
+      releaseEvent();
+      return { data: true };
+    });
+    const modelBackend = backend({
+      sessions: { ...backend().sessions, prompt },
+      events: { ...backend().events, openSessionStream: vi.fn(() => ({ stream })) },
+      createPipeline: vi.fn(() => ({
+        run: vi.fn(async (events: AsyncIterable<unknown>) => {
+          for await (const _ of events) { /* drain */ }
+          return { completed: true, userMessageId: null, sessionTitle: null, sessionTitleSource: null, hadSubagentTasks: false };
+        }),
+      })),
+    });
+    const provider = createSessionModelProvider(modelBackend, 'opencode');
+
+    await provider.invoke(request({
+      model: { providerID: AUTO_MODEL_PROVIDER_ID, modelID: AUTO_MODEL_ID },
+    }));
+
+    expect(prompt).toHaveBeenCalledOnce();
   });
 
   it('opens the stream before prompting and runs pipeline and prompt concurrently', async () => {

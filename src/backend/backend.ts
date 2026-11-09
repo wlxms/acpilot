@@ -416,6 +416,14 @@ export interface Backend<TEvent = unknown> {
   permissions: BackendPermissionOperations;
   questions: BackendQuestionOperations;
 
+  /**
+   * Optional notification that a running backend's model capability catalog
+   * changed (for example, metadata arrived after initial discovery). A backend
+   * must not emit this for lifecycle transitions already covered by the host's
+   * backend-ready/models-changed events.
+   */
+  onDidChangeModelCatalog?(listener: () => void): () => void;
+
   /** Optional model catalog/invocation capability owned by this backend. */
   readonly modelProvider?: BackendModelProvider;
 

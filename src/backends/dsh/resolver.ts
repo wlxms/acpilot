@@ -112,6 +112,10 @@ export function resolveDshLaunch(
     return { kind: 'remote', url: commandEndpoint, source: 'command-endpoint' };
   }
 
+  if (isPathLike(command)) {
+    return createLocalResolution(command, args, target.launchCwd, platform, 'explicit');
+  }
+
   if (!isDefaultDshCommand(command)) {
     return createLocalResolution(command, args, target.launchCwd, platform, 'explicit');
   }
@@ -123,27 +127,7 @@ export function resolveDshLaunch(
     }
   }
 
-  const attempted: string[] = [`PATH:${command}`];
-  const pathExecutable = resolveExecutable(command, pathValue, platform);
-  if (pathExecutable) {
-    return createLocalResolution(pathExecutable, args, target.launchCwd, platform, 'path');
-  }
-
-  if (target.installDirectory) {
-    attempted.push('install directory node_modules/.bin/dsh');
-    const installedExecutable = resolveBinExecutable(target.installDirectory, command, platform);
-    if (installedExecutable) {
-      return createLocalResolution(
-        installedExecutable,
-        args,
-        target.launchCwd,
-        platform,
-        'install-directory',
-      );
-    }
-  }
-
-  attempted.push('project node_modules/.bin/dsh');
+  const attempted: string[] = ['project node_modules/.bin/dsh'];
   const projectExecutable = resolveProjectBinExecutable(target.launchCwd, command, platform);
   if (projectExecutable) {
     return createLocalResolution(projectExecutable, args, target.launchCwd, platform, 'project-bin');
@@ -165,6 +149,25 @@ export function resolveDshLaunch(
     attempted.push('package manager executable');
   }
 
+  if (target.installDirectory) {
+    attempted.push('install directory node_modules/.bin/dsh');
+    const installedExecutable = resolveBinExecutable(target.installDirectory, command, platform);
+    if (installedExecutable) {
+      return createLocalResolution(
+        installedExecutable,
+        args,
+        target.launchCwd,
+        platform,
+        'install-directory',
+      );
+    }
+  }
+
+  attempted.push(`PATH:${command}`);
+  const pathExecutable = resolveExecutable(command, pathValue, platform);
+  if (pathExecutable) {
+    return createLocalResolution(pathExecutable, args, target.launchCwd, platform, 'path');
+  }
   return unresolved(
     `Unable to resolve DSH command "${command}". Configure an explicit command, install DSH, `
       + 'or set an ACP endpoint for an already-running DSH service.',
@@ -229,9 +232,13 @@ function createLocalResolution(
     command,
     args,
     cwd,
-    shell: platform === 'win32',
+    shell: shouldUseWindowsShell(command, platform),
     source,
   };
+}
+
+function shouldUseWindowsShell(command: string, platform: NodeJS.Platform): boolean {
+  return platform === 'win32' && /\.(?:cmd|bat|ps1)$/i.test(command);
 }
 
 function isDefaultDshCommand(command: string): boolean {

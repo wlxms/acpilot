@@ -214,6 +214,19 @@ export class SelectionStore {
       }
     }
 
+    // --- Fall back to the first backend model ----------------------------
+    if (!model) {
+      const modelsResult = await this.backend.config.models();
+      const first = modelsResult.data?.find(candidate =>
+        typeof candidate.id === 'string'
+        && candidate.id.length > 0
+        && typeof candidate.provider === 'string'
+        && candidate.provider.length > 0);
+      if (first) {
+        model = { providerID: String(first.provider), modelID: String(first.id) };
+      }
+    }
+
     // --- Build & persist resolved state ----------------------------------
     this.state = { agent, model, permissionMode };
     this.persist();

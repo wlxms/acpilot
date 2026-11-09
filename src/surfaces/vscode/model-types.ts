@@ -15,6 +15,15 @@ export interface CopilotModelRegistration {
   readonly family?: string;
   readonly maxInputTokens: number;
   readonly maxOutputTokens: number;
+  /** Actual selectable reasoning levels. Absent means no reasoning control. */
+  readonly reasoning?: {
+    readonly current?: string;
+    readonly options: readonly {
+      readonly value: string;
+      readonly name: string;
+      readonly description?: string;
+    }[];
+  };
   readonly capabilities: LanguageModelChatCapabilities;
   /** Backend id that owns this registration. */
   readonly backendId: string;

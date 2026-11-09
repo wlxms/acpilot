@@ -155,6 +155,10 @@ export class ToolInvocationSSP extends SerializableStreamPart<
       return;
     }
 
+    // Keep the normal tool row visible and append the actionable failure detail
+    // directly beneath it. The row alone renders an edit as "Edited <file>",
+    // even when no file mutation occurred.
+
     // RUNNING / COMPLETED / ERROR: push or fallback
     const isError = status === 'error';
     const ToolInvocationPartCtor = VS.ChatToolInvocationPart;
@@ -162,6 +166,17 @@ export class ToolInvocationSSP extends SerializableStreamPart<
       this.pushToolInvocation(stream, effectiveCallId, toolName, state, isError);
     } else {
       this.renderFallback(stream, effectiveCallId, toolName, state, isError);
+    }
+
+    if (isError) {
+      const WarningPart = (vscode as unknown as {
+        ChatResponseWarningPart?: new (value: string) => unknown;
+      }).ChatResponseWarningPart;
+      if (WarningPart) {
+        stream.push(new WarningPart(formatToolFailureMessage(toolName, state.error ?? state.output)));
+      } else {
+        stream.progress(formatToolFailureMessage(toolName, state.error ?? state.output));
+      }
     }
   }
 
@@ -197,8 +212,12 @@ export class ToolInvocationSSP extends SerializableStreamPart<
     }
     this.nextRenderMode = undefined;
 
-    if (state.status === 'running' && this._progressivePushed) {
+    if (toolName === 'read' && state.status === 'completed' && this._progressivePushed) {
       this.updateToolInvocationMessage(stream, callId, toolName, state);
+      return;
+    }
+
+    if (state.status === 'running' && this._progressivePushed) {
       return;
     }
 
@@ -381,7 +400,7 @@ export class ToolInvocationSSP extends SerializableStreamPart<
     };
 
     if (toolName === 'read') {
-      const filePath = input?.filePath as string | undefined;
+      const filePath = (input?.filePath ?? input?.file_path ?? input?.path) as string | undefined;
       if (filePath) {
         const offset = input?.offset as number | undefined;
         const limit = input?.limit as number | undefined;
@@ -474,7 +493,7 @@ export class ToolInvocationSSP extends SerializableStreamPart<
     };
 
     if (toolName === 'read') {
-      const filePath = input?.filePath as string | undefined;
+      const filePath = (input?.filePath ?? input?.file_path ?? input?.path) as string | undefined;
       if (filePath) {
         const offset = input?.offset as number | undefined;
         const limit = input?.limit as number | undefined;
@@ -837,6 +856,11 @@ function isTransientFileTool(toolName: string): boolean {
     || toolName === 'internal'
     || toolName === 'step-start'
     || toolName === 'step-finish';
+}
+
+function formatToolFailureMessage(toolName: string, detail: string | undefined): string {
+  const normalized = String(detail ?? '').trim().replace(/^Error:\s*/iu, '');
+  return normalized ? `${toolName} failed: ${normalized}` : `${toolName} failed`;
 }
 
 function buildAttachedToolStreamData(subAgentInvocationId?: string): Record<string, unknown> {

@@ -25,12 +25,16 @@ export type SettingsMessage =
   | { type: 'saveBackendSettings'; values: Record<string, unknown> }
   | { type: 'setGlobalSetting'; key: string; value: boolean | string }
   | { type: 'setBackendTarget'; targetId: string }
+  | { type: 'setLogBackend'; backendId: string }
+  | { type: 'startBackend'; backendId?: string }
+  | { type: 'stopBackend'; backendId?: string }
   | { type: 'createAcpTarget'; name?: string; endpoint: string; authToken?: string }
   | { type: 'updateAcpTarget'; targetId: string; name?: string; endpoint: string; authToken?: string }
   | { type: 'deleteAcpTarget'; targetId: string }
   | { type: 'createDshTarget'; name?: string; command: string; args: string[]; launchCwd: string; endpoint?: string; installDirectory?: string; packageSpec?: string }
   | { type: 'updateDshTarget'; targetId: string; name?: string; command: string; args: string[]; launchCwd: string; endpoint?: string; installDirectory?: string; packageSpec?: string }
-  | { type: 'deleteDshTarget'; targetId: string }
+  | { type: 'startDsh'; targetId?: string; name?: string; command: string; args: string[]; launchCwd: string; endpoint?: string; installDirectory?: string; packageSpec?: string }
+  | { type: 'stopDsh' }
   | { type: 'installDsh'; targetId?: string; name?: string; command: string; args: string[]; launchCwd: string; endpoint?: string; installDirectory: string; packageSpec?: string }
   | { type: 'updateDsh'; targetId?: string; name?: string; command: string; args: string[]; launchCwd: string; endpoint?: string; installDirectory: string; packageSpec?: string }
   | { type: 'connectProvider'; providerId: string; apiKey: string; baseURL?: string; displayName?: string }
@@ -50,6 +54,9 @@ export interface BackendTargetItem {
   packageSpec?: string;
   active: boolean;
   editable: boolean;
+  backendId?: string;
+  running?: boolean;
+  status?: string;
 }
 
 export interface SettingsData {
@@ -90,6 +97,20 @@ export interface SettingsData {
   backendTargets?: BackendTargetItem[];
   /** Selected settings target; ACP sessions use the selected ACP target when kind='acp'. */
   activeBackendTargetId?: string;
+  /** Live runtime state for the selected backend settings page. */
+  backendRuntime?: {
+    backendId: string;
+    backendName: string;
+    running: boolean;
+    status: string;
+  };
+  /** Recent lines for the backend selected by the current settings view. */
+  backendLogs?: Array<{ backendId: string; backendName: string; lines: string[] }>;
+  /** Live DSH process state for the settings header. */
+  dshRuntime?: {
+    running: boolean;
+    status: string;
+  };
   /** DSH command configuration shown even before a target has been saved. */
   dshTarget?: {
     id?: string;
@@ -161,6 +182,10 @@ export class SettingsPanel {
 
   public postMessage(message: unknown): Thenable<boolean> {
     return this.panel.webview.postMessage(message);
+  }
+
+  public onDidDispose(listener: () => void): vscode.Disposable {
+    return this.panel.onDidDispose(listener);
   }
 
   public set onDidRequestChange(
@@ -652,6 +677,12 @@ export class SettingsPanel {
     .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
      textarea { width: 100%; resize: vertical; font: inherit; color: var(--input-fg); background: var(--input-bg); border: 1px solid var(--input-border); padding: 6px 8px; border-radius: 3px; }
      .dsh-status { margin-top: 10px; color: var(--muted); min-height: 18px; }
+     .backend-logs { max-width: 1000px; margin: 24px auto 0; }
+     .backend-log-tabs { display: flex; gap: 0; overflow-x: auto; border-bottom: 1px solid var(--border); }
+     .backend-log-tab { flex: 0 0 auto; padding: 6px 14px; color: var(--muted); background: transparent; border: 0; border-bottom: 2px solid transparent; cursor: pointer; font: inherit; font-size: 12px; }
+     .backend-log-tab:hover { color: var(--fg); background: var(--row-hover); }
+     .backend-log-tab.active { color: var(--fg); border-bottom-color: var(--accent); }
+     .backend-log-output { min-height: 120px; max-height: 260px; overflow: auto; margin: 0; padding: 10px; color: var(--fg); background: var(--input-bg); border: 1px solid var(--border); border-top: 0; white-space: pre-wrap; word-break: break-word; font: 11px/1.45 var(--vscode-editor-font-family); }
   </style>
 </head>
 <body>
@@ -661,7 +692,8 @@ export class SettingsPanel {
       <div class="toc-header">Settings</div>
       <div class="toc-item active" data-nav="global">Global</div>
       <div class="toc-item" data-nav="opencode">OpenCode</div>
-       <div class="toc-item" data-nav="dsh">DeepSeek Harness</div>
+      <div class="toc-item" data-nav="dsh">DeepSeek Harness</div>
+      <div class="toc-item hidden" id="toc-backend" data-nav="backend">Backend</div>
       <div class="toc-spacer"></div>
       <div class="toc-separator"></div>
       <button id="btn-acp-backend-add" class="toc-add-btn">+ ACP Backend</button>
@@ -744,6 +776,21 @@ export class SettingsPanel {
 
       <!-- ═══ OpenCode nav content ═══ -->
       <section id="nav-opencode" class="settings-body-inner hidden">
+        <div class="group-title">OpenCode</div>
+        <div class="card">
+          <div class="backend-target">
+            <div class="backend-target-main">
+              <div>
+                <div style="font-weight:600;" id="opencode-runtime-name">OpenCode</div>
+                <div class="backend-meta" id="opencode-runtime-status">Stopped</div>
+              </div>
+            </div>
+            <div class="modal-actions" style="margin:0;">
+              <button id="btn-opencode-start">Start OpenCode</button>
+              <button id="btn-opencode-stop" class="button-secondary">Stop</button>
+            </div>
+          </div>
+        </div>
         <div id="backend-settings-container">
           <div class="empty-state">Loading backend settings...</div>
         </div>
@@ -751,53 +798,101 @@ export class SettingsPanel {
 
       <!-- ═══ DeepSeek Harness nav content ═══ -->
       <section id="nav-dsh" class="settings-body-inner hidden">
-        <div class="group-title">DeepSeek Harness Runtime</div>
+        <div class="group-title">DeepSeek Harness</div>
         <div class="card">
-          <div class="desc">ACPilot launches the DSH command you configure here. The launch directory is the DSH process directory; the workspace directory is still sent separately in ACP session/new.</div>
+          <div class="backend-target">
+            <div class="backend-target-main">
+              <div>
+                <div style="font-weight:600;" id="dsh-runtime-title">DeepSeek Harness</div>
+                <div class="backend-meta" id="dsh-runtime-status">Stopped</div>
+              </div>
+            </div>
+            <div class="modal-actions" style="margin:0;">
+              <button id="btn-dsh-start">Start DSH</button>
+              <button id="btn-dsh-stop" class="button-secondary">Stop</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="group-title">Connection</div>
+        <div class="card">
           <input type="hidden" id="dsh-target-id">
           <div class="setting-item">
-            <div class="setting-label">Target name</div>
-            <div class="setting-desc">Display name in the backend target picker</div>
-            <div class="setting-control"><input type="text" id="dsh-target-name" placeholder="DeepSeek Harness"></div>
-          </div>
-          <div class="setting-item">
-            <div class="setting-label">DSH command</div>
-            <div class="setting-desc">Your own dsh executable, script, or wrapper command</div>
+            <div class="setting-label">Command</div>
+            <div class="setting-desc">The DSH executable or wrapper used for local stdio. The default <code>dsh</code> resolves from PATH, the install directory, or a project launcher.</div>
             <div class="setting-control"><input type="text" id="dsh-command" placeholder="dsh"></div>
           </div>
           <div class="setting-item">
-            <div class="setting-label">Running DSH ACP endpoint</div>
-            <div class="setting-desc">Optional ws:// or wss:// endpoint for a DSH ACP server that is already running. This connects directly and does not require a local DSH plugin. A plain dsh --profile acp process uses stdio and cannot be attached after it was started elsewhere.</div>
+            <div class="setting-label">Workspace / launch directory</div>
+            <div class="setting-desc">The DSH process working directory. The selected chat workspace is still sent separately when a session starts.</div>
+            <div class="setting-control setting-control-with-button"><input type="text" id="dsh-launch-cwd" placeholder="C:\\path\\to\\your\\dsh"><button type="button" id="btn-dsh-launch-cwd-browse" class="button-secondary">Browse</button></div>
+          </div>
+          <div class="setting-item">
+            <div class="setting-label">Remote ACP endpoint</div>
+            <div class="setting-desc">Optional. Connect to an already-running DSH ACP server instead of launching a local process.</div>
             <div class="setting-control"><input type="text" id="dsh-endpoint" placeholder="ws://127.0.0.1:4318"></div>
           </div>
-          <div class="setting-item">
-            <div class="setting-label">Arguments</div>
-            <div class="setting-desc">One argument per line. The official ACP profile is --profile acp.</div>
-            <div class="setting-control"><textarea id="dsh-args" rows="3" placeholder="--profile&#10;acp"></textarea></div>
-          </div>
-          <div class="setting-item">
-            <div class="setting-label">DSH launch directory</div>
-            <div class="setting-desc">Working directory used to start your DSH server</div>
-            <div class="setting-control setting-control-with-button"><input type="text" id="dsh-launch-cwd" placeholder="C:\\path\\to\\your\\dsh"><button type="button" id="btn-dsh-launch-cwd-browse" class="button-secondary">Select folder</button></div>
-          </div>
-          <div class="setting-item">
-            <div class="setting-label">Install directory</div>
-            <div class="setting-desc">Directory used by the Install and Update buttons</div>
-            <div class="setting-control setting-control-with-button"><input type="text" id="dsh-install-directory" placeholder="C:\\path\\to\\acpilot-dsh"><button type="button" id="btn-dsh-install-directory-browse" class="button-secondary">Select folder</button></div>
-          </div>
-          <div class="setting-item">
-            <div class="setting-label">Package spec</div>
-            <div class="setting-desc">npm package or version used by Install and Update</div>
-            <div class="setting-control"><input type="text" id="dsh-package-spec" placeholder="@deepseek-ai/dsh@latest"></div>
-          </div>
-          <div class="modal-actions">
-            <button id="btn-dsh-delete" class="button-secondary hidden" style="color:#f48771; border-color:#f48771;">Delete target</button>
-            <button id="btn-dsh-save" class="button-secondary">Save target</button>
-            <button id="btn-dsh-install">Install DSH</button>
-            <button id="btn-dsh-update">Update DSH</button>
-          </div>
-          <div id="dsh-status" class="dsh-status"></div>
         </div>
+
+        <details class="details-content">
+          <summary>Advanced</summary>
+          <div class="card">
+            <div class="setting-item">
+              <div class="setting-label">Target name</div>
+              <div class="setting-desc">Shown in the backend target picker.</div>
+              <div class="setting-control"><input type="text" id="dsh-target-name" placeholder="DeepSeek Harness"></div>
+            </div>
+            <div class="setting-item">
+              <div class="setting-label">Arguments</div>
+              <div class="setting-desc">One argument per line. The standard ACP profile is --profile acp.</div>
+              <div class="setting-control"><textarea id="dsh-args" rows="3" placeholder="--profile&#10;acp"></textarea></div>
+            </div>
+            <div class="setting-item">
+              <div class="setting-label">Install directory</div>
+              <div class="setting-desc">Used by Install and Update.</div>
+              <div class="setting-control setting-control-with-button"><input type="text" id="dsh-install-directory" placeholder="C:\\path\\to\\acpilot-dsh"><button type="button" id="btn-dsh-install-directory-browse" class="button-secondary">Browse</button></div>
+            </div>
+            <div class="setting-item">
+              <div class="setting-label">Package</div>
+              <div class="setting-desc">npm package or version used by Install and Update.</div>
+              <div class="setting-control"><input type="text" id="dsh-package-spec" placeholder="@deepseek-ai/dsh@latest"></div>
+            </div>
+          </div>
+        </details>
+
+        <div class="modal-actions">
+          <button id="btn-dsh-save" class="button-secondary">Save</button>
+          <button id="btn-dsh-install" class="button-secondary">Install</button>
+          <button id="btn-dsh-update" class="button-secondary">Update</button>
+        </div>
+        <div id="dsh-status" class="dsh-status"></div>
+      </section>
+
+      <!-- ═══ Generic backend nav content ═══ -->
+      <section id="nav-backend" class="settings-body-inner hidden">
+        <div class="group-title" id="generic-backend-name">Backend</div>
+        <div class="card">
+          <div class="backend-target">
+            <div class="backend-target-main">
+              <div>
+                <div style="font-weight:600;" id="generic-backend-runtime-name">Backend</div>
+                <div class="backend-meta" id="generic-backend-runtime-status">Stopped</div>
+              </div>
+            </div>
+            <div class="modal-actions" style="margin:0;">
+              <button id="btn-generic-backend-start">Start Backend</button>
+              <button id="btn-generic-backend-stop" class="button-secondary">Stop</button>
+            </div>
+          </div>
+        </div>
+        <div class="card" style="margin-top:12px;">
+          <div class="desc">Start this backend explicitly when you are ready to use it. Runtime diagnostics are shown in the Backend Logs tabs below.</div>
+        </div>
+      </section>
+      <section class="backend-logs" aria-label="Backend logs">
+        <div class="group-title">Backend Logs</div>
+        <div id="backend-log-tabs" class="backend-log-tabs"></div>
+        <pre id="backend-log-output" class="backend-log-output">No backend logs yet.</pre>
       </section>
     </main>
   </div>
@@ -912,6 +1007,11 @@ export class SettingsPanel {
         document.querySelectorAll('.toc-item').forEach(t => t.classList.remove('active'));
         item.classList.add('active');
         document.getElementById('nav-global').classList.toggle('hidden', nav !== 'global');
+        if (nav === 'opencode' || nav === 'dsh') {
+          vscode.postMessage({ type: 'setLogBackend', backendId: nav });
+        } else if (nav === 'backend' && currentData?.backendRuntime?.backendId) {
+          vscode.postMessage({ type: 'setLogBackend', backendId: currentData.backendRuntime.backendId });
+        }
         showNav(nav);
       });
     });
@@ -952,7 +1052,12 @@ export class SettingsPanel {
       openDshSettings();
     });
     document.getElementById('btn-dsh-save').addEventListener('click', saveDshSettings);
-    document.getElementById('btn-dsh-delete').addEventListener('click', deleteDshSettings);
+    document.getElementById('btn-dsh-start').addEventListener('click', startDshFromSettings);
+    document.getElementById('btn-opencode-start').addEventListener('click', () => requestBackendStart('opencode'));
+    document.getElementById('btn-opencode-stop').addEventListener('click', () => requestBackendStop('opencode'));
+    document.getElementById('btn-generic-backend-start').addEventListener('click', () => requestBackendStart(currentData?.backendRuntime?.backendId));
+    document.getElementById('btn-generic-backend-stop').addEventListener('click', () => requestBackendStop(currentData?.backendRuntime?.backendId));
+    document.getElementById('btn-dsh-stop').addEventListener('click', stopDshFromSettings);
     document.getElementById('btn-dsh-install').addEventListener('click', () => installDshFromSettings('installDsh'));
     document.getElementById('btn-dsh-update').addEventListener('click', () => installDshFromSettings('updateDsh'));
     document.getElementById('btn-dsh-launch-cwd-browse').addEventListener('click', () => requestDirectorySelection('launchCwd', 'dsh-launch-cwd'));
@@ -1010,8 +1115,26 @@ export class SettingsPanel {
         const inputId = msg.field === 'launchCwd' ? 'dsh-launch-cwd' : msg.field === 'installDirectory' ? 'dsh-install-directory' : undefined;
         const input = inputId ? document.getElementById(inputId) : undefined;
         if (input && typeof msg.value === 'string') input.value = msg.value;
+      } else if (msg.type === 'backendLogs') {
+        if (currentData) currentData.backendLogs = msg.logs || [];
+        renderBackendLogs(msg.logs || []);
+      } else if (msg.type === 'navigateSettings') {
+        if (msg.backendName) {
+          const toc = document.getElementById('toc-backend');
+          if (toc) toc.textContent = msg.backendName;
+        }
+        showNav(msg.nav || 'backend');
       } else if (msg.type === 'error') {
-        setDshStatus(msg.message || 'Request failed');
+        const message = msg.message || 'Request failed';
+        setDshStatus(message);
+        const genericStatus = document.getElementById('generic-backend-runtime-status');
+        if (genericStatus && currentData?.backendRuntime?.backendId !== 'dsh') {
+          genericStatus.textContent = 'Error: ' + message;
+        }
+        const opencodeStatus = document.getElementById('opencode-runtime-status');
+        if (opencodeStatus && currentData?.backendRuntime?.backendId === 'opencode') {
+          opencodeStatus.textContent = 'Error: ' + message;
+        }
       }
     });
 
@@ -1043,9 +1166,14 @@ export class SettingsPanel {
 
         const main = document.createElement('div');
         main.className = 'target-row-main';
+        const runtimeMeta = target.running
+          ? 'Running'
+          : target.status && target.status !== 'stopped'
+            ? target.status
+            : 'Stopped';
         main.innerHTML =
           '<div class="item-title">' + escapeHtml(target.name) + '</div>' +
-          '<div class="item-meta">' + escapeHtml(target.endpoint || target.description || '') + '</div>';
+          '<div class="item-meta">' + escapeHtml(target.endpoint || target.description || '') + ' · ' + runtimeMeta + '</div>';
         main.addEventListener('click', () => selectBackendTarget(target.id));
         row.appendChild(main);
 
@@ -1085,13 +1213,14 @@ export class SettingsPanel {
 
     function showNav(nav) {
       document.querySelectorAll('.toc-item').forEach(item => item.classList.toggle('active', item.dataset.nav === nav));
+      const genericToc = document.getElementById('toc-backend');
+      if (genericToc) genericToc.classList.toggle('hidden', nav !== 'backend');
       document.querySelectorAll('.settings-body-inner').forEach(section => section.classList.toggle('hidden', section.id !== 'nav-' + nav));
     }
 
     function selectBackendTarget(targetId) {
       vscode.postMessage({ type: 'setBackendTarget', targetId });
       document.getElementById('backend-chooser-modal').classList.add('hidden');
-      showNav(targetId.startsWith('dsh:') || targetId === 'builtin:dsh' ? 'dsh' : targetId.startsWith('builtin:opencode') ? 'opencode' : 'global');
     }
 
     function requestDirectorySelection(field, inputId) {
@@ -1103,7 +1232,6 @@ export class SettingsPanel {
       const value = target || currentData?.dshTarget || {};
       const targetId = value.id?.replace(/^dsh:/, '') || value.id || '';
       document.getElementById('dsh-target-id').value = targetId;
-      document.getElementById('btn-dsh-delete').classList.toggle('hidden', !targetId);
       document.getElementById('dsh-target-name').value = value.name || 'DeepSeek Harness';
       document.getElementById('dsh-command').value = value.command || 'dsh';
       document.getElementById('dsh-endpoint').value = value.endpoint || '';
@@ -1157,12 +1285,45 @@ export class SettingsPanel {
       setDshStatus('Saving DSH target...');
     }
 
-    function deleteDshSettings() {
-      const targetId = document.getElementById('dsh-target-id').value.trim();
-      if (!targetId || !confirm('Delete this DSH target?')) return;
-      vscode.postMessage({ type: 'deleteDshTarget', targetId });
-      fillDshSettings({});
-      setDshStatus('Deleting DSH target...');
+    function dshTargetMessage(type) {
+      const value = readDshSettings();
+      if (!value.command || !value.launchCwd) {
+        alert('DSH command and launch directory are required');
+        return undefined;
+      }
+      return {
+        type,
+        targetId: value.targetId,
+        name: value.name,
+        command: value.command,
+        args: value.args,
+        launchCwd: value.launchCwd,
+        endpoint: value.endpoint,
+        installDirectory: value.installDirectory || undefined,
+        packageSpec: value.packageSpec,
+      };
+    }
+
+    function startDshFromSettings() {
+      const message = dshTargetMessage('startDsh');
+      if (!message) return;
+      vscode.postMessage(message);
+      setDshStatus('Starting DSH...');
+    }
+
+    function stopDshFromSettings() {
+      vscode.postMessage({ type: 'stopDsh' });
+      setDshStatus('Stopping DSH...');
+    }
+
+    function requestBackendStart(backendId) {
+      if (!backendId) return;
+      vscode.postMessage({ type: 'startBackend', backendId });
+    }
+
+    function requestBackendStop(backendId) {
+      if (!backendId) return;
+      vscode.postMessage({ type: 'stopBackend', backendId });
     }
 
     function installDshFromSettings(operation) {
@@ -1232,6 +1393,89 @@ export class SettingsPanel {
         authToken: authToken || undefined,
       });
       closeAcpTargetModal();
+    }
+
+    function runtimeStatusLabel(runtime) {
+      if (!runtime) return 'Stopped';
+      if (runtime.running) return 'Running';
+      if (runtime.status === 'starting') return 'Starting...';
+      if (runtime.status === 'stopping') return 'Stopping...';
+      if (runtime.status === 'error') return 'Error';
+      return 'Stopped';
+    }
+
+    function renderRuntimeCard(runtime, nameId, statusId, startId, stopId, startLabel) {
+      if (!runtime) return;
+      const name = document.getElementById(nameId);
+      const status = document.getElementById(statusId);
+      const start = document.getElementById(startId);
+      const stop = document.getElementById(stopId);
+      if (name) name.textContent = runtime.backendName || 'Backend';
+      if (status) status.textContent = runtimeStatusLabel(runtime);
+      if (start) {
+        start.textContent = runtime.running ? 'Restart ' + (runtime.backendName || startLabel) : startLabel;
+        start.disabled = runtime.status === 'starting' || runtime.status === 'stopping';
+      }
+      if (stop) stop.disabled = !runtime.running && runtime.status !== 'starting';
+    }
+
+    function renderGenericBackend(data) {
+      const runtime = data?.backendRuntime;
+      const toc = document.getElementById('toc-backend');
+      const name = runtime?.backendName || data?.backendName || 'Backend';
+      if (toc) toc.textContent = name;
+      const heading = document.getElementById('generic-backend-name');
+      if (heading) heading.textContent = name;
+      renderRuntimeCard(runtime, 'generic-backend-runtime-name', 'generic-backend-runtime-status', 'btn-generic-backend-start', 'btn-generic-backend-stop', 'Start Backend');
+    }
+
+    function renderOpenCodeRuntime(data) {
+      renderRuntimeCard(data?.backendRuntime?.backendId === 'opencode' ? data.backendRuntime : undefined, 'opencode-runtime-name', 'opencode-runtime-status', 'btn-opencode-start', 'btn-opencode-stop', 'Start OpenCode');
+    }
+
+    function renderBackendLogs(logs) {
+      const tabs = document.getElementById('backend-log-tabs');
+      const output = document.getElementById('backend-log-output');
+      if (!tabs || !output) return;
+      const entries = Array.isArray(logs) ? logs : [];
+      const selectedId = tabs.dataset.selectedBackend || entries[0]?.backendId;
+      tabs.innerHTML = '';
+      if (entries.length === 0) {
+        output.textContent = 'No backend logs yet.';
+        tabs.dataset.selectedBackend = '';
+        return;
+      }
+      const selected = entries.some(entry => entry.backendId === selectedId) ? selectedId : entries[0].backendId;
+      tabs.dataset.selectedBackend = selected;
+      entries.forEach(entry => {
+        const tab = document.createElement('button');
+        tab.className = 'backend-log-tab' + (entry.backendId === selected ? ' active' : '');
+        tab.textContent = entry.backendName || entry.backendId;
+        tab.addEventListener('click', () => {
+          tabs.dataset.selectedBackend = entry.backendId;
+          renderBackendLogs(entries);
+        });
+        tabs.appendChild(tab);
+      });
+      const selectedEntry = entries.find(entry => entry.backendId === selected);
+      output.textContent = selectedEntry?.lines?.join('\\n') || 'No logs for this backend yet.';
+      output.scrollTop = output.scrollHeight;
+    }
+
+    function renderDshRuntime(data) {
+      const runtime = data?.dshRuntime || { running: false, status: 'stopped' };
+      const status = document.getElementById('dsh-runtime-status');
+      if (status) status.textContent = runtime.running
+        ? 'Running'
+        : runtime.status === 'starting'
+          ? 'Starting...'
+          : runtime.status === 'stopping'
+            ? 'Stopping...'
+            : 'Stopped';
+      const start = document.getElementById('btn-dsh-start');
+      if (start) start.textContent = runtime.running ? 'Restart DSH' : 'Start DSH';
+      const stop = document.getElementById('btn-dsh-stop');
+      if (stop) stop.disabled = !runtime.running && runtime.status !== 'starting';
     }
 
     function renderDshSettings(data) {
@@ -1349,7 +1593,11 @@ export class SettingsPanel {
 
       // Render backend-specific settings from descriptor (OpenCode nav)
       renderBackendSettings(data.backendSettings, data);
+      renderOpenCodeRuntime(data);
+      renderGenericBackend(data);
+      renderDshRuntime(data);
       renderDshSettings(data);
+      renderBackendLogs(data.backendLogs || []);
     }
 
     // =========================================================================

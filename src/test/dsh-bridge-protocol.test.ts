@@ -1,10 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import {
   DSH_BRIDGE_MARKER_PREFIX,
+  DSH_BRIDGE_CATALOG_PREFIX,
+  DSH_BRIDGE_DIAGNOSTIC_PREFIX,
   DSH_BRIDGE_TOOL_PREFIX,
   createDshBridgeLaunchNonce,
+  parseDshBridgeCatalogLine,
+  parseDshBridgeDiagnosticLine,
   parseDshBridgeReadyLine,
   parseDshBridgeToolLine,
+  serializeDshBridgeCatalog,
   serializeDshBridgeToolMessage,
 } from '../backends/dsh/bridge-protocol';
 
@@ -90,5 +95,47 @@ describe('DeepSeek Harness bridge protocol', () => {
     expect(parseDshBridgeToolLine(`${DSH_BRIDGE_TOOL_PREFIX}${JSON.stringify({
       type: 'tool_call', protocol: 1, sessionId: '', toolCallId: 'c', toolName: 'read',
     })}`)).toBeUndefined();
+  });
+
+  it('round-trips a model capability catalog with fixed context and reasoning levels', () => {
+    const catalog = {
+      protocol: 1 as const,
+      models: [{
+        provider: 'deepseek-official',
+        model: 'deepseek-v4-flash',
+        name: 'DeepSeek V4.1 Flash',
+        contextWindow: 1_000_000,
+        maxOutputTokens: 256_000,
+        reasoningEfforts: [
+          { value: 'off', name: 'Off' },
+          { value: 'high', name: 'High' },
+        ],
+        defaultReasoningEffort: 'high',
+      }],
+    };
+
+    const encoded = serializeDshBridgeCatalog(catalog);
+    expect(encoded.startsWith(DSH_BRIDGE_CATALOG_PREFIX)).toBe(true);
+    expect(parseDshBridgeCatalogLine(encoded)).toEqual(catalog);
+    expect(parseDshBridgeCatalogLine(`${DSH_BRIDGE_CATALOG_PREFIX}not-json`)).toBeUndefined();
+    expect(parseDshBridgeCatalogLine(`${DSH_BRIDGE_CATALOG_PREFIX}${JSON.stringify({ protocol: 2, models: [] })}`)).toBeUndefined();
+  });
+  it('parses bridge diagnostics without treating them as tool messages', () => {
+    const line = `${DSH_BRIDGE_DIAGNOSTIC_PREFIX}${JSON.stringify({
+      protocol: 1,
+      event: 'pre-execute.ask',
+      sessionId: 'session-1',
+      toolCallId: 'call-1',
+      toolName: 'edit',
+      card: 'diff',
+    })}`;
+    expect(parseDshBridgeDiagnosticLine(line)).toMatchObject({
+      protocol: 1,
+      event: 'pre-execute.ask',
+      toolCallId: 'call-1',
+      toolName: 'edit',
+    });
+    expect(parseDshBridgeToolLine(line)).toBeUndefined();
+    expect(parseDshBridgeDiagnosticLine(`${DSH_BRIDGE_DIAGNOSTIC_PREFIX}not-json`)).toBeUndefined();
   });
 });

@@ -48,7 +48,6 @@ import {
   loadDshTargetState,
   loadPersistedSettingsState,
   removeAcpTarget,
-  removeDshTarget,
   savePersistedSettingsState,
   setActiveAcpTarget,
   setActiveDshTarget,
@@ -56,6 +55,7 @@ import {
   upsertDshTarget,
 } from "./settings/state-persistence";
 import { AppEventBus } from "./backend/app-event-bus";
+import { BackendLogStore } from "./backend/log-store";
 import { SelectionStore } from "./backend/selection-store";
 import { SessionManager } from "./backend/session-manager";
 import { SessionStore } from "./backend/streaming/session-store";
@@ -340,10 +340,15 @@ function registerParticipant(
     registration.feedbackDisposable?.dispose();
   }
 
-  if (ctx.id === "opencode") {
+  const backendIcon = ctx.id === "opencode"
+    ? { light: "opencode-icon-light.svg", dark: "opencode-icon-dark.svg" }
+    : ctx.id === "dsh"
+      ? { light: "dsh-icon-light.svg", dark: "dsh-icon-dark.svg" }
+      : undefined;
+  if (backendIcon) {
     registration.participant.iconPath = {
-      light: vscode.Uri.joinPath(context.extensionUri, "resources", "opencode-icon-light.svg"),
-      dark: vscode.Uri.joinPath(context.extensionUri, "resources", "opencode-icon-dark.svg"),
+      light: vscode.Uri.joinPath(context.extensionUri, "resources", backendIcon.light),
+      dark: vscode.Uri.joinPath(context.extensionUri, "resources", backendIcon.dark),
     };
   }
 
@@ -401,6 +406,55 @@ function isDynamicAcpBackend(value: unknown): value is DynamicAcpBackend {
   );
 }
 
+interface BackendLoggerCap {
+  setLogger(logger: { appendLine(message: string): void }): void;
+}
+
+function attachBackendLogger(
+  backend: BackendContext["backend"],
+  backendId: string,
+  displayName: string,
+  outputChannel: vscode.OutputChannel,
+  backendLogs: BackendLogStore,
+): void {
+  const logger = (message: string): void => {
+    const line = `[${displayName}] ${message}`;
+    outputChannel.appendLine(line);
+    backendLogs.append(backendId, line);
+  };
+  const candidate = backend as unknown as Partial<BackendLoggerCap>;
+  if (typeof candidate.setLogger === "function") {
+    candidate.setLogger({ appendLine: logger });
+  }
+}
+
+function appendBackendLog(
+  s: ExtensionState,
+  backendId: string,
+  message: string,
+): void {
+  const ctx = s.backends.get(backendId);
+  const line = `[${ctx?.displayName ?? backendId}] ${message}`;
+  s.outputChannel.appendLine(line);
+  s.backendLogs?.append(backendId, line);
+}
+
+function backendLogSnapshot(
+  s: ExtensionState,
+  backendId: string,
+): SettingsData["backendLogs"] {
+  const ctx = s.backends.get(backendId);
+  if (!ctx) {
+    return [];
+  }
+  const snapshot = s.backendLogs?.snapshot(backendId) ?? {};
+  return [{
+    backendId: ctx.id,
+    backendName: ctx.displayName,
+    lines: snapshot[ctx.id] ?? [],
+  }];
+}
+
 async function resolveSelectedAcpBackendOptions(
   context: vscode.ExtensionContext,
 ): Promise<AcpBackendOptions | undefined> {
@@ -445,7 +499,12 @@ async function resolveSelectedDshBackendOptions(
       // wrapper, or modified package without installing anything into its
       // profile. Remote endpoints cannot receive a local patch and use ACP
       // events only.
-      args: appendDshBridgePatch(resolution.command, resolution.args, bridgePatchPath),
+      args: appendDshBridgePatch(
+        resolution.command,
+        resolution.args,
+        bridgePatchPath,
+        { shell: resolution.shell },
+      ),
       cwd: resolution.cwd,
       env: { ACPILOT_DSH_BRIDGE_NONCE: nonce },
       stderr: 'pipe',
@@ -472,25 +531,32 @@ function getBackendTargets(
       .map((ctx) => ({
         id: `builtin:${ctx.id}`,
         kind: "builtin" as const,
+        backendId: ctx.id,
         name: getContextDisplayName(ctx),
         description: ctx.id === "dsh"
           ? "Configure a user-owned DeepSeek Harness command"
           : `${getContextDisplayName(ctx)} backend`,
+        running: ctx.backend.isRunning(),
+        status: ctx.backend.getStatus(),
         active: activeId === `builtin:${ctx.id}`,
         editable: false,
       })),
     ...targetState.targets.map((target) => ({
       id: `acp:${target.id}`,
       kind: "acp" as const,
+      backendId: "acp",
       name: target.name,
       description: "Remote ACP endpoint",
       endpoint: target.endpoint,
+      running: s.backends.get("acp")?.backend.isRunning() ?? false,
+      status: s.backends.get("acp")?.backend.getStatus() ?? "stopped",
       active: activeId === `acp:${target.id}`,
       editable: true,
     })),
     ...dshTargetState.targets.map((target) => ({
       id: `dsh:${target.id}`,
       kind: "dsh" as const,
+      backendId: "dsh",
       name: target.name,
       description: target.endpoint
         ? `Connected ACP endpoint (${target.endpoint})`
@@ -501,6 +567,8 @@ function getBackendTargets(
       launchCwd: target.launchCwd,
       installDirectory: target.installDirectory,
       packageSpec: target.packageSpec,
+      running: s.backends.get("dsh")?.backend.isRunning() ?? false,
+      status: s.backends.get("dsh")?.backend.getStatus() ?? "stopped",
       active: activeId === `dsh:${target.id}`,
       editable: true,
     })),
@@ -647,6 +715,21 @@ function invalidateAcpBackendRuntime(
  * operation. A failed mutation still queues a restart so the old target is
  * restored and the context does not remain permanently invalidated.
  */
+function backendNeedsRestart(ctx: BackendContext | undefined): boolean {
+  return !!ctx && (ctx.backend.isRunning() || ctx.backend.getStatus() === "starting");
+}
+
+async function mutateAcpTargetIfRunning<T>(
+  s: ExtensionState,
+  context: vscode.ExtensionContext,
+  workspacePath: string | undefined,
+  mutation: () => Promise<T>,
+): Promise<T> {
+  return backendNeedsRestart(s.backends.get("acp"))
+    ? mutateAcpTarget(s, context, workspacePath, mutation)
+    : mutation();
+}
+
 async function mutateAcpTarget<T>(
   s: ExtensionState,
   context: vscode.ExtensionContext,
@@ -828,6 +911,17 @@ function invalidateDshBackendRuntime(
   return { context: dshCtx, generation };
 }
 
+async function mutateDshTargetIfRunning<T>(
+  s: ExtensionState,
+  context: vscode.ExtensionContext,
+  workspacePath: string | undefined,
+  mutation: () => Promise<T>,
+): Promise<T> {
+  return backendNeedsRestart(s.backends.get("dsh"))
+    ? mutateDshTarget(s, context, workspacePath, mutation)
+    : mutation();
+}
+
 async function mutateDshTarget<T>(
   s: ExtensionState,
   context: vscode.ExtensionContext,
@@ -976,6 +1070,178 @@ async function refreshStatusBar(
   }
 }
 
+
+function backendSettingsNav(backendId: string): string {
+  if (backendId === "opencode" || backendId === "dsh") {
+    return backendId;
+  }
+  return "backend";
+}
+
+function clearBackendModels(s: ExtensionState, ctx: BackendContext): void {
+  s.modelCatalog.clearBackend(ctx.id);
+  s.bus.emit("models-changed", { backendId: ctx.id });
+}
+
+async function startBackendExplicitly(
+  s: ExtensionState,
+  ctx: BackendContext,
+  context: vscode.ExtensionContext,
+  workspacePath: string | undefined,
+): Promise<void> {
+  if (!isCurrentState(s)) {
+    return;
+  }
+  const generation = beginBackendRuntimeTransition(ctx, s.bus);
+  clearBackendModels(s, ctx);
+  const isCurrentTransition = (): boolean =>
+    isCurrentState(s) && ctx.runtimeGeneration === generation;
+  ctx.acceptingRequests = false;
+  appendBackendLog(s, ctx.id, "start requested from Settings");
+  try {
+    if (ctx.backend.isRunning() || ctx.backend.getStatus() === "starting") {
+      await ctx.backend.stop();
+    }
+    if (!isCurrentTransition()) {
+      return;
+    }
+
+    if (ctx.id === "acp") {
+      const instanceKey = getAcpInstanceKey(context);
+      if (isDynamicAcpBackend(ctx.backend)) {
+        ctx.backend.setOptionsProvider(() => resolveSelectedAcpBackendOptions(context));
+      }
+      resetContextRuntime(ctx, context, workspacePath, instanceKey, s.bus);
+    } else if (ctx.id === "dsh") {
+      const instanceKey = getDshInstanceKey(context);
+      if (isDynamicAcpBackend(ctx.backend)) {
+        ctx.backend.setOptionsProvider(() => resolveSelectedDshBackendOptions(context));
+      }
+      resetContextRuntime(ctx, context, workspacePath, instanceKey, s.bus);
+    }
+
+    const result = await ctx.backend.start(workspacePath);
+    if (!isCurrentTransition()) {
+      if (!result.error) {
+        await ctx.backend.stop();
+      }
+      return;
+    }
+    if (result.error) {
+      const message = String(result.error);
+      appendBackendLog(s, ctx.id, `start failed: ${message}`);
+      s.statusBar.updateError(ctx.id, getContextDisplayName(ctx));
+      throw new Error(message);
+    }
+
+    await ctx.selection.resolveDefaults();
+    if (!isCurrentTransition()) {
+      return;
+    }
+    try {
+      await s.modelCatalog.refresh(workspacePath);
+    } catch (error) {
+      appendBackendLog(
+        s,
+        ctx.id,
+        `model catalog refresh failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    if (!isCurrentTransition()) {
+      clearBackendModels(s, ctx);
+      return;
+    }
+    await refreshStatusBar(ctx, s.statusBar);
+    appendBackendLog(s, ctx.id, `started${result.data?.url ? ` at ${result.data.url}` : ""}`);
+    s.bus.emit("backend-ready", { backendId: ctx.id });
+  } finally {
+    if (isCurrentState(s) && ctx.runtimeGeneration === generation) {
+      ctx.acceptingRequests = true;
+    }
+  }
+}
+
+async function stopBackendExplicitly(
+  s: ExtensionState,
+  ctx: BackendContext,
+): Promise<void> {
+  if (!isCurrentState(s)) {
+    return;
+  }
+  const generation = beginBackendRuntimeTransition(ctx, s.bus);
+  clearBackendModels(s, ctx);
+  ctx.acceptingRequests = false;
+  appendBackendLog(s, ctx.id, "stop requested from Settings");
+  try {
+    await ctx.backend.stop();
+    if (isCurrentState(s) && ctx.runtimeGeneration === generation) {
+      appendBackendLog(s, ctx.id, "stopped");
+      s.bus.emit("backend-ready", { backendId: ctx.id });
+    }
+  } finally {
+    if (isCurrentState(s) && ctx.runtimeGeneration === generation) {
+      ctx.acceptingRequests = true;
+    }
+  }
+}
+
+async function persistTargetWithoutStarting(
+  s: ExtensionState,
+  context: vscode.ExtensionContext,
+  workspacePath: string | undefined,
+  targetId: string,
+): Promise<BackendContext | undefined> {
+  const ctx = getSettingsBackendContext(s, targetId);
+  if (!ctx) {
+    return undefined;
+  }
+  const running = ctx.backend.isRunning() || ctx.backend.getStatus() === "starting";
+  if (targetId.startsWith("acp:")) {
+    const id = targetId.slice(4);
+    if (running) {
+      await mutateAcpTarget(s, context, workspacePath, () => setActiveAcpTarget(context, id));
+    } else {
+      await setActiveAcpTarget(context, id);
+      resetContextRuntime(ctx, context, workspacePath, getAcpInstanceKey(context), s.bus);
+      clearBackendModels(s, ctx);
+      ctx.acceptingRequests = true;
+    }
+  } else if (targetId.startsWith("dsh:")) {
+    const id = targetId.slice(4);
+    if (running) {
+      await mutateDshTarget(s, context, workspacePath, () => setActiveDshTarget(context, id));
+    } else {
+      await setActiveDshTarget(context, id);
+      resetContextRuntime(ctx, context, workspacePath, getDshInstanceKey(context), s.bus);
+      clearBackendModels(s, ctx);
+      ctx.acceptingRequests = true;
+    }
+  }
+  return ctx;
+}
+
+async function promptAndNavigateToBackendSettings(
+  panel: SettingsPanel,
+  ctx: BackendContext,
+): Promise<void> {
+  const running = ctx.backend.isRunning();
+  if (!running) {
+    const choice = await vscode.window.showInformationMessage(
+      `${ctx.displayName} is not running. Start it from its backend settings page.`,
+      { modal: true },
+      "Open settings",
+    );
+    if (choice !== "Open settings") {
+      return;
+    }
+  }
+  await panel.postMessage({
+    type: "navigateSettings",
+    nav: backendSettingsNav(ctx.id),
+    backendName: ctx.displayName,
+  });
+}
+
 export function activate(context: vscode.ExtensionContext) {
   // VS Code normally serializes activation, but a proposed chat-session
   // activation can overlap a reload-triggered activation in the same host.
@@ -995,6 +1261,7 @@ export function activate(context: vscode.ExtensionContext) {
 
   const statusBar = new StatusBarManager();
   const bus = new AppEventBus();
+  const backendLogs = new BackendLogStore();
   const workspacePath = getWorkspaceDirectory();
 
   // -- Assemble per-backend contexts in a loop --------------------------------
@@ -1021,6 +1288,9 @@ export function activate(context: vscode.ExtensionContext) {
     }
 
     const backend = desc.factory();
+    // Backend adapters are assembled before ExtensionState exists, so attach
+    // the shared diagnostics sink immediately after factory creation.
+    attachBackendLogger(backend, desc.id, desc.displayName, outputChannel, backendLogs);
     try {
       assertBuiltinBackendAssembly(desc, backend);
     } catch (error) {
@@ -1115,6 +1385,7 @@ export function activate(context: vscode.ExtensionContext) {
     modelCatalog,
     bus,
     outputChannel,
+    backendLogs,
     statusBar,
   };
 
@@ -1130,11 +1401,26 @@ export function activate(context: vscode.ExtensionContext) {
   const openSettingsCommand = vscode.commands.registerCommand(
     "acpilot.openSettings",
     async () => {
-      if (backends.size === 0) {
+      if (backends.size === 0 || !state) {
         return;
       }
+      const settingsState = state;
       const panel = SettingsPanel.createOrShow(context.extensionUri);
       let selectedTargetId = defaultSettingsTargetId;
+      let selectedLogBackendId =
+        getSettingsBackendContext(settingsState, selectedTargetId)?.id
+        ?? defaultBackendId
+        ?? "opencode";
+      const disposeLogListener = settingsState.backendLogs?.onChange(() => {
+        void panel.postMessage({
+          type: "backendLogs",
+          logs: backendLogSnapshot(settingsState, selectedLogBackendId),
+        });
+      });
+      const disposePanelLogListener = panel.onDidDispose(() => {
+        disposeLogListener?.();
+      });
+      context.subscriptions.push(disposePanelLogListener);
 
       // Wire up message handler
       panel.onDidRequestChange = async (message: SettingsMessage) => {
@@ -1149,6 +1435,17 @@ export function activate(context: vscode.ExtensionContext) {
 
         try {
           switch (message.type) {
+            case "setLogBackend": {
+              if (!s.backends.has(message.backendId)) {
+                return;
+              }
+              selectedLogBackendId = message.backendId;
+              await panel.postMessage({
+                type: "backendLogs",
+                logs: backendLogSnapshot(s, selectedLogBackendId),
+              });
+              break;
+            }
             case "ready":
             case "refreshData": {
               await pushDataToPanel(
@@ -1269,27 +1566,47 @@ export function activate(context: vscode.ExtensionContext) {
               );
               break;
             }
-            case "setBackendTarget": {
-              if (message.targetId.startsWith("acp:")) {
-                const targetId = message.targetId.slice(4);
-                await mutateAcpTarget(
-                  s,
-                  context,
-                  workspacePath,
-                  () => setActiveAcpTarget(context, targetId),
-                );
-              } else if (message.targetId.startsWith("dsh:")) {
-                const targetId = message.targetId.slice(4);
-                await mutateDshTarget(
-                  s,
-                  context,
-                  workspacePath,
-                  () => setActiveDshTarget(context, targetId),
-                );
+            case "startBackend": {
+              const backendId = message.backendId ?? selectedCtx.id;
+              const targetCtx = s.backends.get(backendId);
+              if (!targetCtx) {
+                throw new Error(`Backend "${backendId}" is not registered.`);
               }
+              const startOperation = startBackendExplicitly(s, targetCtx, context, workspacePath);
+              if (targetCtx.id === selectedCtx.id) {
+                await pushDataToPanel(s, targetCtx, panel, context, selectedTargetId);
+              }
+              try {
+                await startOperation;
+              } finally {
+                if (targetCtx.id === selectedCtx.id) {
+                  await pushDataToPanel(s, targetCtx, panel, context, selectedTargetId);
+                }
+              }
+              break;
+            }
+            case "stopBackend": {
+              const backendId = message.backendId ?? selectedCtx.id;
+              const targetCtx = s.backends.get(backendId);
+              if (!targetCtx) {
+                throw new Error(`Backend "${backendId}" is not registered.`);
+              }
+              await stopBackendExplicitly(s, targetCtx);
+              if (targetCtx.id === selectedCtx.id) {
+                await pushDataToPanel(s, targetCtx, panel, context, selectedTargetId);
+              }
+              break;
+            }
+            case "setBackendTarget": {
+              const nextCtx = await persistTargetWithoutStarting(
+                s,
+                context,
+                workspacePath,
+                message.targetId,
+              );
               selectedTargetId = message.targetId;
-              const nextCtx = getSettingsBackendContext(s, selectedTargetId);
               if (nextCtx) {
+                selectedLogBackendId = nextCtx.id;
                 s.statusBar.setActiveBackend(nextCtx.id);
                 await pushDataToPanel(
                   s,
@@ -1298,11 +1615,12 @@ export function activate(context: vscode.ExtensionContext) {
                   context,
                   selectedTargetId,
                 );
+                await promptAndNavigateToBackendSettings(panel, nextCtx);
               }
               break;
             }
             case "createAcpTarget": {
-              const createdTarget = await mutateAcpTarget(
+              const createdTarget = await mutateAcpTargetIfRunning(
                 s,
                 context,
                 workspacePath,
@@ -1319,6 +1637,7 @@ export function activate(context: vscode.ExtensionContext) {
               selectedTargetId = `acp:${createdTarget.id}`;
               const nextCtx = getSettingsBackendContext(s, selectedTargetId);
               if (nextCtx) {
+                selectedLogBackendId = nextCtx.id;
                 await pushDataToPanel(
                   s,
                   nextCtx,
@@ -1332,7 +1651,7 @@ export function activate(context: vscode.ExtensionContext) {
             case "updateAcpTarget": {
               const before = loadAcpTargetState(context);
               if (before.activeTargetId === message.targetId) {
-                await mutateAcpTarget(
+                await mutateAcpTargetIfRunning(
                   s,
                   context,
                   workspacePath,
@@ -1372,7 +1691,7 @@ export function activate(context: vscode.ExtensionContext) {
               const before = loadAcpTargetState(context);
               let nextTargetState;
               if (before.activeTargetId === message.targetId) {
-                nextTargetState = await mutateAcpTarget(
+                nextTargetState = await mutateAcpTargetIfRunning(
                   s,
                   context,
                   workspacePath,
@@ -1388,6 +1707,7 @@ export function activate(context: vscode.ExtensionContext) {
               }
               const nextCtx = getSettingsBackendContext(s, selectedTargetId);
               if (nextCtx) {
+                selectedLogBackendId = nextCtx.id;
                 await pushDataToPanel(
                   s,
                   nextCtx,
@@ -1399,7 +1719,7 @@ export function activate(context: vscode.ExtensionContext) {
               break;
             }
             case "createDshTarget": {
-              const createdTarget = await mutateDshTarget(
+              const createdTarget = await mutateDshTargetIfRunning(
                 s,
                 context,
                 workspacePath,
@@ -1420,6 +1740,7 @@ export function activate(context: vscode.ExtensionContext) {
               selectedTargetId = `dsh:${createdTarget.id}`;
               const nextCtx = getSettingsBackendContext(s, selectedTargetId);
               if (nextCtx) {
+                selectedLogBackendId = nextCtx.id;
                 s.statusBar.setActiveBackend(nextCtx.id);
                 await pushDataToPanel(s, nextCtx, panel, context, selectedTargetId);
               }
@@ -1438,7 +1759,7 @@ export function activate(context: vscode.ExtensionContext) {
                 packageSpec: message.packageSpec,
               };
               if (before.activeTargetId === message.targetId) {
-                await mutateDshTarget(
+                await mutateDshTargetIfRunning(
                   s,
                   context,
                   workspacePath,
@@ -1450,66 +1771,110 @@ export function activate(context: vscode.ExtensionContext) {
               await pushDataToPanel(s, selectedCtx, panel, context, selectedTargetId);
               break;
             }
-            case "deleteDshTarget": {
-              const before = loadDshTargetState(context);
-              let nextTargetState;
-              if (before.activeTargetId === message.targetId) {
-                nextTargetState = await mutateDshTarget(
-                  s,
-                  context,
-                  workspacePath,
-                  () => removeDshTarget(context, message.targetId),
-                );
-              } else {
-                nextTargetState = await removeDshTarget(context, message.targetId);
+            case "startDsh": {
+              const dshCtx = s.backends.get("dsh");
+              if (!dshCtx) {
+                throw new Error("DeepSeek Harness backend is not registered.");
               }
-              if (selectedTargetId === `dsh:${message.targetId}`) {
-                selectedTargetId = nextTargetState.activeTargetId
-                  ? `dsh:${nextTargetState.activeTargetId}`
-                  : `builtin:dsh`;
+              const input: DshTargetInput = {
+                id: message.targetId,
+                name: message.name,
+                command: message.command,
+                args: message.args,
+                launchCwd: message.launchCwd,
+                endpoint: message.endpoint,
+                installDirectory: message.installDirectory,
+                packageSpec: message.packageSpec,
+              };
+              const target = await upsertDshTarget(context, input, { makeActive: true });
+              selectedTargetId = `dsh:${target.id}`;
+              s.statusBar.setActiveBackend(dshCtx.id);
+              const startOperation = startBackendExplicitly(s, dshCtx, context, workspacePath);
+              await pushDataToPanel(s, dshCtx, panel, context, selectedTargetId);
+              try {
+                await startOperation;
+              } finally {
+                await pushDataToPanel(s, dshCtx, panel, context, selectedTargetId);
               }
-              const nextCtx = getSettingsBackendContext(s, selectedTargetId);
-              if (nextCtx) {
-                await pushDataToPanel(s, nextCtx, panel, context, selectedTargetId);
+              break;
+            }
+            case "stopDsh": {
+              const dshCtx = s.backends.get("dsh");
+              if (!dshCtx) {
+                throw new Error("DeepSeek Harness backend is not registered.");
               }
+              await stopBackendExplicitly(s, dshCtx);
+              await pushDataToPanel(s, dshCtx, panel, context, selectedTargetId);
               break;
             }
             case "installDsh":
             case "updateDsh": {
-              const installed = await installDsh({
-                installDirectory: message.installDirectory,
-                packageSpec: message.packageSpec,
-              });
-              const args = message.args.length > 0 ? message.args : defaultDshArgs();
-              const input: DshTargetInput = {
-                id: message.targetId,
-                name: message.name,
-                command: commandAfterDshInstall(
-                  message.command,
-                  installed.executable,
-                  message.targetId,
-                ),
-                args,
-                launchCwd: message.launchCwd,
-                endpoint: message.endpoint,
-                installDirectory: installed.installDirectory,
-                packageSpec: installed.packageSpec,
-              };
-              const target = await mutateDshTarget(
-                s,
-                context,
-                workspacePath,
-                () => upsertDshTarget(context, input, { makeActive: true }),
-              );
-              selectedTargetId = `dsh:${target.id}`;
-              const nextCtx = getSettingsBackendContext(s, selectedTargetId);
-              if (nextCtx) {
-                s.statusBar.setActiveBackend(nextCtx.id);
-                await pushDataToPanel(s, nextCtx, panel, context, selectedTargetId);
+              try {
+                appendBackendLog(
+                  s,
+                  "dsh",
+                  `${message.type === "installDsh" ? "install" : "update"} requested`
+                    + `: package=${message.packageSpec || "@deepseek-ai/dsh@latest"}`
+                    + ` installDirectory=${message.installDirectory}`,
+                );
+                const installed = await installDsh({
+                  installDirectory: message.installDirectory,
+                  packageSpec: message.packageSpec,
+                });
+                appendBackendLog(s, "dsh", installed.output.trim());
+                appendBackendLog(
+                  s,
+                  "dsh",
+                  `package operation completed: executable=${installed.executable}`,
+                );
+                const args = message.args.length > 0 ? message.args : defaultDshArgs();
+                const input: DshTargetInput = {
+                  id: message.targetId,
+                  name: message.name,
+                  command: commandAfterDshInstall(
+                    message.command,
+                    installed.executable,
+                    message.targetId,
+                  ),
+                  args,
+                  launchCwd: message.launchCwd,
+                  endpoint: message.endpoint,
+                  installDirectory: installed.installDirectory,
+                  packageSpec: installed.packageSpec,
+                };
+                const target = await mutateDshTargetIfRunning(
+                  s,
+                  context,
+                  workspacePath,
+                  () => upsertDshTarget(context, input, { makeActive: true }),
+                );
+                appendBackendLog(
+                  s,
+                  "dsh",
+                  `target saved: command=${input.command} launchDirectory=${input.launchCwd}`,
+                );
+                selectedTargetId = `dsh:${target.id}`;
+                const nextCtx = getSettingsBackendContext(s, selectedTargetId);
+                if (nextCtx) {
+                  selectedLogBackendId = nextCtx.id;
+                  s.statusBar.setActiveBackend(nextCtx.id);
+                  await pushDataToPanel(s, nextCtx, panel, context, selectedTargetId);
+                }
+                void vscode.window.showInformationMessage(
+                  message.type === "installDsh" ? "DeepSeek Harness installed." : "DeepSeek Harness updated.",
+                );
+              } catch (error) {
+                appendBackendLog(
+                  s,
+                  "dsh",
+                  `${message.type === "installDsh" ? "install" : "update"} failed: ${error instanceof Error ? error.message : String(error)}`,
+                );
+                const nextCtx = getSettingsBackendContext(s, selectedTargetId);
+                if (nextCtx) {
+                  await pushDataToPanel(s, nextCtx, panel, context, selectedTargetId);
+                }
+                throw error;
               }
-              void vscode.window.showInformationMessage(
-                message.type === "installDsh" ? "DeepSeek Harness installed." : "DeepSeek Harness updated.",
-              );
               break;
             }
             case "connectProvider": {
@@ -1958,6 +2323,17 @@ async function pushDataToPanel(
       globalSettings: readGlobalSettings(),
       backendTargets,
       activeBackendTargetId,
+      backendRuntime: {
+        backendId: ctx.id,
+        backendName: ctx.displayName,
+        running: ctx.backend.isRunning(),
+        status: ctx.backend.getStatus(),
+      },
+      backendLogs: backendLogSnapshot(s, ctx.id),
+      dshRuntime: {
+        running: s.backends.get("dsh")?.backend.isRunning() ?? false,
+        status: s.backends.get("dsh")?.backend.getStatus() ?? "stopped",
+      },
       dshTarget: getDshSettingsTarget(context, getWorkspaceDirectory()),
     };
 

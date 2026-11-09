@@ -162,7 +162,7 @@ async function waitForOpenCodeModels(port, trace) {
     }
     models = result;
     trace('listLanguageModels opencode result', { attempts, count: models.length });
-    if (models.length > 0) {
+    if (models.length > 0 && models.some(model => model.name !== 'Auto')) {
       return models;
     }
 
@@ -234,41 +234,40 @@ async function waitForOpenCodeModels(port, trace) {
       throw new Error('ACP model listing did not return an array');
     }
     const modelListings = {};
-    for (const backendId of ['opencode', 'acp', 'dsh', 'reasonix']) {
-      trace(`listLanguageModels ${backendId} start`);
-      const models = backendId === 'opencode'
-        ? await waitForOpenCodeModels(descriptor.port, trace)
-        : await execute(
-          descriptor.port,
-          `return await api.listLanguageModels(${JSON.stringify(backendId)});`,
-        );
-      if (!Array.isArray(models)) {
-        throw new Error(`${backendId} language-model listing did not return an array`);
+    // OpenCode is eager in this isolated host. DSH/ACP/Reasonix are lazily
+    // assembled and DSH requires a user-owned target, so a clean runtime can
+    // validate OpenCode's real picker path without depending on local setup.
+    const opencodeModels = await waitForOpenCodeModels(descriptor.port, trace);
+    if (!opencodeModels.some(model => model.name === 'Auto')) {
+      throw new Error('opencode language-model listing did not expose the Auto entry');
+    }
+    if (!opencodeModels.some(model => typeof model.maxInputTokens === 'number' && model.maxInputTokens > 0)) {
+      throw new Error('opencode language-model listing did not expose a fixed context window');
+    }
+    if (!opencodeModels.some(model => model.reasoning?.options?.length > 0)) {
+      throw new Error('opencode language-model listing did not expose model reasoning levels');
+    }
+    for (const model of opencodeModels) {
+      if (model.vendor !== 'opencode') {
+        throw new Error(`opencode language-model listing crossed vendor boundaries: ${model.vendor}`);
       }
-      trace(`listLanguageModels ${backendId} done`, { count: models.length });
-      const vendors = new Set(models.map(model => model.vendor));
-      if (vendors.size > 1) {
-        throw new Error(`${backendId} language-model listing crossed vendor boundaries`);
-      }
-      for (const model of models) {
       if (model.isUserSelectable === false) {
-        throw new Error(`${backendId} model ${model.id} is not user selectable`);
+        throw new Error(`opencode model ${model.id} is not user selectable`);
       }
-      if (model.targetChatSessionType !== `acpilot.${backendId}`) {
+      if (model.targetChatSessionType !== 'acpilot.opencode') {
         throw new Error(
-          `${backendId} Agent model ${model.id} is not restricted to its Chat Session `
+          `opencode Agent model ${model.id} is not restricted to its Chat Session `
             + `(target=${model.targetChatSessionType ?? 'none'})`,
         );
       }
       if (!model.capabilities || !model.capabilities.toolCalling) {
-        throw new Error(`${backendId} model ${model.id} is not eligible for Agent mode (toolCalling missing)`);
+        throw new Error(`opencode model ${model.id} is not eligible for Agent mode (toolCalling missing)`);
       }
       if (model.capabilities.agentMode !== true) {
-        throw new Error(`${backendId} Agent model ${model.id} does not advertise Agent mode`);
+        throw new Error(`opencode Agent model ${model.id} does not advertise Agent mode`);
       }
-      }
-      modelListings[backendId] = models;
     }
+    modelListings.opencode = opencodeModels;
     let titleGeneration;
     if (process.env.ACPILOT_RUNTIME_TITLE_GENERATION === '1') {
       titleGeneration = await execute(
@@ -281,7 +280,7 @@ async function waitForOpenCodeModels(port, trace) {
     }
     let modelRequest;
     if (process.env.ACPILOT_RUNTIME_MODEL_REQUEST === '1') {
-      const target = modelListings.opencode[0] || modelListings.acp[0] || modelListings.dsh[0] || modelListings.reasonix[0];
+      const target = modelListings.opencode[0];
       if (target) {
         const backendId = target.vendor === 'opencode' ? 'opencode'
           : target.vendor === 'acp' ? 'acp'

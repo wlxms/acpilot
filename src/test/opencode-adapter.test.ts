@@ -108,6 +108,41 @@ describe('OpenCodeBackend', () => {
     }
   });
 
+  it('maps provider model variants to selectable reasoning efforts', async () => {
+    const backend = new OpenCodeBackend();
+    await backend.start('D:\\Temp');
+    mockClient.config.providers.mockResolvedValueOnce({
+      data: {
+        providers: [{
+          id: 'opencode',
+          name: 'OpenCode',
+          models: {
+            'big-pickle': {
+              id: 'big-pickle',
+              name: 'Big Pickle',
+              variants: {
+                none: { reasoningEffort: 'none' },
+                high: { reasoningEffort: 'high' },
+              },
+            },
+          },
+        }],
+      },
+    });
+
+    const result = await backend.config.models('D:\\Temp');
+
+    expect(result.data?.[0]).toMatchObject({
+      id: 'big-pickle',
+      provider: 'opencode',
+      reasoningEfforts: [
+        { value: 'none', name: 'None' },
+        { value: 'high', name: 'High' },
+      ],
+      defaultReasoningEffort: 'high',
+    });
+  });
+
   it('stops model discovery when the captured runtime is stopped', async () => {
     const backend = new OpenCodeBackend();
     await backend.start('D:\\Temp');
@@ -261,6 +296,23 @@ describe('OpenCodeBackend', () => {
       directory: 'D:\\Temp',
       parts: [{ type: 'text', text: 'Use defaults' }],
     });
+  });
+
+  it('maps the generic reasoning effort option to the selected OpenCode variant', async () => {
+    const backend = new OpenCodeBackend();
+    await backend.start('D:\\Temp');
+    mockClient.session.promptAsync.mockResolvedValue({ data: null });
+
+    const result = await backend.sessions.prompt('ses_123', 'Think deeply', 'D:\\Temp', {
+      model: { providerID: 'opencode', modelID: 'big-pickle' },
+      modelOptions: { reasoningEffort: 'high' },
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(mockClient.session.promptAsync).toHaveBeenCalledWith(expect.objectContaining({
+      model: { providerID: 'opencode', modelID: 'big-pickle' },
+      variant: 'high',
+    }));
   });
 
   it('deletes a temporary session through the OpenCode session API', async () => {

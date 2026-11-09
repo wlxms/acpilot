@@ -200,6 +200,152 @@ describe('AcpBackend session capabilities', () => {
     ]);
   });
 
+  it('applies the requested reasoning effort through the advertised thought_level option', async () => {
+    const requests: Array<{ method: string; params: Record<string, unknown> }> = [];
+    const agentApp = agent({ name: 'test-agent' });
+    agentApp.onRequest(methods.agent.session.setConfigOption, ({ params }) => {
+      requests.push({ method: methods.agent.session.setConfigOption, params: params as never });
+      return {
+        configOptions: [
+          {
+            id: 'model',
+            name: 'Model',
+            category: 'model' as const,
+            type: 'select' as const,
+            currentValue: 'model-a',
+            options: [{ value: 'model-a', name: 'Model A' }],
+          },
+          {
+            id: 'reasoning_effort',
+            name: 'Reasoning effort',
+            category: 'thought_level' as const,
+            type: 'select' as const,
+            currentValue: 'high',
+            options: [
+              { value: 'low', name: 'Low' },
+              { value: 'high', name: 'High' },
+            ],
+          },
+        ],
+      };
+    });
+    const clientApp = client({ name: 'test-client' });
+    const connection = clientApp.connect(agentApp);
+    const prompt = vi.fn(async () => ({ stopReason: 'end_turn' }));
+    const backend = new AcpBackend({ name: 'acp' });
+    const internals = backend as unknown as {
+      activeSessions: Map<string, { prompt: typeof prompt }>;
+      clientConnection: typeof connection;
+      startGeneration: number;
+      status: 'running';
+      sessionConfigOptions: Map<string, unknown[]>;
+    };
+    internals.activeSessions.set('session-1', { prompt });
+    internals.clientConnection = connection;
+    internals.startGeneration = 0;
+    internals.status = 'running';
+    internals.sessionConfigOptions.set('session-1', [
+      {
+        id: 'model',
+        name: 'Model',
+        category: 'model',
+        type: 'select',
+        currentValue: 'model-a',
+        options: [{ value: 'model-a', name: 'Model A' }],
+      },
+      {
+        id: 'reasoning_effort',
+        name: 'Reasoning effort',
+        category: 'thought_level',
+        type: 'select',
+        currentValue: 'high',
+        options: [
+          { value: 'low', name: 'Low' },
+          { value: 'high', name: 'High' },
+        ],
+      },
+    ]);
+
+    const promptResult = await backend.sessions.prompt('session-1', 'hello', 'D:/workspace', {
+      model: { providerID: 'acp', modelID: 'model-a' },
+      modelOptions: { reasoningEffort: 'low' },
+    });
+    expect(promptResult).toEqual({ data: true });
+
+    expect(requests).toEqual([
+      {
+        method: methods.agent.session.setConfigOption,
+        params: {
+          sessionId: 'session-1',
+          configId: 'reasoning_effort',
+          value: 'low',
+        },
+      },
+    ]);
+    expect(prompt).toHaveBeenCalled();
+    connection.close();
+  });
+
+  it('rejects a reasoning effort the selected model does not advertise', async () => {
+    const setConfig = vi.fn();
+    const connection = { agent: { request: setConfig } } as never;
+    const prompt = vi.fn(async () => ({ stopReason: 'end_turn' }));
+    const backend = new AcpBackend({ name: 'acp' });
+    const internals = backend as unknown as {
+      activeSessions: Map<string, { prompt: typeof prompt }>;
+      clientConnection: typeof connection;
+      startGeneration: number;
+      status: 'running';
+      sessionConfigOptions: Map<string, unknown[]>;
+    };
+    internals.activeSessions.set('session-1', { prompt });
+    internals.clientConnection = connection;
+    internals.startGeneration = 0;
+    internals.status = 'running';
+    internals.sessionConfigOptions.set('session-1', [{
+      id: 'reasoning_effort',
+      name: 'Reasoning effort',
+      category: 'thought_level',
+      type: 'select',
+      currentValue: 'high',
+      options: [{ value: 'low', name: 'Low' }, { value: 'high', name: 'High' }],
+    }]);
+
+    await expect(backend.sessions.prompt('session-1', 'hello', 'D:/workspace', {
+      model: { providerID: 'acp', modelID: 'model-a' },
+      modelOptions: { reasoningEffort: 'max' },
+    })).resolves.toEqual({
+      error: 'Unsupported reasoning effort "max" for this model; expected one of: low, high.',
+    });
+    expect(setConfig).not.toHaveBeenCalled();
+    expect(prompt).not.toHaveBeenCalled();
+  });
+
+  it('rejects reasoning effort when the model has no thought_level option', async () => {
+    const prompt = vi.fn(async () => ({ stopReason: 'end_turn' }));
+    const backend = new AcpBackend({ name: 'acp' });
+    const internals = backend as unknown as {
+      activeSessions: Map<string, { prompt: typeof prompt }>;
+      clientConnection: { agent: { request: () => unknown } };
+      startGeneration: number;
+      status: 'running';
+      sessionConfigOptions: Map<string, unknown[]>;
+    };
+    internals.activeSessions.set('session-1', { prompt });
+    internals.clientConnection = { agent: { request: vi.fn() } };
+    internals.startGeneration = 0;
+    internals.status = 'running';
+    internals.sessionConfigOptions.set('session-1', []);
+
+    await expect(backend.sessions.prompt('session-1', 'hello', 'D:/workspace', {
+      model: { providerID: 'acp', modelID: 'model-a' },
+      modelOptions: { reasoningEffort: 'low' },
+    })).resolves.toEqual({
+      error: 'The selected model does not expose a reasoning effort option.',
+    });
+    expect(prompt).not.toHaveBeenCalled();
+  });
+
   it('returns an ACP prompt rejection to the caller', async () => {
     const backend = new AcpBackend({ name: 'acp' });
     const prompt = vi.fn(async () => {

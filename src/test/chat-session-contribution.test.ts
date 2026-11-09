@@ -112,4 +112,11 @@ describe('chat session contributions', () => {
       'scripts/',
     ]));
   });
+
+  it('ships a launcher that enables ACPilot proposed APIs', () => {
+    const launcher = readFileSync(join(process.cwd(), 'launch-acpilot-insiders.cmd'), 'utf8');
+
+    expect(launcher).toContain('--enable-proposed-api wlxms.acpilot');
+    expect(launcher).toContain('code-insiders.cmd');
+  });
 });

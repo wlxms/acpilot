@@ -7,6 +7,16 @@ export const DSH_BRIDGE_TOOL_PREFIX = 'ACPILOT_DSH_BRIDGE_TOOL\t';
 export const DSH_BRIDGE_DIAGNOSTIC_PREFIX = 'ACPILOT_DSH_BRIDGE_DIAGNOSTIC\t';
 /** One-shot model metadata emitted by the bridge after the DSH LLM service is ready. */
 export const DSH_BRIDGE_CATALOG_PREFIX = 'ACPILOT_DSH_BRIDGE_CATALOG\t';
+/** Desktop's saved selection is separate from model capability defaults. */
+export const DSH_DESKTOP_SAVED_SELECTION_PREFIX = 'ACPILOT_DSH_DESKTOP_SAVED_SELECTION\t';
+
+export interface DshDesktopSavedSelection {
+  protocol: typeof DSH_BRIDGE_PROTOCOL;
+  nonce: string;
+  provider: string;
+  model: string;
+  reasoningEffort: string;
+}
 
 export interface DshBridgeReady {
   plugin: typeof DSH_BRIDGE_PLUGIN_NAME;
@@ -69,6 +79,24 @@ export interface DshBridgeToolResultMessage {
 }
 
 export type DshBridgeToolMessage = DshBridgeToolCallMessage | DshBridgeToolResultMessage;
+
+/** Accept only bounded saved-selection fields from this exact local launch. */
+export function parseDshDesktopSavedSelectionLine(line: string, expectedNonce: string): DshDesktopSavedSelection | undefined {
+  if (!boundedSelectionField(expectedNonce, 128) || line.length > 4096 || !line.startsWith(DSH_DESKTOP_SAVED_SELECTION_PREFIX)) {return undefined;}
+  try {
+    const value = JSON.parse(line.slice(DSH_DESKTOP_SAVED_SELECTION_PREFIX.length)) as unknown;
+    if (!isRecord(value) || value.protocol !== DSH_BRIDGE_PROTOCOL || value.nonce !== expectedNonce
+      || !boundedSelectionField(value.provider, 1024) || !boundedSelectionField(value.model, 1024)
+      || !boundedSelectionField(value.reasoningEffort, 128)) {return undefined;}
+    return { protocol: DSH_BRIDGE_PROTOCOL, nonce: expectedNonce, provider: value.provider, model: value.model, reasoningEffort: value.reasoningEffort };
+  } catch {
+    return undefined;
+  }
+}
+
+function boundedSelectionField(value: unknown, maximum: number): value is string {
+  return nonEmptyString(value) && value.length <= maximum && Array.from(value).every(character => character.charCodeAt(0) >= 32 && character.charCodeAt(0) !== 127);
+}
 
 export function createDshBridgeLaunchNonce(): string {
   return randomUUID().replace(/-/g, '');

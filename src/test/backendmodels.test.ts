@@ -526,6 +526,42 @@ describe('Copilot model catalog single-vendor exposure', () => {
     expect(modelCatalog.resolve('opencode', 'opencode', 'opencode/shared-model', 'opencode')).toEqual({ kind: 'not-found' });
   });
 
+  it('distinguishes suppliers even when their model and provider display names match', async () => {
+    const catalog = createCopilotModelCatalog(makeOptions(new Map([
+      ['opencode', backendWithModels('opencode', [
+        { id: 'deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', provider: 'gateway-a', providerName: 'Gateway' },
+        { id: 'deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', provider: 'gateway-b', providerName: 'Gateway' },
+      ])],
+    ]), new Map([['opencode', 'opencode']])));
+    try {
+      await catalog.refresh();
+      expect(catalog.list().map(model => model.displayName)).toEqual([
+        'gateway-a: DeepSeek V4.1 Flash',
+        'gateway-b: DeepSeek V4.1 Flash',
+      ]);
+    } finally {
+      catalog.dispose();
+    }
+  });
+
+  it('uses the native model id when its display name is blank', async () => {
+    const catalog = createCopilotModelCatalog(makeOptions(new Map([
+      ['opencode', backendWithModels('opencode', [
+        { id: 'deepseek-v4.1-flash', name: '  ', provider: '  gateway-a  ' },
+        { id: 'deepseek-v4.1-pro', provider: 'gateway-b' },
+      ])],
+    ]), new Map([['opencode', 'opencode']])));
+    try {
+      await catalog.refresh();
+      expect(catalog.list().map(model => model.displayName)).toEqual([
+        'gateway-a: deepseek-v4.1-flash',
+        'gateway-b: deepseek-v4.1-pro',
+      ]);
+    } finally {
+      catalog.dispose();
+    }
+  });
+
   it('resolves a shared model within the requested backend', async () => {
     const sharedModel: BackendModel = { id: 'shared-model', name: 'Shared Model', provider: 'deepseek' };
     const modelCatalog = createCopilotModelCatalog(makeOptions(new Map([

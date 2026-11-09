@@ -15,6 +15,7 @@ export type DshLaunchSource =
   | 'target-endpoint'
   | 'command-endpoint'
   | 'environment-endpoint'
+  | 'desktop'
   | 'explicit'
   | 'path'
   | 'install-directory'
@@ -27,6 +28,12 @@ export interface DshLocalLaunchResolution {
   args: string[];
   cwd: string;
   shell: boolean;
+  /** Environment overrides required by a specialized launcher. */
+  env?: NodeJS.ProcessEnv;
+  /** Number of runtime arguments before DSH receives its launcher arguments. */
+  dshArgsStart?: number;
+  /** Desktop installation and shared configuration used by this launch. */
+  desktop?: { directory: string; home: string; cliEntry: string };
   source: Exclude<DshLaunchSource, 'target-endpoint' | 'command-endpoint' | 'environment-endpoint'>;
 }
 
@@ -86,11 +93,6 @@ export function resolveDshLaunch(
   const env = options.env ?? process.env;
   const platform = options.platform ?? process.platform;
   const pathValue = options.pathValue ?? getPathValue(env);
-  const commandTokens = tokenizeCommandLine(target.command);
-  const command = commandTokens[0]?.trim() ?? '';
-  const inlineArgs = commandTokens.slice(1);
-  const args = [...inlineArgs, ...target.args];
-
   if (target.endpoint !== undefined) {
     const endpoint = parseAcpEndpoint(target.endpoint);
     if (endpoint) {
@@ -100,6 +102,16 @@ export function resolveDshLaunch(
       'target.endpoint',
     ]);
   }
+
+  // A pasted Desktop path may contain spaces without command-line quotes.
+  // Resolve the complete selection before treating whitespace as arguments.
+  const desktopSelection = resolveDshDesktopLaunch(target.command.trim(), target.args, target.launchCwd, env, platform);
+  if (desktopSelection) { return desktopSelection; }
+
+  const commandTokens = tokenizeCommandLine(target.command);
+  const command = commandTokens[0]?.trim() ?? '';
+  const inlineArgs = commandTokens.slice(1);
+  const args = [...inlineArgs, ...target.args];
 
   if (!command) {
     return unresolved('DSH command is empty. Configure a DSH command or ACP endpoint.', [
@@ -111,6 +123,9 @@ export function resolveDshLaunch(
   if (commandEndpoint) {
     return { kind: 'remote', url: commandEndpoint, source: 'command-endpoint' };
   }
+
+  const desktopCommand = resolveDshDesktopLaunch(command, args, target.launchCwd, env, platform);
+  if (desktopCommand) { return desktopCommand; }
 
   if (isPathLike(command)) {
     return createLocalResolution(command, args, target.launchCwd, platform, 'explicit');
@@ -173,6 +188,64 @@ export function resolveDshLaunch(
       + 'or set an ACP endpoint for an already-running DSH service.',
     attempted,
   );
+}
+
+function resolveDshDesktopLaunch(
+  command: string,
+  args: readonly string[],
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform,
+): DshLocalLaunchResolution | DshUnresolvedLaunchResolution | undefined {
+  if (platform !== 'win32' || !isAbsolute(command)) { return undefined; }
+  const name = parse(command).base.toLowerCase();
+  let directory: string;
+  if (name === 'dsh desktop.exe') {
+    directory = dirname(command);
+  } else if (isDirectory(command)
+    && (name === 'dsh desktop' || isFile(join(command, 'DSH Desktop.exe')))) {
+    directory = command;
+  } else {
+    return undefined;
+  }
+
+  const executable = join(directory, 'DSH Desktop.exe');
+  const archive = join(directory, 'resources', 'app.asar');
+  if (!isFile(executable)) {
+    return unresolved('DSH Desktop executable was not found: ' + executable, [executable]);
+  }
+  // Electron exposes ASAR archives as virtual directories to extension hosts.
+  if (!isFile(archive) && !isDirectory(archive)) {
+    return unresolved('DSH Desktop bundled app.asar was not found: ' + archive, [archive]);
+  }
+  const appData = env.APPDATA?.trim();
+  const home = env.DSH_HOME?.trim() || (appData ? join(appData, 'dsh-desktop', 'harness') : undefined);
+  if (!home) {
+    return unresolved('DSH Desktop configuration home is unavailable. Set DSH_HOME or APPDATA.', ['DSH_HOME', 'APPDATA']);
+  }
+
+  // Electron can read this virtual path; the extension host's native fs cannot
+  // stat individual files inside app.asar.
+  const cliEntry = join(archive, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
+  return {
+    kind: 'local',
+    source: 'desktop',
+    command: executable,
+    args: ['--expose-internals', cliEntry, ...args],
+    cwd,
+    shell: false,
+    env: { ELECTRON_RUN_AS_NODE: '1', DSH_HOME: home },
+    dshArgsStart: 2,
+    desktop: { directory, home, cliEntry },
+  };
+}
+
+function isDirectory(path: string): boolean {
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 export function tokenizeCommandLine(value: string): string[] {

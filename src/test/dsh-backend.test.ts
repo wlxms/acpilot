@@ -25,7 +25,7 @@ describe('DshBackend', () => {
     expect(pipeline).toBeInstanceOf(DshPipeline);
   });
 
-  it('merges bridge model metadata into ACP discovery without changing models', async () => {
+  it('merges bridge model metadata into ACP discovery without changing native selectors', async () => {
     const backend = new DshBackend();
     const lines: string[] = [];
     backend.setLogger({ appendLine: message => lines.push(message) });
@@ -62,8 +62,9 @@ describe('DshBackend', () => {
     await expect(internals.configModels('D:/workspace')).resolves.toEqual({
       data: [{
         id: 'deepseek-v4-flash',
-        name: 'deepseek-v4-flash',
+        name: 'DeepSeek V4.1 Flash',
         provider: 'deepseek-official',
+        displayProviderID: 'deepseek-official',
         maxInputTokens: 1_000_000,
         maxOutputTokens: 256_000,
         reasoningEfforts: [
@@ -76,7 +77,7 @@ describe('DshBackend', () => {
     expect(lines).toContain('[dsh-backend] bridge.catalog models=1');
   });
 
-  it('maps opaque DSH ACP model values to bridge provider/model metadata', async () => {
+  it('keeps same-model opaque DSH routes distinct by supplier for display', async () => {
     const backend = new DshBackend();
     const internals = backend as unknown as {
       onLocalStderrLine(line: string): void;
@@ -87,33 +88,60 @@ describe('DshBackend', () => {
       'ACPILOT_DSH_BRIDGE_CATALOG\t'
         + JSON.stringify({
           protocol: 1,
-          models: [{
-            provider: 'deepseek-official',
-            model: 'deepseek-flash',
-            name: 'DeepSeek-V4-Flash',
-            contextWindow: 1_000_000,
-            maxOutputTokens: 256_000,
-            reasoningEfforts: [{ value: 'high', name: 'High' }],
-            defaultReasoningEffort: 'high',
-          }],
+          models: [
+            {
+              provider: 'deepseek-official',
+              model: 'deepseek-flash',
+              name: 'DeepSeek V4.1 Flash',
+              contextWindow: 1_000_000,
+              maxOutputTokens: 256_000,
+              reasoningEfforts: [{ value: 'high', name: 'High' }],
+              defaultReasoningEffort: 'high',
+            },
+            {
+              provider: 'oneai',
+              model: 'deepseek-flash',
+              name: 'DeepSeek V4.1 Flash',
+              contextWindow: 512_000,
+              maxOutputTokens: 128_000,
+            },
+          ],
         }),
     );
-    internals.getAdvertisedModels = () => [{
-      id: '["deepseek-official","deepseek-flash"]',
-      name: 'DeepSeek-V4-Flash',
-      provider: 'dsh',
-    }];
-
-    await expect(internals.configModels('D:/workspace')).resolves.toEqual({
-      data: [{
+    internals.getAdvertisedModels = () => [
+      {
         id: '["deepseek-official","deepseek-flash"]',
         name: 'DeepSeek-V4-Flash',
         provider: 'dsh',
-        maxInputTokens: 1_000_000,
-        maxOutputTokens: 256_000,
-        reasoningEfforts: [{ value: 'high', name: 'High' }],
-        defaultReasoningEffort: 'high',
-      }],
+      },
+      {
+        id: '["oneai","deepseek-flash"]',
+        name: 'DeepSeek-V4-Flash',
+        provider: 'dsh',
+      },
+    ];
+
+    await expect(internals.configModels('D:/workspace')).resolves.toEqual({
+      data: [
+        {
+          id: '["deepseek-official","deepseek-flash"]',
+          name: 'DeepSeek V4.1 Flash',
+          provider: 'dsh',
+          displayProviderID: 'deepseek-official',
+          maxInputTokens: 1_000_000,
+          maxOutputTokens: 256_000,
+          reasoningEfforts: [{ value: 'high', name: 'High' }],
+          defaultReasoningEffort: 'high',
+        },
+        {
+          id: '["oneai","deepseek-flash"]',
+          name: 'DeepSeek V4.1 Flash',
+          provider: 'dsh',
+          displayProviderID: 'oneai',
+          maxInputTokens: 512_000,
+          maxOutputTokens: 128_000,
+        },
+      ],
     });
   });
 

@@ -21,7 +21,7 @@ import {
   DEFAULT_DSH_PACKAGE_SPEC,
 } from "./backends/dsh/target";
 import { resolveDshLaunch } from "./backends/dsh/resolver";
-import { appendDshBridgePatch, ensureDshBridgePatch } from "./backends/dsh/bridge-launch";
+import { prepareDshLocalLaunch } from "./backends/dsh/launch";
 import {
   commandAfterDshInstall,
   defaultDshArgs,
@@ -54,6 +54,7 @@ import {
   upsertAcpTarget,
   upsertDshTarget,
 } from "./settings/state-persistence";
+import { repairMisplacedDshDesktopTarget } from "./settings/dsh-target-repair";
 import { AppEventBus } from "./backend/app-event-bus";
 import { BackendLogStore } from "./backend/log-store";
 import { SelectionStore } from "./backend/selection-store";
@@ -487,28 +488,15 @@ async function resolveSelectedDshBackendOptions(
     };
   }
   const nonce = createDshBridgeLaunchNonce();
-  const bridgePatchPath = await ensureDshBridgePatch({
+  const local = await prepareDshLocalLaunch(resolution, {
     modulePath: vscode.Uri.joinPath(context.extensionUri, 'dsh-bridge', 'index.mjs').fsPath,
     patchDirectory: join(context.globalStorageUri.fsPath, 'dsh'),
+    desktopLauncherPath: vscode.Uri.joinPath(context.extensionUri, 'dsh-bridge', 'desktop-launch.mjs').fsPath,
+    nonce,
   });
   return {
     local: {
-      command: resolution.command,
-      // Load the ACPilot bridge as the last DSH patch layer. The module is
-      // referenced by file URL, so this works with a user-owned DSH checkout,
-      // wrapper, or modified package without installing anything into its
-      // profile. Remote endpoints cannot receive a local patch and use ACP
-      // events only.
-      args: appendDshBridgePatch(
-        resolution.command,
-        resolution.args,
-        bridgePatchPath,
-        { shell: resolution.shell },
-      ),
-      cwd: resolution.cwd,
-      env: { ACPILOT_DSH_BRIDGE_NONCE: nonce },
-      stderr: 'pipe',
-      shell: resolution.shell,
+      ...local,
       onStderrLine: (line) => {
         // Consume only the ACPilot bridge marker as a recognized extension
         // signal. Ordinary DSH diagnostics remain out-of-band and are ignored.
@@ -1263,6 +1251,17 @@ export function activate(context: vscode.ExtensionContext) {
   const bus = new AppEventBus();
   const backendLogs = new BackendLogStore();
   const workspacePath = getWorkspaceDirectory();
+  const dshTargetRepair = repairMisplacedDshDesktopTarget(context, workspacePath)
+    .then((repaired) => {
+      if (repaired && isCurrentActivation(generation)) {
+        outputChannel.appendLine("[extension:dsh] DSH Desktop selected; repaired legacy launch target");
+      }
+    })
+    .catch(() => {
+      if (isCurrentActivation(generation)) {
+        outputChannel.appendLine("[extension:dsh] DSH Desktop target repair could not be saved; check DSH settings before the next reload");
+      }
+    });
 
   // -- Assemble per-backend contexts in a loop --------------------------------
   const backends = new Map<string, BackendContext>();
@@ -1305,7 +1304,10 @@ export function activate(context: vscode.ExtensionContext) {
       );
     }
     if (desc.id === "dsh" && isDynamicAcpBackend(backend)) {
-      backend.setOptionsProvider(() => resolveSelectedDshBackendOptions(context));
+      backend.setOptionsProvider(async () => {
+        await dshTargetRepair;
+        return resolveSelectedDshBackendOptions(context);
+      });
     }
     if (desc.id === "reasonix" && isDynamicAcpBackend(backend)) {
       backend.setOptionsProvider(() => {

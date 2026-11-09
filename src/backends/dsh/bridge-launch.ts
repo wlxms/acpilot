@@ -14,6 +14,8 @@ export interface DshBridgePatchOptions {
 export interface DshBridgeLaunchOptions {
   /** Quote generated arguments when the child is launched through cmd.exe. */
   shell?: boolean;
+  /** Runtime arguments that precede the DSH launcher arguments. */
+  dshArgsStart?: number;
 }
 
 /**
@@ -62,7 +64,13 @@ export function appendDshBridgePatch(
   patchPath: string,
   options: DshBridgeLaunchOptions = {},
 ): string[] {
-  const insertionIndex = dshLauncherPrefixLength(command, args);
+  const offset = options.dshArgsStart;
+  if (offset !== undefined && (!Number.isInteger(offset) || offset < 0 || offset > args.length)) {
+    throw new RangeError('DSH argument offset must be an integer within the launch arguments');
+  }
+  const insertionIndex = offset === undefined
+    ? dshLauncherPrefixLength(command, args)
+    : offset + directDshArgumentIndex(args.slice(offset));
   const launchPatchPath = options.shell
     ? quoteWindowsShellArgument(patchPath)
     : patchPath;

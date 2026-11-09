@@ -35,6 +35,8 @@ export interface BackendModel {
   name?: string;
   /** Provider ID (used for API calls) */
   provider?: string;
+  /** Supplier ID for model display when provider identifies a routing adapter. */
+  displayProviderID?: string;
   /** Human-readable provider name (used for UI only) */
   providerName?: string;
   /** Nested capability info: `input.image` indicates vision support */

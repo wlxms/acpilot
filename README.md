@@ -69,11 +69,24 @@ task / subagent      → 点击展开子代理完整对话
 在 `ACP: Open Settings` 的 **DeepSeek Harness** 页面中可以保存自己的 DSH target：
 
 - `DSH command`：用户自己的 `dsh` 可执行文件、脚本或 wrapper 命令
+- 也可以填写某份 **DSH Desktop** 的安装目录或 `DSH Desktop.exe` 路径；`Browse Desktop` 可选择安装目录。插件会用该 Desktop 内置的 DSH 启动 ACP 后端，共用 Desktop 保存的 Provider、模型、凭据和兼容的 profile 插件，新会话继承保存的默认模型及推理强度。Desktop 的界面插件会在 ACP 配置中停用；修改 Desktop 配置后，重启插件的 DSH 后端即可重新读取。
 - `DSH launch directory`：启动 DSH 进程时使用的工作目录，可指向用户魔改后的 DSH 源码目录
 - `Arguments`：逐行填写启动参数，默认使用 `--profile` 和 `acp`
 - `Install DSH` / `Update DSH`：使用用户本机的 npm，把 `@deepseek-ai/dsh@latest` 安装或更新到指定目录
 
 安装 DSH 后，首次安装会自动填入安装目录下的 launcher；已有 target 的更新操作会保留用户设置的 command，因此可以继续使用自己的 DSH server。DSH 进程启动目录和 ACP `session/new` 使用的 VS Code workspace 目录分别配置，互不覆盖。
+
+例如使用本机的 Desktop：
+
+```text
+Command: C:\Users\Administrator\AppData\Local\Programs\DSH Desktop
+Workspace / launch directory: D:\acpilot
+Arguments（每行一个）:
+--profile
+acp
+```
+
+Desktop 适配使用用户数据目录中的 `dsh-desktop/harness/profiles/web`（兼容旧版 `desktop` profile），并在 ACPilot 的存储目录中生成独立运行配置；Desktop 的源配置文件不会被覆盖。`Install directory` 仍用于 npm 的 Install / Update 操作，不需要填成 Desktop 安装目录。
 
 ACPilot 也附带了可选的 `dsh-bridge` 插件。普通 DSH ACP profile 不需要安装 bridge；安装后，DSH 工具可以通过 `presentCall` / `presentResult` 把终端、文件读取、搜索、diff 和 External Edit 信息交给 VS Code 渲染。插件安装到用户自己的 DSH profile，不会替换用户的 DSH 命令或启动目录。
 

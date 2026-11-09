@@ -311,4 +311,153 @@ describe('DSH launch resolver', () => {
     });
     expect(result.message).toContain('DSH');
   });
+
+  it.each([
+    { label: 'unquoted directory', selection: 'directory', quoted: false },
+    { label: 'quoted directory', selection: 'directory', quoted: true },
+    { label: 'unquoted executable', selection: 'executable', quoted: false },
+    { label: 'quoted executable', selection: 'executable', quoted: true },
+  ] as const)('launches a Desktop $label through its bundled CLI', ({ selection, quoted }) => {
+    const root = tempDirectory('acpilot-dsh-desktop-');
+    const directory = join(root, 'DSH Desktop');
+    const executable = join(directory, 'DSH Desktop.exe');
+    mkdirSync(join(directory, 'resources'), { recursive: true });
+    writeFileSync(executable, '');
+    writeFileSync(join(directory, 'resources', 'app.asar'), '');
+    const selectedPath = selection === 'directory' ? directory : executable;
+    const appData = join(root, 'Roaming App Data');
+
+    const result = resolveDshLaunch(createTarget({
+      command: quoted ? '"' + selectedPath + '"' : selectedPath,
+      launchCwd: root,
+    }), {
+      env: { APPDATA: appData },
+      platform: 'win32',
+      pathValue: '',
+    });
+
+    const cliEntry = join(directory, 'resources', 'app.asar', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
+    const home = join(appData, 'dsh-desktop', 'harness');
+    expect(result).toEqual({
+      kind: 'local',
+      source: 'desktop',
+      command: executable,
+      args: ['--expose-internals', cliEntry, '--profile', 'acp'],
+      cwd: root,
+      shell: false,
+      dshArgsStart: 2,
+      env: { ELECTRON_RUN_AS_NODE: '1', DSH_HOME: home },
+      desktop: { directory, home, cliEntry },
+    });
+  });
+
+  it('accepts the archive as a virtual directory in Electron extension hosts', () => {
+    const root = tempDirectory('acpilot-dsh-desktop-electron-');
+    const directory = join(root, 'DSH Desktop');
+    mkdirSync(join(directory, 'resources', 'app.asar'), { recursive: true });
+    writeFileSync(join(directory, 'DSH Desktop.exe'), '');
+
+    const result = resolveDshLaunch(createTarget({ command: directory, launchCwd: root }), {
+      env: { APPDATA: join(root, 'Roaming') }, platform: 'win32', pathValue: '',
+    });
+
+    expect(result).toMatchObject({ kind: 'local', source: 'desktop', shell: false });
+  });
+
+  it('preserves inline arguments after a quoted Desktop executable', () => {
+    const root = tempDirectory('acpilot-dsh-desktop-inline-');
+    const directory = join(root, 'DSH Desktop');
+    const executable = join(directory, 'DSH Desktop.exe');
+    mkdirSync(join(directory, 'resources'), { recursive: true });
+    writeFileSync(executable, '');
+    writeFileSync(join(directory, 'resources', 'app.asar'), '');
+    const home = join(root, 'shared home');
+
+    const result = resolveDshLaunch(createTarget({
+      command: '"' + executable + '" --profile custom',
+      args: ['--resume', 'session-1'],
+      launchCwd: root,
+    }), {
+      env: { DSH_HOME: '  ' + home + '  ', APPDATA: join(root, 'unused') },
+      platform: 'win32',
+      pathValue: '',
+    });
+
+    expect(result).toMatchObject({
+      command: executable,
+      args: [
+        '--expose-internals',
+        join(directory, 'resources', 'app.asar', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'),
+        '--profile', 'custom', '--resume', 'session-1',
+      ],
+      env: { ELECTRON_RUN_AS_NODE: '1', DSH_HOME: home },
+    });
+  });
+
+  it('keeps an explicitly selected Desktop ahead of project and PATH launchers', () => {
+    const root = tempDirectory('acpilot-dsh-desktop-priority-');
+    const directory = join(root, 'DSH Desktop');
+    const executable = join(directory, 'DSH Desktop.exe');
+    const projectBin = join(root, 'node_modules', '.bin');
+    mkdirSync(join(directory, 'resources'), { recursive: true });
+    mkdirSync(projectBin, { recursive: true });
+    writeFileSync(executable, '');
+    writeFileSync(join(directory, 'resources', 'app.asar'), '');
+    writeFileSync(join(projectBin, 'dsh.cmd'), '');
+
+    const result = resolveDshLaunch(createTarget({ command: directory, launchCwd: root }), {
+      env: { DSH_HOME: join(root, 'desktop-home') },
+      platform: 'win32',
+      pathValue: projectBin,
+    });
+
+    expect(result).toMatchObject({ source: 'desktop', command: executable });
+  });
+
+  it.each(['executable', 'archive'] as const)('rejects a Desktop installation missing its $0', (missing) => {
+    const root = tempDirectory('acpilot-dsh-desktop-missing-');
+    const directory = join(root, 'DSH Desktop');
+    mkdirSync(join(directory, 'resources'), { recursive: true });
+    if (missing !== 'executable') { writeFileSync(join(directory, 'DSH Desktop.exe'), ''); }
+    if (missing !== 'archive') { writeFileSync(join(directory, 'resources', 'app.asar'), ''); }
+
+    const result = resolveDshLaunch(createTarget({ command: directory, launchCwd: root }), {
+      env: { APPDATA: join(root, 'Roaming') },
+      platform: 'win32',
+      pathValue: '',
+    });
+
+    expect(result.kind).toBe('unresolved');
+    if (result.kind !== 'unresolved') { throw new Error('expected malformed Desktop to be unresolved'); }
+    expect(result.message).toContain(missing === 'executable' ? 'DSH Desktop.exe' : 'app.asar');
+  });
+
+  it('rejects a selected missing Desktop executable instead of launching it as a GUI', () => {
+    const root = tempDirectory('acpilot-dsh-desktop-missing-exe-');
+    const result = resolveDshLaunch(createTarget({
+      command: '"' + join(root, 'DSH Desktop.exe') + '"',
+      launchCwd: root,
+    }), { env: { DSH_HOME: join(root, 'home') }, platform: 'win32', pathValue: '' });
+
+    expect(result.kind).toBe('unresolved');
+  });
+
+  it('rejects a Desktop launch without its configuration home', () => {
+    const root = tempDirectory('acpilot-dsh-desktop-no-home-');
+    const directory = join(root, 'DSH Desktop');
+    mkdirSync(join(directory, 'resources'), { recursive: true });
+    writeFileSync(join(directory, 'DSH Desktop.exe'), '');
+    writeFileSync(join(directory, 'resources', 'app.asar'), '');
+
+    const result = resolveDshLaunch(createTarget({ command: directory, launchCwd: root }), {
+      env: { DSH_HOME: ' ', APPDATA: ' ' },
+      platform: 'win32',
+      pathValue: '',
+    });
+
+    expect(result.kind).toBe('unresolved');
+    if (result.kind !== 'unresolved') { throw new Error('expected missing Desktop home to be unresolved'); }
+    expect(result.message).toContain('DSH_HOME');
+    expect(result.message).toContain('APPDATA');
+  });
 });

@@ -267,8 +267,17 @@ export class AcpBackend implements Backend<ActiveSessionMessage> {
   }
 
   /** Called for every non-readiness stderr line while a local process is alive. */
-  protected onLocalStderrLine(_line: string): void {
+  protected onLocalStderrLine(_line: string, _launchEnv?: NodeJS.ProcessEnv): void {
     // Base ACP has no side channel.
+  }
+
+  /** Initialize only fresh sessions through standard advertised config options. */
+  protected async initializeNewSessionConfig(
+    options: SessionConfigOption[],
+    _setOption: (configId: string, value: string) => Promise<SessionConfigOption[]>,
+    _launchEnv?: NodeJS.ProcessEnv,
+  ): Promise<SessionConfigOption[]> {
+    return options;
   }
 
   /** Allow specialized adapters to report side-channel lifecycle diagnostics. */
@@ -354,8 +363,9 @@ export class AcpBackend implements Backend<ActiveSessionMessage> {
           const configuredOnStderrLine = configuredLocal.onStderrLine;
           configuredLocal.stderr = 'pipe';
           configuredLocal.onStderrLine = line => {
+            if (generation !== this.startGeneration || this.stopping) {return;}
             configuredOnStderrLine?.(line);
-            this.onLocalStderrLine(line);
+            this.onLocalStderrLine(line, configuredLocal.env);
           };
           const configuredOnExit = configuredLocal.onExit;
           configuredLocal.onExit = message => {
@@ -1225,6 +1235,7 @@ export class AcpBackend implements Backend<ActiveSessionMessage> {
       const connection = this.clientConnection;
       const generation = this.startGeneration;
       const capabilities = this.initializeResponse?.agentCapabilities?.sessionCapabilities;
+      const launchEnv = this.activeOptions?.local?.env;
       if (!connection || this.status !== 'running') {
         return { error: 'ACP backend not running' };
       }
@@ -1254,10 +1265,28 @@ export class AcpBackend implements Backend<ActiveSessionMessage> {
           }
           return { error: 'ACP backend stopped while creating session' };
         }
+        const configOptions = await this.initializeNewSessionConfig(
+          session.newSessionResponse.configOptions ?? [],
+          async (configId, value) => {
+            const response = await this.requestSessionConfigOption(session.sessionId, configId, value, connection, generation);
+            if (!this.isCurrentConnection(connection, generation)) {
+              throw new Error('ACP backend changed while initializing session configuration');
+            }
+            return response.configOptions;
+          },
+          launchEnv,
+        );
+        if (!this.isCurrentConnection(connection, generation) || this.status !== 'running') {
+          session.dispose();
+          if (opts?.transient) {
+            await this.cleanupTransientSessions(connection, [session.sessionId], capabilities);
+          }
+          return { error: 'ACP backend stopped while creating session' };
+        }
         this.activeSessions.set(session.sessionId, session);
         this.sessionActivationEpochs.delete(session.sessionId);
         this.sessionDirectories.set(session.sessionId, opts?.directory ?? process.cwd());
-        this.sessionConfigOptions.set(session.sessionId, session.newSessionResponse.configOptions ?? []);
+        this.sessionConfigOptions.set(session.sessionId, configOptions);
         if (opts?.transient) {
           // Create the keyed state before publishing the marker so a concurrent
           // stop/release/delete sees the same remote identity immediately.
@@ -1888,8 +1917,8 @@ export class AcpBackend implements Backend<ActiveSessionMessage> {
     connection: ClientConnection,
     generation: number,
   ): Promise<void> {
-    if (typeof effort !== 'string' || effort.length === 0) {
-      throw new Error('Invalid reasoning effort: expected a non-empty string.');
+    if (typeof effort !== 'string') {
+      throw new Error('Invalid reasoning effort: expected a string.');
     }
     const options = this.sessionConfigOptions.get(sessionId) ?? [];
     const selector = options.find(option => option.type === 'select' && option.category === 'thought_level');

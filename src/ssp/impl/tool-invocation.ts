@@ -50,6 +50,7 @@ import type {
   ChatToolInvocationPart,
 } from '../../types/vscode-proposed-additions';
 import { ChatTodoStatus } from '../../types/vscode-proposed-additions';
+import { buildDshTeamToolPresentation } from './dsh-team-tools';
 
 // ---------------------------------------------------------------------------
 // Proposed vscode type accessor (runtime may not have these)
@@ -70,6 +71,10 @@ type ProposedVscode = typeof vscode & {
 };
 
 const VS = vscode as ProposedVscode;
+
+function isDshTodoToolName(toolName: string): boolean {
+  return toolName === 'todo_write' || toolName === 'Update todo list';
+}
 
 // ---------------------------------------------------------------------------
 // ToolInvocationSSP
@@ -122,7 +127,17 @@ export class ToolInvocationSSP extends SerializableStreamPart<
     if (data.state) {
       this.payload.state = { ...this.payload.state, ...data.state };
     }
-    if (data.toolName !== undefined) {this.payload.toolName = data.toolName;}
+    if (data.toolName !== undefined) {
+      const becomesSubagent = (data.toolName === 'subagent' || data.toolName === 'task')
+        && this.payload.toolName !== 'subagent' && this.payload.toolName !== 'task';
+      this.payload.toolName = data.toolName;
+      if (becomesSubagent) {
+        // A generic ACP row may already be running when delegation starts.
+        // Republish the same call with native subagent data before completion.
+        this._progressivePushed = false;
+        this.nextRenderMode = undefined;
+      }
+    }
     if (data.callId !== undefined) {this.payload.callId = data.callId;}
     if (data.messageId !== undefined) {this.payload.messageId = data.messageId;}
     if (data.sessionId !== undefined) {this.payload.sessionId = data.sessionId;}
@@ -134,7 +149,10 @@ export class ToolInvocationSSP extends SerializableStreamPart<
    * Routes to pushToolInvocation (proposed API) or renderFallback.
    */
   render(stream: SspStream): void {
-    const { callId, toolName, state } = this.payload;
+    const { callId, toolName: backendToolName, state } = this.payload;
+    // DSH uses its registered name on ACP and its presenter title in older
+    // streams. Keep the source name in the payload while rendering native todos.
+    const toolName = isDshTodoToolName(backendToolName) ? 'todo' : backendToolName;
     const effectiveCallId = callId ?? this.payload.partId;
     if (!effectiveCallId) {return;}
 
@@ -246,7 +264,7 @@ export class ToolInvocationSSP extends SerializableStreamPart<
           const msg = this.formatInvocationMsg(toolName, input, title);
           part.invocationMessage = typeof msg === 'string' ? msg : msg.value;
         } else {
-          const pastMsg = this.formatPastTenseMsg(toolName, title, state.startTime, state.endTime, input);
+          const pastMsg = this.formatPastTenseMsg(toolName, title, state.startTime, state.endTime, input, isError);
           part.pastTenseMessage = typeof pastMsg === 'string' ? pastMsg : pastMsg.value;
         }
         if (state.metadata?.presentation === 'system') {
@@ -255,7 +273,7 @@ export class ToolInvocationSSP extends SerializableStreamPart<
       }
 
       // Contract C4: toolSpecificData mapping
-      const specific = this.buildToolSpecificData(toolName, input, output, title, state.metadata);
+      const specific = this.buildToolSpecificData(toolName, input, output, title, state.metadata, state.status);
       if (specific) {
         part.toolSpecificData = specific as any;
       }
@@ -356,13 +374,14 @@ export class ToolInvocationSSP extends SerializableStreamPart<
       }
       const pastMsg = state.metadata?.presentation === 'system'
         ? title
-        : this.formatPastTenseMsg(toolName, title, state.startTime, state.endTime, input);
+        : this.formatPastTenseMsg(toolName, title, state.startTime, state.endTime, input, isError);
+      const team = buildDshTeamToolPresentation(state);
       try {
         stream.updateToolInvocation?.(callId, {
           pastTenseMessage: typeof pastMsg === 'string' ? pastMsg : pastMsg.value,
           invocationMessage: state.metadata?.presentation === 'system'
             ? title
-            : isError ? `✗ ${toolName}` : `✓ ${toolName}`,
+            : team?.pastTenseMessage ?? (isError ? `✗ ${toolName}` : `✓ ${toolName}`),
           isAttachedToThinking: true,
         } as any);
       } catch { /* ignore */ }
@@ -382,13 +401,15 @@ export class ToolInvocationSSP extends SerializableStreamPart<
     input: Record<string, unknown>,
     title: string,
   ): string | vscode.MarkdownString {
+    const team = buildDshTeamToolPresentation({ ...this.payload.state, input });
+    if (team) {return team.invocationMessage;}
     const formatFileBubbleMessage = (
       verb: 'Read' | 'Editing' | 'Writing',
       filePath: string,
       offset?: number,
       limit?: number,
     ): vscode.MarkdownString => {
-      const uri = vscode.Uri.file(filePath).toString().toLowerCase();
+      const uri = vscode.Uri.file(filePath).toString();
       const range = offset !== undefined || limit !== undefined
         ? (() => {
             const start = offset ?? 1;
@@ -463,10 +484,14 @@ export class ToolInvocationSSP extends SerializableStreamPart<
     timeStart?: number,
     timeEnd?: number,
     input?: Record<string, unknown>,
+    isError = false,
   ): string | vscode.MarkdownString {
     const duration = (timeStart !== undefined && timeEnd !== undefined)
       ? ` (${((timeEnd - timeStart) / 1000).toFixed(1)}s)`
       : '';
+
+    const team = buildDshTeamToolPresentation({ ...this.payload.state, input: input ?? {} });
+    if (team) {return team.pastTenseMessage + duration;}
 
     const formatFileBubbleMessage = (
       verb: 'Read' | 'Edited' | 'Wrote',
@@ -475,7 +500,7 @@ export class ToolInvocationSSP extends SerializableStreamPart<
       limit?: number,
       suffix = '',
     ): vscode.MarkdownString => {
-      const uri = vscode.Uri.file(filePath).toString().toLowerCase();
+      const uri = vscode.Uri.file(filePath).toString();
       const range = offset !== undefined || limit !== undefined
         ? (() => {
             const start = offset ?? 1;
@@ -528,7 +553,8 @@ export class ToolInvocationSSP extends SerializableStreamPart<
       const short = pattern.length > 60 ? pattern.substring(0, 57) + '...' : pattern;
       return `Globbed \`${short}\`${duration}`;
     } else if (toolName === 'todo') {
-      return `Updated todos${duration}`;
+      return isError && isDshTodoToolName(this.payload.toolName)
+        ? `Todo update failed${duration}` : `Updated todos${duration}`;
     } else if (toolName === 'websearch' || toolName === 'websearch_web_search_exa') {
       const query = (input?.query as string) ?? title;
       if (query) {
@@ -554,7 +580,10 @@ export class ToolInvocationSSP extends SerializableStreamPart<
     output: string,
     title: string,
     metadata?: Record<string, unknown>,
+    status?: SerializableToolState['status'],
   ): ChatTerminalToolInvocationData | ChatSimpleToolResultData | ChatToolResourcesInvocationData | (ChatSubagentToolInvocationData & { kind?: 'subagent' }) | ChatTodoToolInvocationData | undefined {
+    const team = buildDshTeamToolPresentation({ ...this.payload.state, input, output, metadata, status: status ?? this.payload.state.status });
+    if (team) {return team.data;}
     const formatInput = (data: Record<string, unknown>, fallbackTitle: string): string => {
       const keys = Object.keys(data);
       if (keys.length === 0) {return fallbackTitle;}
@@ -590,7 +619,20 @@ export class ToolInvocationSSP extends SerializableStreamPart<
         state: exitCode !== undefined ? { exitCode } : undefined,
       } satisfies ChatTerminalToolInvocationData;
     }
-    if (dshPresentation?.card === 'search' || dshPresentation?.card === 'read') {
+    const searchOrigin = metadata?.dshToolName ?? this.payload.state.originalToolName ?? toolName;
+    const isFilesystemSearch = searchOrigin === 'glob' || searchOrigin === 'grep' || searchOrigin === 'list';
+    if (dshPresentation?.card === 'search'
+      || (dshPresentation?.card === 'generic' && dshPresentation.kind === 'search' && isFilesystemSearch)) {
+      const values = buildDshResourceValues(dshPresentation);
+      if (values.length > 0) {return { values } satisfies ChatToolResourcesInvocationData;}
+      // A filesystem search scope is an argument, not a matched file. Web
+      // search also uses generic.kind=search and keeps its native URL branch.
+      return status === 'running' || status === 'pending' ? undefined : {
+        input: formatInput(input, title),
+        output: truncate(output, 2000),
+      } satisfies ChatSimpleToolResultData;
+    }
+    if (dshPresentation?.card === 'read') {
       const values = buildDshResourceValues(dshPresentation);
       if (values.length > 0) {return { values } satisfies ChatToolResourcesInvocationData;}
     }
@@ -692,6 +734,13 @@ export class ToolInvocationSSP extends SerializableStreamPart<
 
       case 'todo':
       case 'todowrite': {
+        // DSH validates and commits its whole list during execution. Only its
+        // successful result may update VS Code's persistent session todo widget.
+        if (isDshTodoToolName(this.payload.toolName) && status !== 'completed') {
+          return status === 'error'
+            ? { input: formatInput(input, title), output: truncate(output, 2000) } satisfies ChatSimpleToolResultData
+            : undefined;
+        }
         // Parse todo items from tool input (todos array).
         const todos = input.todos as Array<{ content: string; status: string }> | undefined;
         if (todos && Array.isArray(todos)) {

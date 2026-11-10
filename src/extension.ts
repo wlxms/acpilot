@@ -71,6 +71,7 @@ import type { DshTargetInput } from "./backends/dsh/target";
 import { startRuntimeTestControlServer } from "./test-control/server";
 import { createRuntimeTestApi } from "./test-control/runtime-api";
 import { beginBackendRuntimeTransition } from "./runtime/backend-transition";
+import { registerDshRenderHost } from "./chat-rendering/host";
 
 export async function chooseDshDirectory(
   field: DirectoryField,
@@ -1246,6 +1247,7 @@ export function activate(context: vscode.ExtensionContext) {
   deactivating = false;
   const outputChannel = vscode.window.createOutputChannel("ACPilot");
   outputChannel.appendLine("[extension] ACPilot activating...");
+  registerDshRenderHost(context);
 
   const statusBar = new StatusBarManager();
   const bus = new AppEventBus();

@@ -14,11 +14,14 @@ import {
   type StreamPartRecord,
   type AnySerializableStreamPart,
   type SerializableToolState,
+  type ToolInvocationStreamPartPayload,
   isMutableKind,
 } from '../../ssp/types';
 import type { FileSnapshotRecord } from '../../ssp/types';
 import { parseLine } from '../serializable/serializer';
 import { AssistantTextSSP } from '../../ssp/impl/assistant-text';
+import { RichViewSSP } from '../../ssp/impl/rich-view';
+import { parseDshRichView } from '../../chat-rendering/protocol';
 import { ReasoningSSP } from '../../ssp/impl/reasoning';
 import { UserPromptSSP } from '../../ssp/impl/user-prompt';
 import { ToolInvocationSSP } from '../../ssp/impl/tool-invocation';
@@ -328,6 +331,7 @@ export function finalizeIncompleteStates(
 export function createSSPFromRecord(
   record: StreamPartRecord,
   metaIndex?: ReadonlyMap<string, Record<string, unknown>>,
+  directory?: string,
 ): AnySerializableStreamPart {
   // For externalEdit, inject undoStopId from meta if available
   if (record.kind === 'externalEdit' && metaIndex) {
@@ -344,6 +348,11 @@ export function createSSPFromRecord(
   const payload = record.payload as Record<string, unknown>;
 
   switch (record.kind) {
+    case 'richView': {
+      const view = record.version === 1 ? parseDshRichView(record.payload) : undefined;
+      return view ? new RichViewSSP({ partId: record.meta.sourcePartId ?? record.id, view }, record.meta, record.id)
+        : new OpaqueEventSSP({ event: record.payload }, record.meta, record.id);
+    }
     case 'userPrompt':
       return new UserPromptSSP(payload as never, record.meta, record.id);
 
@@ -377,7 +386,7 @@ export function createSSPFromRecord(
     }
 
     case 'toolInvocation':
-      return new ToolInvocationSSP(payload as never, record.meta, record.id);
+      return new ToolInvocationSSP(restoreDshReadPaths(payload as unknown as ToolInvocationStreamPartPayload, directory), record.meta, record.id);
 
     case 'question':
       return new QuestionSSP(payload as never, undefined, record.meta, record.id);
@@ -406,4 +415,45 @@ export function createSSPFromRecord(
       // Unknown kind -> wrap payload as an opaque backend event.
       return new OpaqueEventSSP({ event: record.payload }, record.meta, record.id);
   }
+}
+
+/** Repair legacy relative DSH links at read time without changing saved records. */
+function restoreDshReadPaths(
+  payload: ToolInvocationStreamPartPayload,
+  directory?: string,
+): ToolInvocationStreamPartPayload {
+  const metadata = payload.state?.metadata;
+  const presentation = metadata?.dshPresentation as Record<string, unknown> | undefined;
+  if (!directory || payload.toolName !== 'read' || !presentation) {return payload;}
+  const resolve = (value: unknown): unknown => {
+    if (typeof value !== 'string' || path.isAbsolute(value) || path.win32.isAbsolute(value)) {return value;}
+    const resolver = path.win32.isAbsolute(directory) && !path.posix.isAbsolute(directory) ? path.win32 : path;
+    return resolver.resolve(directory, value);
+  };
+  const input = payload.state.input ?? {};
+  const filePath = (presentation.card === 'read' ? presentation.path : undefined)
+    ?? input.filePath ?? input.file_path ?? input.path;
+  return {
+    ...payload,
+    state: {
+      ...payload.state,
+      input: {
+        ...input,
+        ...(typeof filePath === 'string' ? { filePath: resolve(filePath) } : {}),
+        ...(presentation.card === 'read' && (input.offset ?? presentation.offset) !== undefined ? { offset: input.offset ?? presentation.offset } : {}),
+        ...(presentation.card === 'read' && (input.limit ?? presentation.limit) !== undefined ? { limit: input.limit ?? presentation.limit } : {}),
+      },
+      metadata: {
+        ...metadata,
+        dshPresentation: {
+          ...presentation,
+          ...(presentation.card === 'read' ? { path: resolve(presentation.path) } : {}),
+          ...(Array.isArray(presentation.locations) ? {
+            locations: presentation.locations.map(location => location && typeof location === 'object'
+              ? { ...location, path: resolve(location.path) } : location),
+          } : {}),
+        },
+      },
+    },
+  };
 }

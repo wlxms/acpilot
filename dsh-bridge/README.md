@@ -7,6 +7,7 @@ The official DSH `acp` profile remains the owner of stdout and ACP JSON-RPC. The
 - terminal cards for `bash`, `pwsh`, and other command tools;
 - file links and line locations for reads and searches;
 - search path and match resources;
+- native subagent cards with nested tools and actual completion events;
 - custom tool titles, categories, inputs, and outputs;
 - diff presentations and the `ExternalEditSSP` baseline, after snapshot, and undo metadata flow.
 
@@ -17,6 +18,13 @@ before converting an allowed decision into `ask`. DSH then runs its normal
 approval service before `tools/execute`; ACPilot's `full-edit` mode answers that
 request automatically only after `ExternalEditSSP` has captured the baseline.
 The bridge never writes the file and never replaces DSH's approval service.
+
+Managed subagents use `subagent/start` and `subagent/end` to distinguish launch
+from completion. When ACPilot attaches with a launch nonce, user cancellation
+interrupts active descendants and clears their queued work. Settlement notices
+from those stopped children cannot wake another generation. DSH's ACP prompt
+already waits for children and consumes their results, so ACPilot does not send
+an additional continuation prompt.
 
 When ACPilot starts a local DSH process, it generates a launcher patch that
 imports this bridge by an absolute file URL. That works with a user-owned DSH

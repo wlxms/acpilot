@@ -6,6 +6,10 @@ import { ToolInvocationSSP } from '../../ssp/impl/tool-invocation';
 import type { SerializableToolState } from '../../ssp/types';
 import { ChatTodoStatus } from '../../types/vscode-proposed-additions';
 
+const NativeToolPart = (vscode as unknown as {
+  ChatToolInvocationPart: new (toolName: string, toolCallId: string, errorMessage?: string) => unknown;
+}).ChatToolInvocationPart;
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -80,6 +84,16 @@ describe('ToolInvocationSSP', () => {
   // ════════════════════════════════════════════════════════════════════════
 
   describe('Contract C1: read complete tense preservation', () => {
+    it.each(['running', 'completed'] as const)('preserves case in an absolute file link while %s', (status) => {
+      const stream = mockStream();
+      const ssp = new ToolInvocationSSP({
+        partId: 'read-case', toolName: 'read', callId: 'read-case',
+        state: toolState({ status, input: { filePath: '/Workspace/Script/AWYActor.cs', offset: 2, limit: 2 } }),
+      });
+      ssp.render(stream);
+      expect(String(lastPushedPart(stream).invocationMessage)).toBe('Read [](file:///Workspace/Script/AWYActor.cs#2-3)');
+    });
+
     it('read completed should set invocationMessage, NOT pastTenseMessage', () => {
       const stream = mockStream();
       const ssp = new ToolInvocationSSP({
@@ -177,6 +191,24 @@ describe('ToolInvocationSSP', () => {
   // ════════════════════════════════════════════════════════════════════════
 
   describe('Contract C3: progressive push idempotency', () => {
+    it('promotes a generic running call once while preserving its parent subagent group', () => {
+      const stream = mockStream();
+      const ssp = new ToolInvocationSSP({
+        partId: 'nested-delegate', callId: 'nested-delegate', toolName: 'spawn_worker',
+        subAgentInvocationId: 'parent-call', state: toolState({ input: { description: 'Inspect source', prompt: 'Review code' } }),
+      });
+      ssp.render(stream);
+      ssp.update({ toolName: 'subagent', state: { input: { description: 'Inspect source', agentName: 'reviewer', prompt: 'Review code' } }, renderMode: 'updateOnly' } as never);
+      ssp.render(stream);
+      expect(lastPushedPart(stream)).toMatchObject({ toolName: 'subagent', toolCallId: 'nested-delegate', subAgentInvocationId: 'parent-call', isComplete: false,
+        toolSpecificData: { description: 'Inspect source', agentName: 'reviewer', prompt: 'Review code' } });
+      expect(countPushes(stream)).toBe(2);
+      ssp.update({ toolName: 'subagent', state: { title: 'Waiting for review' }, renderMode: 'updateOnly' } as never);
+      ssp.render(stream);
+      expect(countPushes(stream)).toBe(2);
+      expect(stream.updateToolInvocation).toHaveBeenCalledWith('nested-delegate', expect.objectContaining({ invocationMessage: 'Waiting for review' }));
+    });
+
     it('multiple running updates should only push once, then updateToolInvocation', () => {
       const stream = mockStream();
       const ssp = new ToolInvocationSSP({
@@ -532,6 +564,90 @@ describe('ToolInvocationSSP', () => {
       expect(typeof data.input).toBe('string');
       expect(data.input).toMatch(/nested A/);
       expect(data.input).toMatch(/✓/);
+    });
+
+    it.each(['todo_write', 'Update todo list'])('DSH %s preserves the nested todo text fallback', (toolName) => {
+      const stream = mockStream();
+      const ssp = new ToolInvocationSSP({
+        partId: 'dsh-todo', toolName, callId: 'dsh-todo',
+        state: toolState({ status: 'completed', input: { todos: [
+          { content: 'Inspect the child task', status: 'completed' },
+          { content: 'Finish the child task', status: 'in_progress' },
+        ] }, output: 'Updated todo list: 0 pending, 1 in progress, 1 completed.' }),
+        subAgentInvocationId: 'parent-subagent-call',
+      });
+      ssp.render(stream);
+      const part = lastPushedPart(stream);
+      expect(part.toolName).toBe('todo');
+      expect(part.toolSpecificData).toEqual({
+        input: '[✓] 1. Inspect the child task\n[⟳] 2. Finish the child task',
+        output: 'Updated todo list: 0 pending, 1 in progress, 1 completed.',
+      });
+    });
+
+    it('keeps an unrelated tool with a todos input in the generic rendering branch', () => {
+      const stream = mockStream();
+      const ssp = new ToolInvocationSSP({
+        partId: 'project-plan', toolName: 'Update project plan', callId: 'project-plan',
+        state: toolState({ status: 'completed', input: { todos: [
+          { content: 'Project milestone', status: 'pending' },
+        ] }, output: 'Plan saved' }),
+      });
+      ssp.render(stream);
+      const part = lastPushedPart(stream);
+      expect(part.toolName).toBe('Update project plan');
+      expect(part.toolSpecificData.todoList).toBeUndefined();
+      expect(part.toolSpecificData.output).toBe('Plan saved');
+    });
+
+    it.each(['todo_write', 'Update todo list'])('DSH %s reports a rejected todo update without publishing the attempted list', (toolName) => {
+      const stream = mockStream();
+      const ssp = new ToolInvocationSSP({
+        partId: 'rejected-todo', toolName, callId: 'rejected-todo',
+        state: toolState({ status: 'running', input: { todos: [
+          { content: 'Duplicate task', status: 'completed' },
+          { content: 'Duplicate task', status: 'completed' },
+        ] } }),
+      });
+      ssp.render(stream);
+      ssp.update({ state: { status: 'error', output: 'invalid todos: duplicate content', error: 'invalid todos: duplicate content' } });
+      ssp.render(stream);
+      const nativeParts = (stream.push as ReturnType<typeof vi.fn>).mock.calls
+        .map(call => call[0]).filter(part => part instanceof NativeToolPart);
+      for (const part of nativeParts) {expect(part.toolSpecificData?.todoList).toBeUndefined();}
+      const part = nativeParts[nativeParts.length - 1];
+      expect(part.isError).toBe(true);
+      expect(part.toolSpecificData.todoList).toBeUndefined();
+      expect(part.toolSpecificData.output).toBe('invalid todos: duplicate content');
+      expect(part.pastTenseMessage).toBe('Todo update failed');
+    });
+
+    it('preserves canonical todo rendering while the tool is running', () => {
+      const stream = mockStream();
+      new ToolInvocationSSP({
+        partId: 'canonical-todo', toolName: 'todo', callId: 'canonical-todo',
+        state: toolState({ status: 'running', input: { todos: [
+          { content: 'Existing backend task', status: 'in_progress' },
+        ] } }),
+      }).render(stream);
+      expect(lastPushedPart(stream).toolSpecificData).toEqual({ todoList: [
+        { id: 0, title: 'Existing backend task', status: ChatTodoStatus.InProgress },
+      ] });
+    });
+
+    it('reports a rejected DSH todo update when native tool parts are unavailable', () => {
+      const stream = mockStream();
+      (stream.push as ReturnType<typeof vi.fn>).mockImplementation((part) => {
+        if (part instanceof NativeToolPart) {throw new Error('Native tool parts unavailable');}
+      });
+      const ssp = new ToolInvocationSSP({
+        partId: 'rejected-todo-fallback', toolName: 'todo_write', callId: 'rejected-todo-fallback',
+        state: toolState({ status: 'error', input: { todos: [] }, error: 'Update rejected' }),
+      });
+      ssp.render(stream);
+      expect(stream.updateToolInvocation).toHaveBeenCalledWith('rejected-todo-fallback', expect.objectContaining({
+        pastTenseMessage: 'Todo update failed',
+      }));
     });
 
     it('task → ChatSubagentToolInvocationData', () => {

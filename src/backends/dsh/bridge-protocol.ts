@@ -55,7 +55,24 @@ export interface DshBridgePresentation {
   [key: string]: unknown;
 }
 
-export interface DshBridgeToolCallMessage {
+/** A renderer owns its data vocabulary; the bridge validates the envelope. */
+export interface DshBridgeRichView {
+  protocol: 1;
+  renderer: { id: string; version: number };
+  viewId: string;
+  data: unknown;
+}
+
+const DSH_BRIDGE_RICH_VIEW_MAX_BYTES = 2 * 1024 * 1024;
+
+/** Actual event owner and Copilot scope when a managed child emits a tool. */
+export interface DshBridgeAgentScope {
+  agentSessionId?: string;
+  subAgentInvocationId?: string;
+  parentSubAgentInvocationId?: string;
+}
+
+export interface DshBridgeToolCallMessage extends DshBridgeAgentScope {
   type: 'tool_call';
   protocol: typeof DSH_BRIDGE_PROTOCOL;
   sessionId: string;
@@ -66,7 +83,7 @@ export interface DshBridgeToolCallMessage {
   presentation: DshBridgePresentation;
 }
 
-export interface DshBridgeToolResultMessage {
+export interface DshBridgeToolResultMessage extends DshBridgeAgentScope {
   type: 'tool_result';
   protocol: typeof DSH_BRIDGE_PROTOCOL;
   sessionId: string;
@@ -76,6 +93,7 @@ export interface DshBridgeToolResultMessage {
   isError: boolean;
   output?: unknown;
   presentation?: DshBridgePresentation;
+  richView?: DshBridgeRichView;
 }
 
 export type DshBridgeToolMessage = DshBridgeToolCallMessage | DshBridgeToolResultMessage;
@@ -149,7 +167,11 @@ export function parseDshBridgeToolLine(line: string): DshBridgeToolMessage | und
       || !nonEmptyString(value.sessionId)
       || !nonEmptyString(value.toolCallId)
       || !nonEmptyString(value.rootToolCallId)
-      || !nonEmptyString(value.toolName)) {
+      || !nonEmptyString(value.toolName)
+      || (value.agentSessionId !== undefined && !nonEmptyString(value.agentSessionId))
+      || (value.subAgentInvocationId !== undefined && !nonEmptyString(value.subAgentInvocationId))
+      || (value.parentSubAgentInvocationId !== undefined && (!nonEmptyString(value.parentSubAgentInvocationId)
+        || value.parentSubAgentInvocationId === value.subAgentInvocationId))) {
       return undefined;
     }
 
@@ -160,6 +182,7 @@ export function parseDshBridgeToolLine(line: string): DshBridgeToolMessage | und
 
     if (typeof value.isError !== 'boolean') {return undefined;}
     if (value.presentation !== undefined && !isPresentation(value.presentation)) {return undefined;}
+    if (value.richView !== undefined && !isRichView(value.richView)) {return undefined;}
     return value as unknown as DshBridgeToolResultMessage;
   } catch {
     return undefined;
@@ -239,4 +262,12 @@ function nonEmptyString(value: unknown): value is string {
 
 function isPresentation(value: unknown): value is DshBridgePresentation {
   return isRecord(value) && nonEmptyString(value.card);
+}
+
+function isRichView(value: unknown): value is DshBridgeRichView {
+  return isRecord(value) && value.protocol === 1
+    && isRecord(value.renderer) && boundedSelectionField(value.renderer.id, 128)
+    && typeof value.renderer.version === 'number' && Number.isSafeInteger(value.renderer.version) && value.renderer.version > 0
+    && boundedSelectionField(value.viewId, 1024) && Object.hasOwn(value, 'data')
+    && Buffer.byteLength(JSON.stringify(value), 'utf8') < DSH_BRIDGE_RICH_VIEW_MAX_BYTES;
 }

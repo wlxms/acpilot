@@ -204,6 +204,9 @@ export interface ExtensionContext {
 }
 
 export class Uri {
+    static joinPath(base: Uri, ...parts: string[]): Uri {
+        return base.with({ path: base.path.replace(/\/$/, '') + '/' + parts.join('/') });
+    }
     readonly scheme: string;
     readonly authority: string;
     readonly path: string;

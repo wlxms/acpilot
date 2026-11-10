@@ -1,0 +1,29 @@
+body {
+  min-height: 0;
+  margin: 0;
+  font-family: var(--vscode-font-family, system-ui, sans-serif);
+  font-size: var(--vscode-font-size, 13px);
+  background: var(--vscode-editor-background, #fff);
+  color: var(--vscode-editor-foreground, #1f2328);
+  --dsw-alias-bg-base: var(--vscode-editor-background, #fff);
+  --dsw-alias-bg-layer-1: var(--vscode-editor-background, #fff);
+  --dsw-alias-bg-layer-2: var(--vscode-textBlockQuote-background, #f4f5f7);
+  --dsw-alias-bg-layer-3: var(--vscode-input-background, #f4f5f7);
+  --dsw-alias-label-primary: var(--vscode-editor-foreground, #1f2328);
+  --dsw-alias-label-secondary: var(--vscode-descriptionForeground, #656d76);
+  --dsw-alias-label-tertiary: var(--vscode-descriptionForeground, #656d76);
+  --dsw-alias-border-l2: var(--vscode-widget-border, #d0d7de);
+  --dsw-alias-fill-hover: var(--vscode-list-hoverBackground, #f4f5f7);
+  --dsw-alias-state-business-primary: var(--vscode-textLink-foreground, #0969da);
+}
+body.vscode-dark, body.vscode-high-contrast {
+  color-scheme: dark;
+  --dsw-alias-state-business-tertiary: #22324b;
+  --dsw-alias-state-success-tertiary: #233c2c;
+  --dsw-alias-state-warn-tertiary: #27241f;
+}
+#dsh-root { width: 100%; box-sizing: border-box; padding: 8px 0; }
+.dsh-diagnostic { padding: 10px; border: 1px solid var(--vscode-widget-border, #d0d7de); border-radius: 6px; overflow-wrap: anywhere; }
+.dsh-diagnostic ul { margin-bottom: 0; padding-left: 20px; }
+.dsh-waiting, .dsh-action-status { padding: 8px 0; color: var(--vscode-descriptionForeground, #656d76); }
+.dsh-action-status[role="alert"] { color: var(--vscode-errorForeground, #cf222e); }

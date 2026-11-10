@@ -1,7 +1,7 @@
 {
   "name": "acpilot",
   "displayName": "ACPilot",
-  "version": "0.5.4",
+  "version": "0.5.8",
   "description": "ACP coding assistant powered by ACP backends",
   "publisher": "wlxms",
   "repository": {
@@ -15,7 +15,8 @@
     "chatParticipantAdditions",
     "chatParticipantPrivate",
     "chatProvider",
-    "chatSessionsProvider"
+    "chatSessionsProvider",
+    "chatOutputRenderer"
   ],
   "categories": [
     "Other"
@@ -218,10 +219,21 @@
           }
         ]
       }
+    ],
+    "chatOutputRenderers": [
+      {
+        "viewType": "acpilot.dshView",
+        "mimeTypes": [
+          "application/vnd.acpilot.dsh-view+json"
+        ],
+        "codeBlockLanguageIdentifiers": [
+          "dsh-ui"
+        ]
+      }
     ]
   },
   "scripts": {
-    "compile": "esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node",
+    "compile": "npm run build:dsh-renderer && esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node",
     "watch": "npm run compile -- --sourcemap --watch",
     "lint": "tsc --noEmit && eslint src/",
     "lint:eslint": "eslint src/",
@@ -232,9 +244,12 @@
     "test:runtime": "npm run compile && node scripts/runtime-smoke.cjs",
     "generate-font": "node scripts/generate-font.cjs",
     "vscode:prepublish": "npm run generate-font && npm run compile",
-    "launch:insiders": "powershell -NoProfile -Command \"& 'C:\\Program Files\\Microsoft VS Code Insiders\\bin\\code-insiders.cmd' --enable-proposed-api wlxms.acpilot\""
+    "launch:insiders": "powershell -NoProfile -Command \"& 'C:\\Program Files\\Microsoft VS Code Insiders\\bin\\code-insiders.cmd' --enable-proposed-api wlxms.acpilot\"",
+    "build:dsh-renderer": "node scripts/build-dsh-renderer.cjs",
+    "test:renderer": "npm run build:dsh-renderer && node --test webviews/dsh-renderer/renderer.test.cjs"
   },
   "devDependencies": {
+    "@changfenhuang/dsh-genui": "0.15.0",
     "@eslint/js": "^10.0.1",
     "@types/node": "^20.19.40",
     "@types/vscode": "^1.125.0",
@@ -245,6 +260,9 @@
     "eslint": "^10.4.0",
     "fantasticon": "^4.1.0",
     "glob": "^13.0.6",
+    "jsdom": "25.0.1",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.60.0",
     "vitest": "^4.1.5"

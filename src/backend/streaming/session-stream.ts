@@ -23,6 +23,8 @@ export interface SSSConfig {
   turnIndex: number;
   requestId: string;
   schedulingMode?: SessionStreamSchedulingMode;
+  /** Disable when onTitleChanged delegates durable writes to a title service. */
+  persistTitles?: boolean;
   onTitleChanged?: (update: SSSTitleUpdate) => void;
 }
 
@@ -98,12 +100,14 @@ export class SerializableSessionStream extends SessionStreamNodeBase<SubsessionS
     if (!normalized) {return undefined;}
     const provisional = options?.provisional ?? false;
 
-    this.writeMeta({
-      title: normalized,
-      titleSource: source,
-      titleUpdatedAt: new Date().toISOString(),
-      provisionalTitle: provisional,
-    });
+    if (this.rootConfig.persistTitles !== false) {
+      this.writeMeta({
+        title: normalized,
+        titleSource: source,
+        titleUpdatedAt: new Date().toISOString(),
+        provisionalTitle: provisional,
+      });
+    }
 
     const changed = this.currentTitle !== normalized
       || this.currentTitleSource !== source

@@ -45,6 +45,10 @@ import type { OpenCodeEvent } from '../backends/opencode/sdk-events';
 import type { BackendServerStatus } from '../backend/types';
 import type { ExtensionState, SessionState, BackendContext } from '../types';
 import { AppEventBus } from '../backend/app-event-bus';
+import { createDshRenderSessionRoute } from '../chat-rendering/session-route';
+import { RichViewSSP } from '../ssp/impl/rich-view';
+import { getDshRenderHost, registerDshRenderHost } from '../chat-rendering/host';
+import { parseDshRichView } from '../chat-rendering/protocol';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -469,6 +473,92 @@ describe('createParticipantHandler', () => {
     );
 
     expect(order).toEqual(['pipeline', 'prompt']);
+  });
+
+  it('guards originating DSH actions for the full visible request and releases after completion', async () => {
+    backendStatus = 'running';
+    Object.assign(ctx, { id: 'dsh', instanceKey: 'dsh', scheme: 'acpilot.dsh', storageNamespace: 'dsh' });
+    const resource = vscode.Uri.parse('acpilot.dsh:/dsh-session');
+    ctx.sessionMap.set(resource.toString(), {
+      backendSessionId: 'dsh-session', turnMap: [], title: 'Existing Session',
+    });
+    let completePrompt!: (value: { data: boolean }) => void;
+    vi.mocked(ctx.backend.sessions.prompt).mockReturnValue(new Promise(resolve => { completePrompt = resolve; }));
+    const pending = createParticipantHandler(state, ctx)(
+      createRequest({ prompt: 'show choices', sessionId: 'visible-dsh', sessionResource: resource }),
+      { history: [] }, stream, token,
+    );
+    await vi.waitFor(() => { expect(ctx.backend.sessions.prompt).toHaveBeenCalled(); });
+    const route = createDshRenderSessionRoute(ctx, { ...ctx }, resource, 'dsh-session');
+    try {
+      await expect(route.submit('confirm', {})).rejects.toThrow(/busy/i);
+    } finally {
+      completePrompt({ data: true });
+      await pending;
+    }
+    // The unit VS Code shim has no targeted command; reaching that check proves
+    // the completed request released its guard rather than leaving a stuck UI.
+    await expect(route.submit('confirm', {})).rejects.toThrow(/unavailable/i);
+  });
+
+  it('guards an already mapped DSH conversation during backend startup and releases after startup failure', async () => {
+    Object.assign(ctx, { id: 'dsh', instanceKey: 'dsh', scheme: 'acpilot.dsh', storageNamespace: 'dsh' });
+    const resource = vscode.Uri.parse('acpilot.dsh:/dsh-session');
+    ctx.sessionMap.set(resource.toString(), { backendSessionId: 'dsh-session', turnMap: [], title: 'Existing Session' });
+    const route = createDshRenderSessionRoute(ctx, { ...ctx }, resource, 'dsh-session');
+    let finishStartup!: (result: { error: string }) => void;
+    vi.mocked(ctx.backend.start).mockReturnValue(new Promise(resolve => { finishStartup = resolve; }));
+    const pending = createParticipantHandler(state, ctx)(
+      createRequest({ prompt: 'continue choices', sessionId: 'visible-dsh', sessionResource: resource }),
+      { history: [] }, stream, token,
+    );
+    await vi.waitFor(() => { expect(ctx.backend.start).toHaveBeenCalled(); });
+    try {
+      await expect(route.submit('confirm', {})).rejects.toThrow(/busy/i);
+    } finally {
+      finishStartup({ error: 'fixture startup finished' });
+      await pending;
+    }
+    await expect(route.submit('confirm', {})).rejects.toThrow(/unavailable/i);
+  });
+
+  it('binds identical live view ids to their individual originating DSH conversations', async () => {
+    backendStatus = 'running';
+    Object.assign(ctx, { id: 'dsh', instanceKey: 'dsh', scheme: 'acpilot.dsh', storageNamespace: 'dsh' });
+    const oldRegister = (vscode.chat as unknown as { registerChatOutputRenderer?: unknown }).registerChatOutputRenderer;
+    Object.assign(vscode.chat, { registerChatOutputRenderer: () => ({ dispose() {} }) });
+    registerDshRenderHost({ subscriptions: [] } as unknown as vscode.ExtensionContext);
+    const view = { protocol: 1 as const, renderer: { id: 'dsh.genui', version: 1 }, viewId: 'same-live-view', data: { items: [] } };
+    vi.mocked(ctx.backend.createPipeline).mockImplementation(options => ({
+      run: vi.fn(async () => {
+        options.stream.push(new RichViewSSP({ partId: 'same-live-view', view }));
+        return { completed: true, userMessageId: null, sessionTitle: null, sessionTitleSource: null, hadSubagentTasks: false };
+      }),
+    }));
+    mockSdkClient.session.promptAsync.mockResolvedValue({});
+    const envelopes: Array<{ routeToken: string }> = [];
+    const resources = ['session-a', 'session-b'].map(id => vscode.Uri.parse('acpilot.dsh:/' + id));
+    try {
+      for (const [index, resource] of resources.entries()) {
+        const id = index === 0 ? 'session-a' : 'session-b';
+        ctx.sessionMap.set(resource.toString(), { backendSessionId: id, turnMap: [], title: 'Existing DSH conversation' });
+        const output = { markdown: vi.fn(), progress: vi.fn(), push: vi.fn() } as unknown as vscode.ChatResponseStream;
+        await createParticipantHandler(state, ctx)(createRequest({ prompt: 'render choices', sessionId: 'visible-' + id, sessionResource: resource }), { history: [] }, output, token);
+        const fence = vi.mocked(output.markdown).mock.calls.map(call => String(call[0])).find(text => text.includes('same-live-view'));
+        expect(fence).toBeDefined();
+        const envelope = JSON.parse(fence!.split('\n').slice(1, -2).join('\n')) as { routeToken: string };
+        expect(envelope.routeToken).toBeTypeOf('string');
+        envelopes.push(envelope);
+      }
+      expect(envelopes[0].routeToken).not.toBe(envelopes[1].routeToken);
+      ctx.sessionMap.set(resources[0].toString(), { backendSessionId: 'replacement', turnMap: [] });
+      await expect(getDshRenderHost().submit(envelopes[0].routeToken, parseDshRichView(envelopes[0])!, 'choose', {})).rejects.toThrow(/changed/i);
+      await expect(getDshRenderHost().submit(envelopes[1].routeToken, parseDshRichView(envelopes[1])!, 'choose', {})).rejects.toThrow(/unavailable/i);
+    } finally {
+      getDshRenderHost().dispose();
+      if (oldRegister === undefined) {delete (vscode.chat as unknown as { registerChatOutputRenderer?: unknown }).registerChatOutputRenderer;}
+      else {Object.assign(vscode.chat, { registerChatOutputRenderer: oldRegister });}
+    }
   });
 
   it('writes initial session meta before first-prompt title patches', async () => {
@@ -2267,4 +2357,5 @@ describe('resolvePromptAgent', () => {
     expect(result).toBe('prometheus');
     expect(ctx.selection.setAgent).not.toHaveBeenCalled();
   });
+
 });

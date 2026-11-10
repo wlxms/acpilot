@@ -35,13 +35,15 @@ task / subagent      → 点击展开子代理完整对话
    ```bash
    git clone https://github.com/wlxms/acpilot.git
    cd acpilot
-   npm install
+   npm ci --legacy-peer-deps
    ```
 3. 构建
    ```bash
    npm run compile
    ```
 4. 在 VSCode 中按 `F5` 启动扩展开发主机
+
+GenUI 的独立渲染器复用包内的 embed 入口；安装时使用 `--legacy-peer-deps`，避免安装仅供 DSH Desktop 宿主使用的 peer dependencies。`npm run compile` 会同时构建本地渲染器、引擎与字体资源。
 
 ## 使用
 
@@ -99,9 +101,17 @@ npm run lint
 # 测试（vitest）
 npm test
 
+# GenUI 完整构建、交互与资源检查
+npm run test:renderer
+
+# 可选：本机 Chromium 无窗口运行，检查图形引擎、资源与按钮回传
+node webviews/dsh-renderer/browser-smoke.cjs
+
 # VS Code Extension Host + loopback 控制端点 smoke/e2e
 npm run test:runtime
 ```
+
+Chromium smoke 默认使用 Windows 上的 Google Chrome；其他安装位置可用 `ACPILOT_CHROME_EXECUTABLE` 指定。截图和检查结果保存在 `build/dsh-renderer-browser/`；这项检查覆盖独立 Webview 运行时，Copilot Workbench 显示需另行验证。
 
 ### 技术栈
 

@@ -781,6 +781,28 @@ describe('finalizeIncompleteStates', () => {
 // ---------------------------------------------------------------------------
 
 describe('createSSPFromRecord', () => {
+  it.each([true, false])('restores legacy DSH relative read links in the original workspace (input=%s)', (withInput) => {
+    const record: StreamPartRecord = {
+      kind: 'toolInvocation', version: 1, id: 'legacy-read',
+      payload: {
+        partId: 'legacy-read', toolName: 'read', callId: 'legacy-read',
+        state: {
+          status: 'completed', input: withInput ? { file_path: 'Script/AWYActor.cs', offset: 3, limit: 2 } : {},
+          metadata: { dshToolName: 'read', dshPresentation: { card: 'read', path: 'Script/AWYActor.cs', offset: 3, limit: 2 } },
+        },
+      },
+      meta: { turnIndex: 0, requestId: '', sequence: 0, createdAt: '', source: 'restore' },
+    };
+    const stream = mockStream();
+    const savedRecord = structuredClone(record);
+    const ssp = createSSPFromRecord(record, undefined, 'D:/workspace');
+    ssp.render(stream as never);
+    const part = stream.push.mock.calls[0]?.[0] as { invocationMessage: unknown; toolSpecificData: { values: Array<{ uri: { path: string } }> } };
+    expect(String(part.invocationMessage)).toBe('Read [](file:///D:/workspace/Script/AWYActor.cs#3-4)');
+    expect(part.toolSpecificData.values[0]?.uri.path).toBe('/D:/workspace/Script/AWYActor.cs');
+    expect(record).toEqual(savedRecord);
+  });
+
   it('creates AssistantTextSSP from assistantText record', () => {
     const record: StreamPartRecord = {
       kind: 'assistantText', version: 1, id: 'ssp-1',

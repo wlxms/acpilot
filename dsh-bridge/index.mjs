@@ -500,6 +500,44 @@ export function apply(ctx) {
     return result.isError ? undefined : fileMutationPresentation(exec)
   }
 
+  const resolveReadCallPresentation = async (exec, presentation) => {
+    if (exec?.name !== 'read' || !isRecord(exec.arguments)
+      || typeof exec.arguments.file_path !== 'string') return presentation
+    const requestedPath = exec.arguments.file_path
+    for (const scope of [exec.agent?.ctx, ctx]) {
+      try {
+        const fs = scope?.get?.('fs') ?? scope?.fs
+        const workingDirectory = scope?.get?.('workingDirectory') ?? scope?.workingDirectory
+        if (typeof fs?.resolve !== 'function' || typeof fs?.processPath !== 'function'
+          || (exec.agent !== undefined && typeof workingDirectory?.ensure !== 'function')) continue
+        // Mirror DSH's read resolution, including the live per-session directory.
+        // Presentation must not rewrite arguments or substitute the launch cwd.
+        const cwd = exec.agent === undefined ? undefined : await workingDirectory.ensure(exec.agent, exec.signal)
+        const target = await fs.resolve(requestedPath, {
+          ...(cwd !== undefined ? { cwd } : {}), signal: exec.signal,
+        })
+        const resolvedPath = fs.processPath(target)
+        if (typeof resolvedPath !== 'string'
+          || (!path.isAbsolute(resolvedPath) && !path.win32.isAbsolute(resolvedPath))) return presentation
+        return {
+          ...presentation,
+          card: 'read',
+          path: resolvedPath,
+          offset: exec.arguments.offset ?? presentation.offset ?? 1,
+          ...(exec.arguments.limit !== undefined ? { limit: exec.arguments.limit } : {}),
+          ...(Array.isArray(presentation.locations) ? {
+            locations: presentation.locations.map(location => isRecord(location) && location.path === requestedPath
+              ? { ...location, path: resolvedPath } : location),
+          } : {}),
+        }
+      } catch {
+        // Optional services and custom filesystem failures retain their presenter.
+        return presentation
+      }
+    }
+    return presentation
+  }
+
   /**
    * Reject an edit that is already known to fail before DSH reaches its
    * approval gate. A permission request creates ACPilot's ExternalEdit
@@ -533,7 +571,7 @@ export function apply(ctx) {
 
   ctx.on('tools/pre-execute', async (exec, next) => {
     const sessionId = sessionIdentity(exec)
-    const presentation = callPresentation(exec)
+    const presentation = await resolveReadCallPresentation(exec, callPresentation(exec))
     rememberExecAgent(sessionId, exec.agent)
     emitBridgeDiagnostic('pre-execute.begin', {
       sessionId: sessionId ?? null,

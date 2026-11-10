@@ -71,6 +71,10 @@ type ProposedVscode = typeof vscode & {
 
 const VS = vscode as ProposedVscode;
 
+function isDshTodoToolName(toolName: string): boolean {
+  return toolName === 'todo_write' || toolName === 'Update todo list';
+}
+
 // ---------------------------------------------------------------------------
 // ToolInvocationSSP
 // ---------------------------------------------------------------------------
@@ -144,7 +148,10 @@ export class ToolInvocationSSP extends SerializableStreamPart<
    * Routes to pushToolInvocation (proposed API) or renderFallback.
    */
   render(stream: SspStream): void {
-    const { callId, toolName, state } = this.payload;
+    const { callId, toolName: backendToolName, state } = this.payload;
+    // DSH uses its registered name on ACP and its presenter title in older
+    // streams. Keep the source name in the payload while rendering native todos.
+    const toolName = isDshTodoToolName(backendToolName) ? 'todo' : backendToolName;
     const effectiveCallId = callId ?? this.payload.partId;
     if (!effectiveCallId) {return;}
 
@@ -256,7 +263,7 @@ export class ToolInvocationSSP extends SerializableStreamPart<
           const msg = this.formatInvocationMsg(toolName, input, title);
           part.invocationMessage = typeof msg === 'string' ? msg : msg.value;
         } else {
-          const pastMsg = this.formatPastTenseMsg(toolName, title, state.startTime, state.endTime, input);
+          const pastMsg = this.formatPastTenseMsg(toolName, title, state.startTime, state.endTime, input, isError);
           part.pastTenseMessage = typeof pastMsg === 'string' ? pastMsg : pastMsg.value;
         }
         if (state.metadata?.presentation === 'system') {
@@ -265,7 +272,7 @@ export class ToolInvocationSSP extends SerializableStreamPart<
       }
 
       // Contract C4: toolSpecificData mapping
-      const specific = this.buildToolSpecificData(toolName, input, output, title, state.metadata);
+      const specific = this.buildToolSpecificData(toolName, input, output, title, state.metadata, state.status);
       if (specific) {
         part.toolSpecificData = specific as any;
       }
@@ -366,7 +373,7 @@ export class ToolInvocationSSP extends SerializableStreamPart<
       }
       const pastMsg = state.metadata?.presentation === 'system'
         ? title
-        : this.formatPastTenseMsg(toolName, title, state.startTime, state.endTime, input);
+        : this.formatPastTenseMsg(toolName, title, state.startTime, state.endTime, input, isError);
       try {
         stream.updateToolInvocation?.(callId, {
           pastTenseMessage: typeof pastMsg === 'string' ? pastMsg : pastMsg.value,
@@ -473,6 +480,7 @@ export class ToolInvocationSSP extends SerializableStreamPart<
     timeStart?: number,
     timeEnd?: number,
     input?: Record<string, unknown>,
+    isError = false,
   ): string | vscode.MarkdownString {
     const duration = (timeStart !== undefined && timeEnd !== undefined)
       ? ` (${((timeEnd - timeStart) / 1000).toFixed(1)}s)`
@@ -538,7 +546,8 @@ export class ToolInvocationSSP extends SerializableStreamPart<
       const short = pattern.length > 60 ? pattern.substring(0, 57) + '...' : pattern;
       return `Globbed \`${short}\`${duration}`;
     } else if (toolName === 'todo') {
-      return `Updated todos${duration}`;
+      return isError && isDshTodoToolName(this.payload.toolName)
+        ? `Todo update failed${duration}` : `Updated todos${duration}`;
     } else if (toolName === 'websearch' || toolName === 'websearch_web_search_exa') {
       const query = (input?.query as string) ?? title;
       if (query) {
@@ -564,6 +573,7 @@ export class ToolInvocationSSP extends SerializableStreamPart<
     output: string,
     title: string,
     metadata?: Record<string, unknown>,
+    status?: SerializableToolState['status'],
   ): ChatTerminalToolInvocationData | ChatSimpleToolResultData | ChatToolResourcesInvocationData | (ChatSubagentToolInvocationData & { kind?: 'subagent' }) | ChatTodoToolInvocationData | undefined {
     const formatInput = (data: Record<string, unknown>, fallbackTitle: string): string => {
       const keys = Object.keys(data);
@@ -702,6 +712,13 @@ export class ToolInvocationSSP extends SerializableStreamPart<
 
       case 'todo':
       case 'todowrite': {
+        // DSH validates and commits its whole list during execution. Only its
+        // successful result may update VS Code's persistent session todo widget.
+        if (isDshTodoToolName(this.payload.toolName) && status !== 'completed') {
+          return status === 'error'
+            ? { input: formatInput(input, title), output: truncate(output, 2000) } satisfies ChatSimpleToolResultData
+            : undefined;
+        }
         // Parse todo items from tool input (todos array).
         const todos = input.todos as Array<{ content: string; status: string }> | undefined;
         if (todos && Array.isArray(todos)) {

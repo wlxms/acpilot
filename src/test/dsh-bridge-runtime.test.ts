@@ -15,7 +15,96 @@ interface BridgePermissionProbeResult {
   title?: string;
 }
 
+function probeReadCallPresentation(options: { serviceScope?: 'agent' | 'bridge'; failure?: string; toolName?: string } = {}) {
+  const bridgePath = JSON.stringify(pathToFileURL(path.resolve(process.cwd(), 'dsh-bridge/index.mjs')).href);
+  const script = `
+    const path = await import('node:path');
+    const bridge = await import(${bridgePath});
+    const options = ${JSON.stringify(options)};
+    const writes = [];
+    process.stderr.write = (chunk) => { writes.push(String(chunk)); return true; };
+    const handlers = {};
+    const signal = new AbortController().signal;
+    let cwd = 'D:/workspace/current';
+    let resolutions = 0;
+    const session = { id: 'read-session', header: { cwd: 'D:/workspace/original' } };
+    const agent = { session, ctx: {} };
+    const services = options.failure === 'missing' ? {} : {
+      workingDirectory: {
+        ensure: async (owner, cancellation) => {
+          if (owner !== agent || cancellation !== signal) throw new Error('wrong execution scope');
+          if (options.failure === 'ensure') throw new Error('working directory unavailable');
+          return cwd;
+        },
+      },
+      fs: {
+        resolve: async (input, resolveOptions) => {
+          resolutions++;
+          if (options.failure === 'resolve') throw new Error('filesystem unavailable');
+          if (resolveOptions.cwd !== cwd || resolveOptions.signal !== signal) throw new Error('wrong resolution options');
+          return { processPath: path.win32.resolve(resolveOptions.cwd, input), original: input };
+        },
+        processPath: (target) => {
+          if (options.failure === 'processPath') throw new Error('process path unavailable');
+          return target.processPath;
+        },
+      },
+    };
+    if (options.serviceScope === 'agent') Object.assign(agent.ctx, services);
+    const tools = { get: () => ({ presentCall: args => ({
+      card: 'generic', kind: 'read', title: 'Read ' + args.file_path,
+      locations: [{ path: args.file_path, line: args.offset }],
+    }) }) };
+    bridge.apply({
+      llm: { listProviders: () => [] }, tools,
+      ...(options.serviceScope === 'agent' ? {} : services),
+      on: (name, handler) => { handlers[name] = handler; }, provide: () => undefined,
+    });
+    const args = Object.freeze({ file_path: 'Source/Actor.cs', offset: 2, limit: 3 });
+    for (const callId of ['read-first', 'read-second']) {
+      const exec = { agent, signal, callId, rootCallId: callId, name: options.toolName ?? 'read', arguments: args };
+      const decision = await handlers['tools/pre-execute'](exec, async () => ({ kind: 'allow' }));
+      if (exec.arguments !== args || decision.kind !== 'allow') throw new Error('execution changed');
+      cwd = 'D:/workspace/resumed';
+    }
+    const prefix = 'ACPILOT_DSH_BRIDGE_TOOL\\t';
+    const calls = writes.filter(line => line.startsWith(prefix)).map(line => JSON.parse(line.slice(prefix.length)));
+    process.stdout.write(JSON.stringify({ calls, args, resolutions }));
+  `;
+  return JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', script], {
+    cwd: process.cwd(), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+  })) as { calls: Array<{ rawInput: unknown; presentation: Record<string, unknown> }>; args: unknown; resolutions: number };
+}
+
 describe('DeepSeek Harness bridge runtime', () => {
+  it.each(['agent', 'bridge'] as const)('resolves read call paths from the current runtime directory (%s services)', (serviceScope) => {
+    const result = probeReadCallPresentation({ serviceScope });
+    expect(result.calls.map(call => call.presentation)).toEqual([
+      { card: 'read', kind: 'read', title: 'Read Source/Actor.cs', path: 'D:\\workspace\\current\\Source\\Actor.cs', offset: 2, limit: 3, locations: [{ path: 'D:\\workspace\\current\\Source\\Actor.cs', line: 2 }] },
+      { card: 'read', kind: 'read', title: 'Read Source/Actor.cs', path: 'D:\\workspace\\resumed\\Source\\Actor.cs', offset: 2, limit: 3, locations: [{ path: 'D:\\workspace\\resumed\\Source\\Actor.cs', line: 2 }] },
+    ]);
+    expect(result.args).toEqual({ file_path: 'Source/Actor.cs', offset: 2, limit: 3 });
+    expect(result.calls.map(call => call.rawInput)).toEqual([
+      { file_path: 'Source/Actor.cs', offset: 2, limit: 3 },
+      { file_path: 'Source/Actor.cs', offset: 2, limit: 3 },
+    ]);
+  });
+
+  it.each(['missing', 'ensure', 'resolve', 'processPath'])('keeps the existing read presentation when runtime resolution fails (%s)', (failure) => {
+    const result = probeReadCallPresentation({ failure });
+    for (const call of result.calls) {
+      expect(call.presentation).toEqual({ card: 'generic', kind: 'read', title: 'Read Source/Actor.cs', locations: [{ path: 'Source/Actor.cs', line: 2 }] });
+      expect(call.rawInput).toEqual({ file_path: 'Source/Actor.cs', offset: 2, limit: 3 });
+    }
+  });
+
+  it('does not resolve a non-read tool through the filesystem services', () => {
+    const result = probeReadCallPresentation({ toolName: 'custom-tool' });
+    expect(result.resolutions).toBe(0);
+    expect(result.calls[0].presentation.card).toBe('generic');
+    expect(result.calls[0].presentation.locations).toEqual([{ path: 'Source/Actor.cs', line: 2 }]);
+  });
+
   it('resolves presenters from the executing Agent scope', () => {
     const bridgePath = JSON.stringify(pathToFileURL(path.resolve(process.cwd(), 'dsh-bridge/index.mjs')).href);
     const script = `

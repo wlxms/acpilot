@@ -201,7 +201,7 @@ export class DshPipeline extends AcpPipeline {
 
   protected override beforeStop(): void {
     for (const toolCallId of [...this.pendingAcpToolCalls.keys()]) {
-      this.flushPendingAcpToolCall(toolCallId);
+      this.flushPendingAcpToolCall(toolCallId, true);
     }
   }
 
@@ -295,8 +295,9 @@ export class DshPipeline extends AcpPipeline {
       if (pending) {
         pending.updates.push({ update, eventSessionId });
         if ((update.status === 'completed' || update.status === 'failed')
-          && !this.bridgeCalls.has(update.toolCallId)
-          && !this.bridgeResults.has(update.toolCallId)) {
+          && (inferAcpReadPresentation(pending.update)?.card === 'read'
+            || this.bridgeCalls.get(update.toolCallId)?.presentation.card === 'read'
+            || (!this.bridgeCalls.has(update.toolCallId) && !this.bridgeResults.has(update.toolCallId)))) {
           this.flushPendingAcpToolCall(update.toolCallId);
         }
         return;
@@ -334,9 +335,18 @@ export class DshPipeline extends AcpPipeline {
     }
   }
 
-  private flushPendingAcpToolCall(toolCallId: string): void {
+  private flushPendingAcpToolCall(toolCallId: string, force = false): void {
     const pending = this.pendingAcpToolCalls.get(toolCallId);
     if (!pending) {return;}
+    const call = this.bridgeCalls.get(toolCallId);
+    const bridgeResult = this.bridgeResults.get(toolCallId);
+    const completed = pending.updates.find(buffered => buffered.update.status === 'completed');
+    const readCall = call?.presentation.card === 'read' ? call.presentation : inferAcpReadPresentation(pending.update);
+    if (!force && !bridgeResult && !pending.updates.some(buffered => buffered.update.status === 'completed' || buffered.update.status === 'failed')
+      && readCall?.card === 'read' && !hasAbsoluteReadPath(readCall)) {
+      // A generic bridge fallback does not identify the current session cwd.
+      return;
+    }
     if (pending.timer !== undefined) {clearTimeout(pending.timer);}
     this.pendingAcpToolCalls.delete(toolCallId);
     const externalEditTimer = this.pendingExternalEditTimers.get(toolCallId);
@@ -348,6 +358,16 @@ export class DshPipeline extends AcpPipeline {
       || inferAcpFilePresentation(pending.update)?.card === 'diff') {
       this.startBridgeFreeExternalEdit(pending.update);
       this.deferredDiffToolCalls.add(toolCallId);
+    }
+    const readPresentation = bridgeResult?.presentation?.card === 'read'
+      ? bridgeResult.presentation
+      : inferAcpReadPresentation(pending.update, completed
+        ? dshToolOutputToText(completed.update)
+        : bridgeResult ? bridgeOutputText(bridgeResult, bridgeResult.presentation) : undefined);
+    if (readPresentation?.card === 'read') {
+      // A resumed session may use a different cwd. Its read result supplies the
+      // actual file path before the queued call creates its first native link.
+      pending.update = { ...pending.update, rawInput: presentationInput(readPresentation, pending.update.rawInput, this.directory) };
     }
     this.dispatchAcpUpdate(pending.update, pending.eventSessionId);
     for (const buffered of pending.updates) {
@@ -370,6 +390,24 @@ export class DshPipeline extends AcpPipeline {
           if (tracked) {tracked.status = 'error';}
         }
         return;
+      }
+      const storedCall = this.acpToolCalls.get(update.toolCallId);
+      const readPresentation = resolveReadPresentation(hasAbsoluteReadPath(call?.presentation)
+        ? call?.presentation
+        : inferAcpReadPresentation({
+          sessionUpdate: 'tool_call', toolCallId: update.toolCallId,
+          title: update.title ?? storedCall?.title ?? call?.toolName ?? '',
+          kind: update.kind ?? storedCall?.kind,
+          rawInput: update.rawInput ?? storedCall?.rawInput ?? call?.rawInput,
+        }, update.sessionUpdate === 'tool_call_update' ? dshToolOutputToText(update) : undefined)
+          ?? (call?.presentation.card === 'read' ? call.presentation : undefined), this.directory);
+      if (readPresentation?.card === 'read') {
+        // The host retains the first rendered file reference. Resolve it before
+        // ACP pushes the card; later invocationMessage updates cannot repair it.
+        update = {
+          ...update,
+          rawInput: presentationInput(readPresentation, update.rawInput ?? storedCall?.rawInput ?? call?.rawInput, this.directory),
+        };
       }
     }
     if (update.sessionUpdate === 'tool_call_update' && this.deferredDiffToolCalls.has(update.toolCallId)) {
@@ -674,7 +712,7 @@ function inferAcpReadPresentation(
   const parsed = output ? parseDshReadEnvelope(output) : undefined;
   const input = isRecord(update.rawInput) ? update.rawInput : undefined;
   const filePath = parsed?.path
-    ?? firstString(input?.file_path, input?.filePath, input?.filepath, input?.path, input?.filename);
+    ?? firstString(input?.filePath, input?.file_path, input?.filepath, input?.path, input?.filename);
   if (!filePath) {return undefined;}
 
   const offset = parsed?.offset
@@ -809,6 +847,12 @@ function isReadOnlyPermissionKind(kind: RequestPermissionRequest['toolCall']['ki
 type AcpToolCall = Extract<SessionUpdate, { sessionUpdate: 'tool_call' }>;
 
 function genericFallbackDelay(update: AcpToolCall): number | undefined {
+  const readPath = inferAcpReadPresentation(update)?.path;
+  // Relative reads need the bridge's runtime path or the canonical result;
+  // the original workspace alone cannot identify a resumed session's cwd.
+  if (typeof readPath === 'string') {
+    return path.isAbsolute(readPath) || path.win32.isAbsolute(readPath) ? DSH_BRIDGE_TOOL_WAIT_MS : undefined;
+  }
   switch (update.kind) {
     case 'read':
     case 'search':
@@ -999,6 +1043,11 @@ function resolveReadPresentation(
         : location),
     } : {}),
   };
+}
+
+function hasAbsoluteReadPath(presentation: DshBridgePresentation | undefined): boolean {
+  return presentation?.card === 'read' && typeof presentation.path === 'string'
+    && (path.isAbsolute(presentation.path) || path.win32.isAbsolute(presentation.path));
 }
 
 function displayToolName(toolName: string, presentation: DshBridgePresentation | undefined): string {

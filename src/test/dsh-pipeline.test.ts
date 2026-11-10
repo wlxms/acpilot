@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { ActiveSessionMessage } from '@agentclientprotocol/sdk';
 import type { BackendPipelineStream } from '../backend/backend';
 import { DshPipeline } from '../backends/dsh/pipeline';
+import { ToolInvocationSSP } from '../ssp/impl/tool-invocation';
 
 function createStream(
   onPush?: (part: { id?: string; toJSON?: () => { payload?: Record<string, unknown> }; update?: (data: Record<string, unknown>) => void }) => void,
@@ -46,6 +47,112 @@ function stop(): ActiveSessionMessage {
 }
 
 describe('DshPipeline', () => {
+
+  it.each(['generic', 'read'] as const)('waits for the actual path when the bridge cannot resolve a relative read (card=%s)', async (card) => {
+    const rendered: string[] = [];
+    const target = createStream(part => {
+      (part as unknown as ToolInvocationSSP).render({
+        push(nativePart) { rendered.push(String((nativePart as { invocationMessage?: unknown }).invocationMessage)); },
+        markdown() {}, progress() {},
+      });
+    });
+    const pipeline = new DshPipeline({ sessionId: 'session-1', directory: 'D:/workspace', stream: target.value });
+    const rawInput = { file_path: 'WangYue/Actor.h' };
+    pipeline.handleBridgeMessage({
+      type: 'tool_call', protocol: 1, sessionId: 'session-1', toolCallId: 'read-fallback', rootToolCallId: 'read-fallback', toolName: 'read', rawInput,
+      presentation: { card, kind: 'read', path: rawInput.file_path },
+    });
+    let emissionsBeforeResult = -1;
+    await pipeline.run((async function* () {
+      yield sessionUpdate({ sessionUpdate: 'tool_call', toolCallId: 'read-fallback', title: 'read', kind: 'other', status: 'in_progress', rawInput });
+      emissionsBeforeResult = rendered.length;
+      yield sessionUpdate({
+        sessionUpdate: 'tool_call_update', toolCallId: 'read-fallback', status: 'completed',
+        rawOutput: '<path>D:/workspace/Source/WangYue/Actor.h</path>\n<type>file</type>\n<content>\n1: class Actor;\n</content>',
+      });
+      yield stop();
+    })(), { isCancellationRequested: false });
+    expect(emissionsBeforeResult).toBe(0);
+    expect(rendered[0]).toBe('Read [](file:///D:/workspace/Source/WangYue/Actor.h#1-1)');
+  });
+
+  it.each([false, true])('uses a cached read result before the first link when the bridge call is missing (presentation=%s)', async (hasPresentation) => {
+    const rendered: string[] = [];
+    const target = createStream(part => {
+      (part as unknown as ToolInvocationSSP).render({
+        push(nativePart) { rendered.push(String((nativePart as { invocationMessage?: unknown }).invocationMessage)); },
+        markdown() {}, progress() {},
+      });
+    });
+    const pipeline = new DshPipeline({ sessionId: 'session-1', directory: 'D:/workspace', stream: target.value });
+    const output = '<path>D:/workspace/Source/WangYue/Actor.h</path>\n<type>file</type>\n<content>\n1: class Actor;\n</content>';
+    await pipeline.run((async function* () {
+      yield sessionUpdate({ sessionUpdate: 'tool_call', toolCallId: 'read-result-only', title: 'read', kind: 'other', status: 'in_progress', rawInput: { file_path: 'WangYue/Actor.h' } });
+      pipeline.handleBridgeMessage({
+        type: 'tool_result', protocol: 1, sessionId: 'session-1', toolCallId: 'read-result-only', rootToolCallId: 'read-result-only', toolName: 'read', isError: false,
+        output: [{ type: 'text', text: output }],
+        ...(hasPresentation ? { presentation: { card: 'read', path: 'D:/workspace/Source/WangYue/Actor.h', offset: 1 } } : {}),
+      });
+      yield sessionUpdate({ sessionUpdate: 'tool_call_update', toolCallId: 'read-result-only', status: 'completed', rawOutput: output });
+      yield stop();
+    })(), { isCancellationRequested: false });
+    expect(rendered[0]).toBe('Read [](file:///D:/workspace/Source/WangYue/Actor.h#1-1)');
+  });
+
+  it.each(['other', 'read'])('uses the returned path for a bridge-free read in a changed session directory (kind=%s)', async (kind) => {
+    vi.useFakeTimers();
+    try {
+      const rendered: string[] = [];
+      const target = createStream(part => {
+        (part as unknown as ToolInvocationSSP).render({
+          push(nativePart) { rendered.push(String((nativePart as { invocationMessage?: unknown }).invocationMessage)); },
+          markdown() {}, progress() {},
+        });
+      });
+      // A resumed DSH session can already have changed its working directory.
+      const pipeline = new DshPipeline({ sessionId: 'session-1', directory: 'D:/workspace', stream: target.value });
+      let emissionsBeforeResult = -1;
+      await pipeline.run((async function* () {
+        yield sessionUpdate({ sessionUpdate: 'tool_call', toolCallId: 'read-changed-cwd', title: 'read', kind, status: 'in_progress', rawInput: { file_path: 'WangYue/Actor.h' } });
+        await vi.advanceTimersByTimeAsync(150);
+        emissionsBeforeResult = rendered.length;
+        yield sessionUpdate({
+          sessionUpdate: 'tool_call_update', toolCallId: 'read-changed-cwd', status: 'completed',
+          rawOutput: '<path>D:/workspace/Source/WangYue/Actor.h</path>\n<type>file</type>\n<content>\n1: class Actor;\n\n(End of file - total 1 lines)\n</content>',
+        });
+        yield stop();
+      })(), { isCancellationRequested: false });
+      expect(emissionsBeforeResult).toBe(0);
+      expect(rendered[0]).toBe('Read [](file:///D:/workspace/Source/WangYue/Actor.h#1-1)');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(['early', 'late', 'none'] as const)('resolves read links before their first native emission (bridge=%s)', async (bridgeTiming) => {
+    const rendered: Array<{ invocationMessage?: unknown }> = [];
+    const target = createStream(part => {
+      (part as unknown as ToolInvocationSSP).render({
+        push(nativePart) { rendered.push({ invocationMessage: (nativePart as { invocationMessage?: unknown }).invocationMessage }); },
+        markdown() {}, progress() {},
+      });
+    });
+    const pipeline = new DshPipeline({ sessionId: 'session-1', directory: 'D:/ue_wangyue/wangyuesrc', stream: target.value });
+    const rawInput = { file_path: 'Source\\WangYue\\Gameplay\\Level\\PlaySession\\Public\\WYPlaySessionContext.h', offset: 1, limit: 200 };
+    const bridgeCall = {
+      type: 'tool_call' as const, protocol: 1 as const, sessionId: 'session-1',
+      toolCallId: 'read-first', rootToolCallId: 'read-first', toolName: 'read', rawInput,
+      presentation: { card: 'read' as const, path: rawInput.file_path, offset: 1, limit: 200 },
+    };
+    if (bridgeTiming === 'early') {pipeline.handleBridgeMessage(bridgeCall);}
+    await pipeline.run((async function* () {
+      yield sessionUpdate({ sessionUpdate: 'tool_call', toolCallId: 'read-first', title: 'read', kind: 'read', status: 'in_progress', rawInput });
+      if (bridgeTiming === 'late') {pipeline.handleBridgeMessage(bridgeCall);}
+      yield sessionUpdate({ sessionUpdate: 'tool_call_update', toolCallId: 'read-first', status: 'completed', rawInput, rawOutput: 'content' });
+      yield stop();
+    })(), { isCancellationRequested: false });
+    expect(String(rendered[0]?.invocationMessage)).toBe('Read [](file:///D:/ue_wangyue/wangyuesrc/Source/WangYue/Gameplay/Level/PlaySession/Public/WYPlaySessionContext.h#1-200)');
+  });
 
   it.each(['C:/Other/Script/Actor.cs', '\\\\Server\\Share\\Script\\Actor.cs', '/srv/Script/Actor.cs', '\\Script\\Actor.cs'])('preserves an absolute DSH read path: %s', async (filePath) => {
     const target = createStream();
@@ -91,7 +198,12 @@ describe('DshPipeline', () => {
   });
 
   it('uses a presentation-only read path and line range for the file link', async () => {
-    const target = createStream();
+    const rendered: Array<{ invocationMessage?: unknown }> = [];
+    const target = createStream(part => {
+      (part as unknown as ToolInvocationSSP).render({
+        push(nativePart) { rendered.push(nativePart as typeof rendered[number]); }, markdown() {}, progress() {},
+      });
+    });
     const pipeline = new DshPipeline({ sessionId: 'session-1', directory: 'D:/workspace', stream: target.value });
     pipeline.handleBridgeMessage({
       type: 'tool_call', protocol: 1, sessionId: 'session-1',
@@ -102,9 +214,6 @@ describe('DshPipeline', () => {
       yield sessionUpdate({ sessionUpdate: 'tool_call', toolCallId: 'read-presentation', title: 'read', kind: 'read', status: 'in_progress' });
       yield stop();
     })(), { isCancellationRequested: false });
-    const rendered: Array<{ invocationMessage?: unknown }> = [];
-    (target.pushed[0] as unknown as { render(stream: { push(part: unknown): void; markdown(value: unknown): void; progress(value: string): void }): void })
-      .render({ push(part) { rendered.push(part as typeof rendered[number]); }, markdown() {}, progress() {} });
     expect(String(rendered[0]?.invocationMessage)).toBe('Read [](file:///D:/workspace/Script/Actor.cs#4-5)');
   });
 
@@ -587,31 +696,27 @@ describe('DshPipeline', () => {
     await expect(responsePromise).resolves.toEqual({ outcome: { outcome: 'selected', optionId: 'allow-once' } });
   });
 
-  it('renders a bridge-free read tool while it is still running', async () => {
+  it.each(['other', 'read'])('renders a bridge-free absolute read tool while it is still running (kind=%s)', async (kind) => {
     const target = createStream();
     const pipeline = new DshPipeline({
       sessionId: 'session-1',
       stream: target.value,
     });
     let pushedDuringRun = -1;
+    let runningPayload: Record<string, unknown> | undefined;
 
     await pipeline.run((async function* () {
       yield sessionUpdate({
         sessionUpdate: 'tool_call',
         toolCallId: 'call-long-read',
         title: 'read',
-        kind: 'read',
+        kind,
         status: 'in_progress',
-        rawInput: { path: 'src/long-read.ts' },
+        rawInput: { path: 'D:/workspace/src/long-read.ts' },
       });
-      await new Promise(resolve => setTimeout(resolve, 150));
+      await vi.waitFor(() => expect(target.pushed.length).toBe(1));
       pushedDuringRun = target.pushed.length;
-      expect(target.pushed[0]?.toJSON?.().payload).toMatchObject({
-        state: {
-          input: expect.objectContaining({ filePath: 'src/long-read.ts' }),
-          metadata: { dshPresentation: { card: 'read' } },
-        },
-      });
+      runningPayload = structuredClone(target.pushed[0]?.toJSON?.().payload);
       yield sessionUpdate({
         sessionUpdate: 'tool_call_update',
         toolCallId: 'call-long-read',
@@ -622,6 +727,12 @@ describe('DshPipeline', () => {
     })(), { isCancellationRequested: false });
 
     expect(pushedDuringRun).toBe(1);
+    expect(runningPayload).toMatchObject({
+      state: {
+        input: expect.objectContaining({ filePath: 'D:/workspace/src/long-read.ts' }),
+        metadata: { dshPresentation: { card: 'read' } },
+      },
+    });
     expect((target.pushed[0] as unknown as { kind?: string }).kind).toBe('toolInvocation');
   });
 

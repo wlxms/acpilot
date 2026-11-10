@@ -20,6 +20,8 @@ import {
 import type { FileSnapshotRecord } from '../../ssp/types';
 import { parseLine } from '../serializable/serializer';
 import { AssistantTextSSP } from '../../ssp/impl/assistant-text';
+import { RichViewSSP } from '../../ssp/impl/rich-view';
+import { parseDshRichView } from '../../chat-rendering/protocol';
 import { ReasoningSSP } from '../../ssp/impl/reasoning';
 import { UserPromptSSP } from '../../ssp/impl/user-prompt';
 import { ToolInvocationSSP } from '../../ssp/impl/tool-invocation';
@@ -346,6 +348,11 @@ export function createSSPFromRecord(
   const payload = record.payload as Record<string, unknown>;
 
   switch (record.kind) {
+    case 'richView': {
+      const view = record.version === 1 ? parseDshRichView(record.payload) : undefined;
+      return view ? new RichViewSSP({ partId: record.meta.sourcePartId ?? record.id, view }, record.meta, record.id)
+        : new OpaqueEventSSP({ event: record.payload }, record.meta, record.id);
+    }
     case 'userPrompt':
       return new UserPromptSSP(payload as never, record.meta, record.id);
 

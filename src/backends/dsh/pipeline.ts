@@ -12,6 +12,7 @@ import type {
   BackendPipelineToken,
 } from '../../backend/backend';
 import { ToolInvocationSSP } from '../../ssp/impl/tool-invocation';
+import { RichViewSSP } from '../../ssp/impl/rich-view';
 import { AcpPipeline } from '../acp/pipeline';
 import { resolveToolCallPath } from '../acp/filepath-resolver';
 const DSH_BRIDGE_PERMISSION_WAIT_MS = 1_500;
@@ -99,7 +100,8 @@ export class DshPipeline extends AcpPipeline {
 
   private handleManagedTool(message: DshBridgeToolMessage, initialAcpCall?: AcpToolCall): void {
     const call = message.type === 'tool_call' ? message : this.bridgeCalls.get(message.toolCallId);
-    if (message.type === 'tool_result' && !call && !this.liveTools.has(message.toolCallId)) {return;}
+    if (message.type === 'tool_result' && !call && !this.liveTools.has(message.toolCallId)
+      && (message.isError || !message.richView)) {return;}
     if (message.type === 'tool_call') {
       this.bridgeCalls.set(message.toolCallId, message);
       this.flushPendingAcpToolCall(message.toolCallId);
@@ -139,6 +141,23 @@ export class DshPipeline extends AcpPipeline {
       }));
     }
     this.liveTools.set(message.toolCallId, { target, status, subagent });
+    if (message.type === 'tool_result') {this.emitRichView(message, target);}
+  }
+
+  private emitRichView(message: DshBridgeToolResultMessage, target: BackendPipelineStream): void {
+    if (message.isError || !message.richView) {return;}
+    const partId = `rich-view-${message.toolCallId}`;
+    if (target.has(partId)) {return;}
+    target.push(new RichViewSSP({
+      partId,
+      view: message.richView,
+      sessionId: message.agentSessionId ?? message.sessionId,
+      toolCallId: message.toolCallId,
+      ...(message.subAgentInvocationId ? {
+        parentSessionId: message.sessionId,
+        subAgentInvocationId: message.subAgentInvocationId,
+      } : {}),
+    }));
   }
 
   constructor(options: BackendPipelineOptions) {
@@ -655,6 +674,7 @@ export class DshPipeline extends AcpPipeline {
           metadata,
         },
       });
+      this.emitRichView(message, this.sss);
       return;
     }
 
@@ -680,6 +700,7 @@ export class DshPipeline extends AcpPipeline {
       },
       sessionId: message.sessionId,
     }));
+    this.emitRichView(message, this.sss);
   }
 }
 

@@ -11,6 +11,12 @@ import { normalizePermissionMode } from '../backend/types';
 import type { BackendPipelineResult } from '../backend/backend';
 import type { SessionTitleSource } from '../backend/serializable/types';
 import { extractAttachmentsFromReferences } from './references';
+import {
+  assertDshRenderSessionSubmission,
+  createDshRenderSessionRoute,
+  markDshRenderSessionBusy,
+} from '../chat-rendering/session-route';
+import { wrapDshRenderStream, type DshRenderStream } from '../chat-rendering/stream';
 
 const HANDLER_DRAIN_TIMEOUT_MS = 2_000;
 
@@ -676,6 +682,9 @@ export function createParticipantHandler(
     const ctx: BackendContext = { ...backendContext };
     let cancelDisposable: vscode.Disposable | undefined;
     let resolvedBackendSessionId: string | undefined;
+    let releaseDshRenderBusy: (() => void) | undefined;
+    let busyDshBackendSessionId: string | undefined;
+    let dshRenderStream: DshRenderStream | undefined;
     let cancelRequested = false;
     let resolveCancellation!: () => void;
     const cancellationSignal = new Promise<void>(resolve => {
@@ -756,6 +765,7 @@ export function createParticipantHandler(
 
     try {
       assertRequestRuntimeCurrent();
+      assertDshRenderSessionSubmission(runtimeOwner, ctx, request.sessionResource, request.prompt);
       // 1. Early cancellation check
       if (token.isCancellationRequested) {
         return { metadata: {} };
@@ -780,6 +790,16 @@ export function createParticipantHandler(
       if (isEmptyPrompt(request.prompt)) {
         stream.markdown(ErrorMessages.EMPTY_PROMPT);
         return { metadata: {} };
+      }
+
+      if (ctx.id === 'dsh') {
+        const resourceKey = getSessionResourceKey(request);
+        const knownSession = (resourceKey ? ctx.sessions.get(resourceKey) : undefined)
+          ?? ctx.sessions.get(request.sessionId ?? 'unknown');
+        if (knownSession?.backendSessionId) {
+          busyDshBackendSessionId = knownSession.backendSessionId;
+          releaseDshRenderBusy = markDshRenderSessionBusy(ctx, busyDshBackendSessionId);
+        }
       }
 
       // Subscribe before starting the backend or resolving a session. The
@@ -836,6 +856,11 @@ export function createParticipantHandler(
       );
       if (!backendSessionId) {return { metadata: {} };}
       resolvedBackendSessionId = backendSessionId;
+      if (ctx.id === 'dsh' && busyDshBackendSessionId !== backendSessionId) {
+        releaseDshRenderBusy?.();
+        busyDshBackendSessionId = backendSessionId;
+        releaseDshRenderBusy = markDshRenderSessionBusy(ctx, backendSessionId);
+      }
 
       // Install cancellation handling as soon as the backend session is known.
       // This covers model/attachment resolution and SSS setup, not only the
@@ -908,6 +933,14 @@ export function createParticipantHandler(
       }
 
       aliasSessionState(state, ctx, vscodeSessionId, sessionResourceKey);
+
+      if (ctx.id === 'dsh') {
+        const resource = request.sessionResource;
+        const route = resource?.scheme === ctx.scheme
+          ? createDshRenderSessionRoute(runtimeOwner, ctx, resource, backendSessionId)
+          : undefined;
+        dshRenderStream = wrapDshRenderStream(stream, route);
+      }
 
       const titleService = new SessionTitleService(state, ctx);
       const activeChatState = ctx.sessions.get(vscodeSessionId);
@@ -1112,7 +1145,7 @@ export function createParticipantHandler(
           `[handler] workspaceRoot="${workspaceRoot}" backend="${ctx.backend.name}" ` +
           `backendSessionId="${backendSessionId}" requestId="${request.id}" turn=${liveTurnIndex}`,
         );
-        const sessionStream = new SerializableSessionStream(stream, {
+        const sessionStream = new SerializableSessionStream(dshRenderStream ?? stream, {
           workspaceRoot,
           backendName: ctx.storageNamespace,
           sessionId: backendSessionId,
@@ -1511,6 +1544,11 @@ export function createParticipantHandler(
       }
       cancelDisposable?.dispose();
       disposeRuntimeChanging();
+      try {
+        dshRenderStream?.flushDshRender();
+      } finally {
+        releaseDshRenderBusy?.();
+      }
     }
   };
 }

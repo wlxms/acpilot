@@ -24,6 +24,7 @@
  */
 
 // No imports from backend adapters - SSP is fully independent.
+import type { DshRichView } from '../chat-rendering/protocol';
 
 // ===========================================================================
 // Serialization contract (JSONL record shape)
@@ -56,6 +57,7 @@ export type SerializableStreamPartSource =
 
 export type SerializableStreamPartKind =
   | 'userPrompt'
+  | 'richView'
   | 'assistantText'
   | 'reasoning'
   | 'toolInvocation'
@@ -257,6 +259,7 @@ export interface MarkdownStringValue {
 // ===========================================================================
 
 export interface SspStream {
+  richView?(view: DshRichView, meta?: SerializableStreamPartMeta): void;
   markdown(value: string | MarkdownStringValue): void;
   progress(value: string): void;
   push(part: unknown): void;

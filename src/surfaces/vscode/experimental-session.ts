@@ -21,6 +21,8 @@ import type {
 } from '../../backend/serializable/types';
 import type { FileSnapshotRecord, StreamPartRecord as SerializableStreamPart } from '../../ssp/types';
 import { createParticipantHandler } from '../../participant/handler';
+import { createDshRenderSessionRoute } from '../../chat-rendering/session-route';
+import { wrapDshRenderStream } from '../../chat-rendering/stream';
 import { isUserSelectableAgent } from '../../backend/types';
 import { normalizePermissionMode } from '../../backend/types';
 
@@ -2044,7 +2046,7 @@ export function createSessionContentProvider(
     runtime: BackendContext,
     sessionId: string,
     token: vscode.CancellationToken,
-    options?: { replayPendingChanges?: boolean },
+    options?: { replayPendingChanges?: boolean; renderResource?: vscode.Uri },
   ): Promise<RestoredSessionHistory> {
     assertRuntimeCurrent(runtime);
     const sessionDir = runtime.sessionStore.getSessionDir(sessionId);
@@ -2132,12 +2134,18 @@ export function createSessionContentProvider(
         snapshotsForResponse: readonly FileSnapshotRecord[],
       ): vscode.ChatResponseTurn | undefined => {
         const collector = new CollectorStream();
+        const route = runtime.id === 'dsh' && options?.renderResource
+          ? createDshRenderSessionRoute(ctx, runtime, options.renderResource, sessionId)
+          : undefined;
+        const renderStream = runtime.id === 'dsh'
+          ? wrapDshRenderStream(collector as never, route)
+          : undefined;
         const pushedRestoredEditScopes = new Set<string>();
 
         for (const entry of entriesForResponse) {
           if (token.isCancellationRequested) {break;}
           if (shouldRenderRestoredEntry(entry)) {
-            createSSPFromRecord(entry.record, entry.metaIndex, directory).render(collector as never);
+            createSSPFromRecord(entry.record, entry.metaIndex, directory).render((renderStream ?? collector) as never);
           }
           const restoredEditCallId = getRestoredEditSnapshotCallId(entry.record);
           const restoredEditScopeKey = restoredEditCallId
@@ -2158,6 +2166,7 @@ export function createSessionContentProvider(
           }
         }
 
+        renderStream?.flushDshRender();
         return collector.parts.length > 0
           ? collector.buildTurn(getRestoredTurnMetadata(snapshotsForResponse, toolIdEditMap), runtime.scheme)
           : undefined;
@@ -2299,8 +2308,11 @@ export function createSessionContentProvider(
       // that was previously created via requestHandler. The sessions key is
       // request.sessionId which matches the untitled-* ID from the URI path.
       if (sessionId.startsWith('untitled-')) {
-        const chatState = runtime.sessions.get(sessionId);
+        const chatState = runtime.sessions.get(sessionId) ?? runtime.sessions.get(resource.toString());
         if (chatState?.backendSessionId) {
+          if (!runtime.sessions.has(resource.toString())) {
+            runtime.sessions.set(resource.toString(), chatState);
+          }
           const backendSessionId = chatState.backendSessionId;
           logger.appendLine(
             `[session-provider] Found existing OpenCode session ${backendSessionId} for VSCode session ${sessionId}`,
@@ -2314,6 +2326,7 @@ export function createSessionContentProvider(
 
               const { history, meta } = await fetchSessionHistory(runtime, backendSessionId, token, {
                 replayPendingChanges: false,
+                renderResource: resource,
               });
               assertRuntimeCurrent(runtime, true);
               let backendTitle: string | undefined;
@@ -2387,10 +2400,21 @@ export function createSessionContentProvider(
               `[session-provider] Aliased provider resource ${vscodeSessionKey} to live session ${sessionId} from ${liveEntry.key}`,
             );
           }
+          if (runtime.id === 'dsh' && !runtime.sessions.has(vscodeSessionKey)) {
+            // Bind restored views to this mapping before replay. Later title
+            // restoration updates the same object so a replaced mapping cannot
+            // silently claim an old view even when it reuses the native id.
+            runtime.sessions.set(vscodeSessionKey, {
+              backendSessionId: sessionId,
+              turnMap: [],
+              createdAt: sessionInfo.data?.createdAt ?? new Date(),
+            });
+          }
 
           // Fetch message history
           const { history, pendingReplaySnapshots, meta } = await fetchSessionHistory(runtime, sessionId, token, {
             replayPendingChanges: !isLiveInMemory,
+            renderResource: resource,
           });
           assertRuntimeCurrent(runtime, true);
           const resolvedTitle = await titleServiceFor(runtime).applyRestoredTitle({

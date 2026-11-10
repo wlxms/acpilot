@@ -466,8 +466,7 @@ export function apply(ctx) {
     return undefined
   }
 
-  const callPresentation = (exec) => {
-    const definition = toolDefinition(exec)
+  const callPresentation = (exec, definition) => {
     try {
       const presented = definition?.presentCall?.(exec.arguments)
       if (isPresentation(presented)) return presented
@@ -482,8 +481,7 @@ export function apply(ctx) {
     }
   }
 
-  const resultPresentation = (exec, result) => {
-    const definition = toolDefinition(exec)
+  const resultPresentation = (exec, result, definition) => {
     try {
       const presented = definition?.presentResult?.(exec.arguments, {
         content: result.content,
@@ -499,6 +497,27 @@ export function apply(ctx) {
       if (metadataPresentation) return metadataPresentation
     }
     return result.isError ? undefined : fileMutationPresentation(exec)
+  }
+
+  const resultRichView = (exec, result, definition) => {
+    if (result.isError === true) return undefined
+    if (!isGenuiRenderTool(definition)) return undefined
+    try {
+      // DSH's output projection is authoritative, including null. Older custom
+      // runtimes may omit it; only that case recomputes the same projection.
+      const data = result.meta !== undefined ? result.meta
+        : definition.output.presentationMeta(exec.arguments, result.value)
+      if (!isRecord(data) || !Array.isArray(data.items)) return undefined
+      return {
+        protocol: ACPILOT_DSH_BRIDGE_PROTOCOL,
+        renderer: { id: 'dsh.genui', version: 1 },
+        viewId: exec.callId,
+        data,
+      }
+    } catch {
+      // A broken optional presenter must not interrupt the actual tool result.
+      return undefined
+    }
   }
 
   const resolveReadCallPresentation = async (exec, presentation) => {
@@ -592,8 +611,12 @@ export function apply(ctx) {
 
   ctx.on('tools/pre-execute', async (exec, next) => {
     const sessionId = sessionIdentity(exec)
+    const definition = toolDefinition(exec)
+    if (isGenuiRenderTool(definition)) {
+      exec.arguments = normalizeGenuiArguments(exec.arguments)
+    }
     searchDirectories.set(exec, exec.agent?.session?.header?.cwd ?? process.cwd())
-    const presentation = resolveSearchPresentation(exec, await resolveReadCallPresentation(exec, callPresentation(exec)))
+    const presentation = resolveSearchPresentation(exec, await resolveReadCallPresentation(exec, callPresentation(exec, definition)))
     rememberExecAgent(sessionId, exec.agent)
     emitBridgeDiagnostic('pre-execute.begin', {
       sessionId: sessionId ?? null,
@@ -706,7 +729,9 @@ export function apply(ctx) {
     const activation = typeof childId === 'string' ? childScopes.get(childId) : undefined
     // An unusually fast child can end before its admission tool returns.
     if (activation && !activation.active) return undefined
-    const presentation = resolveSearchPresentation(exec, activation?.presentation ?? resultPresentation(exec, result))
+    const definition = activation ? undefined : toolDefinition(exec)
+    const presentation = resolveSearchPresentation(exec, activation?.presentation ?? resultPresentation(exec, result, definition))
+    const richView = resultRichView(exec, result, definition)
     emit({
       type: 'tool_result',
       protocol: ACPILOT_DSH_BRIDGE_PROTOCOL,
@@ -717,6 +742,7 @@ export function apply(ctx) {
       isError: result.isError === true,
       output: result.content,
       ...(presentation ? { presentation } : {}),
+      ...(richView ? { richView } : {}),
     })
     return undefined
   })
@@ -881,6 +907,47 @@ function fileMutationPresentation(exec) {
 
 function firstString(...values) {
   return values.find(value => typeof value === 'string')
+}
+
+/** Identify the effective GenUI tool rather than relying on its public name. */
+function isGenuiRenderTool(definition) {
+  const description = definition?.description
+  const specSchema = definition?.parameters?.properties?.spec
+  return typeof description === 'string' && /\bgenui\b/i.test(description) && description.includes('dsh-ui')
+    && specSchema?.type === 'object' && specSchema?.properties?.items?.type === 'array'
+    && typeof definition?.output?.presentationMeta === 'function'
+}
+
+/** Repair only known component aliases, never action payloads or chart data. */
+function normalizeGenuiArguments(args) {
+  if (!isRecord(args) || !isRecord(args.spec) || !Array.isArray(args.spec.items)) return args
+  const normalizeNode = (value, depth = 0) => {
+    if (!isRecord(value) || depth > 64) return value
+    const node = { ...value }
+    if (node.type === 'badge' && !['label', 'text', 'value'].some(key => Object.hasOwn(node, key))
+      && typeof node.content === 'string') {
+      node.label = node.content
+      delete node.content
+    }
+    if (node.type === 'row') {
+      const justifyAliases = { 'space-between': 'between', 'flex-start': 'start', 'flex-end': 'end' }
+      if (typeof node.justify === 'string' && Object.hasOwn(justifyAliases, node.justify)) node.justify = justifyAliases[node.justify]
+      if (!Object.hasOwn(node, 'items') && Array.isArray(node.children)) {
+        node.items = node.children
+        delete node.children
+      }
+    }
+    if (Array.isArray(node.items)) node.items = node.items.map(item => normalizeNode(item, depth + 1))
+    if (node.type === 'tabs' && Array.isArray(node.tabs)) {
+      node.tabs = node.tabs.map(tab => normalizeNode(tab, depth + 1))
+    }
+    if (node.type === 'table' && Array.isArray(node.details)) {
+      node.details = node.details.map(items => Array.isArray(items)
+        ? items.map(item => normalizeNode(item, depth + 1)) : items)
+    }
+    return node
+  }
+  return { ...args, spec: { ...args.spec, items: args.spec.items.map(item => normalizeNode(item)) } }
 }
 
 function isRecord(value) {

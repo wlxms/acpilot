@@ -1,0 +1,2 @@
+# Generated renderer assets must retain their bundled upstream bytes.
+resources/dsh-renderer/** -text -diff

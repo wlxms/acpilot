@@ -97,34 +97,37 @@ export class DshPipeline extends AcpPipeline {
     return target;
   }
 
-  private handleManagedTool(message: DshBridgeToolMessage): void {
+  private handleManagedTool(message: DshBridgeToolMessage, initialAcpCall?: AcpToolCall): void {
     const call = message.type === 'tool_call' ? message : this.bridgeCalls.get(message.toolCallId);
     if (message.type === 'tool_result' && !call && !this.liveTools.has(message.toolCallId)) {return;}
     if (message.type === 'tool_call') {
       this.bridgeCalls.set(message.toolCallId, message);
       this.flushPendingAcpToolCall(message.toolCallId);
     }
-    const presentation = resolveReadPresentation(message.presentation ?? call?.presentation, this.directory);
+    const presentation = resolveFilePresentation(message.presentation ?? call?.presentation, this.directory);
     const subagent = presentation?.card === 'subagent';
     const tracked = this.liveTools.get(message.toolCallId);
     const target = tracked?.target ?? (message.subAgentInvocationId
       ? this.scopeStream(message.subAgentInvocationId, message.parentSubAgentInvocationId)
       : this.sss);
+    const initialTerminalCall = !subagent && (initialAcpCall?.status === 'completed' || initialAcpCall?.status === 'failed')
+      ? initialAcpCall : undefined;
     const status: 'running' | 'completed' | 'error' = subagent
       ? presentation?.status === 'completed' ? 'completed' : presentation?.status === 'error' ? 'error' : 'running'
-      : message.type === 'tool_result' ? (message.isError ? 'error' : 'completed') : 'running';
+      : initialTerminalCall ? initialTerminalCall.status === 'failed' ? 'error' : 'completed'
+        : message.type === 'tool_result' ? (message.isError ? 'error' : 'completed') : 'running';
     // Start-tool results describe admission, while subagent/end describes work.
-    const output = message.type === 'tool_result' && status !== 'running'
-      ? bridgeOutputText(message, presentation) : undefined;
+    const output = initialTerminalCall ? dshToolOutputToText(initialTerminalCall)
+      : message.type === 'tool_result' && status !== 'running' ? bridgeOutputText(message, presentation) : undefined;
     const input = {
-      ...presentationInput(presentation, call?.rawInput, this.directory),
+      ...presentationInput(presentation, initialAcpCall?.rawInput ?? call?.rawInput, this.directory),
       ...(subagent && typeof presentation?.agentName === 'string' ? { agentName: presentation.agentName } : {}),
     };
     const state = {
-      status, input, title: presentationTitle(presentation) ?? call?.toolName ?? message.toolName,
+      status, input, title: presentationTitle(presentation) ?? initialAcpCall?.title ?? call?.toolName ?? message.toolName,
       originalToolName: message.toolName, metadata: presentationMetadata(message.toolName, presentation),
       ...(output !== undefined ? { output } : {}),
-      ...(status === 'error' ? { error: output || String(presentation?.stopReason ?? 'Subagent failed') } : {}),
+      ...(status === 'error' ? { error: output || String(presentation?.stopReason ?? (subagent ? 'Subagent failed' : 'Tool failed')) } : {}),
     };
     const toolName = subagent ? 'subagent' : displayToolName(message.toolName, presentation);
     if (target.has(message.toolCallId)) {
@@ -267,7 +270,10 @@ export class DshPipeline extends AcpPipeline {
   ): boolean {
     const bridgeCall = this.bridgeCalls.get(update.toolCallId);
     return bridgeCall?.presentation.card === 'diff'
-      || inferAcpFilePresentation(update)?.card === 'diff';
+      || inferAcpFilePresentation(update)?.card === 'diff'
+      || isSearchPresentation(bridgeCall?.presentation)
+      || isSearchPresentation(this.bridgeResults.get(update.toolCallId)?.presentation)
+      || inferAcpTeamPresentation(update) !== undefined;
   }
 
   /**
@@ -392,7 +398,12 @@ export class DshPipeline extends AcpPipeline {
         return;
       }
       const storedCall = this.acpToolCalls.get(update.toolCallId);
-      const readPresentation = resolveReadPresentation(hasAbsoluteReadPath(call?.presentation)
+      if (!isSearchPresentation(call?.presentation)
+        && !isSearchPresentation(this.bridgeResults.get(update.toolCallId)?.presentation)
+        && (update.kind === 'search' || /^(glob|grep)\b/i.test(update.title ?? storedCall?.title ?? ''))) {
+        update = { ...update, rawInput: displaySearchInput(update.rawInput ?? storedCall?.rawInput) };
+      }
+      const readPresentation = resolveFilePresentation(hasAbsoluteReadPath(call?.presentation)
         ? call?.presentation
         : inferAcpReadPresentation({
           sessionUpdate: 'tool_call', toolCallId: update.toolCallId,
@@ -410,6 +421,29 @@ export class DshPipeline extends AcpPipeline {
         };
       }
     }
+    if (update.sessionUpdate === 'tool_call_update' && !this.sss.has(update.toolCallId)) {
+      const result = this.bridgeResults.get(update.toolCallId);
+      const storedCall = this.bridgeCalls.get(update.toolCallId);
+      const implicitCall: AcpToolCall = {
+        ...update, sessionUpdate: 'tool_call',
+        kind: update.kind ?? undefined, content: update.content ?? undefined,
+        locations: update.locations ?? undefined, _meta: update._meta ?? undefined,
+        title: update.title ?? storedCall?.toolName ?? result?.toolName ?? '',
+        status: update.status ?? (result ? result.isError ? 'failed' : 'completed' : undefined),
+        rawInput: update.rawInput ?? storedCall?.rawInput,
+        ...(update.rawOutput === undefined && update.content === undefined && result
+          ? { rawOutput: bridgeOutputText(result, result.presentation) } : {}),
+      };
+      const managedCall = storedCall ?? bridgeCallFromAcpUpdate(implicitCall, this.sessionId)
+        ?? bridgeCallFromSearchResult(result, implicitCall, this.sessionId);
+      if (managedCall && (isSearchPresentation(managedCall.presentation) || isDshTeamToolName(managedCall.toolName))) {
+        // Populate ACP's lifecycle map while deferring its generic implicit card.
+        this.acpToolCalls.set(update.toolCallId, implicitCall);
+        trimMap(this.acpToolCalls);
+        super.handleSessionUpdate(implicitCall, eventSessionId);
+        this.handleManagedTool(managedCall, implicitCall);
+      }
+    }
     if (update.sessionUpdate === 'tool_call_update' && this.deferredDiffToolCalls.has(update.toolCallId)) {
       this.applyDeferredDiffUpdate(update);
       return;
@@ -424,9 +458,15 @@ export class DshPipeline extends AcpPipeline {
       }
     }
     if (update.sessionUpdate === 'tool_call') {
+      const bridgeResult = this.bridgeResults.get(update.toolCallId);
       const bridgeCall = this.bridgeCalls.get(update.toolCallId)
-        ?? bridgeCallFromAcpUpdate(update, this.sessionId);
+        ?? bridgeCallFromAcpUpdate(update, this.sessionId)
+        ?? bridgeCallFromSearchResult(bridgeResult, update, this.sessionId);
       if (bridgeCall) {
+        if ((isSearchPresentation(bridgeCall.presentation) || isDshTeamToolName(bridgeCall.toolName))
+          && !this.sss.has(update.toolCallId)) {
+          this.handleManagedTool(bridgeCall, update);
+        }
         this.applyBridgeCall(bridgeCall);
         const result = this.bridgeResults.get(update.toolCallId);
         if (result) {this.applyBridgeResult(result);}
@@ -555,7 +595,7 @@ export class DshPipeline extends AcpPipeline {
   private applyBridgeCall(message: DshBridgeToolCallMessage): void {
     const partId = message.toolCallId;
     if (!this.sss.has(partId)) {return;}
-    const presentation = resolveReadPresentation(message.presentation, this.directory);
+    const presentation = resolveFilePresentation(message.presentation, this.directory);
     const input = presentationInput(presentation, message.rawInput, this.directory);
     const title = presentationTitle(presentation) ?? message.toolName;
     this.sss.update(partId, {
@@ -578,7 +618,7 @@ export class DshPipeline extends AcpPipeline {
       this.acpToolCalls.get(message.toolCallId),
       output,
     );
-    const presentation = resolveReadPresentation(message.presentation?.card === 'read'
+    const presentation = resolveFilePresentation(message.presentation?.card === 'read'
       ? message.presentation
       : parsedReadPresentation ?? message.presentation ?? callPresentation, this.directory);
     const input = presentationInput(presentation, call?.rawInput, this.directory);
@@ -643,13 +683,26 @@ export class DshPipeline extends AcpPipeline {
   }
 }
 
+function bridgeCallFromSearchResult(
+  result: DshBridgeToolResultMessage | undefined,
+  update: AcpToolCall,
+  sessionId: string,
+): DshBridgeToolCallMessage | undefined {
+  if (!result?.presentation || !isSearchPresentation(result.presentation)) {return undefined;}
+  return {
+    type: 'tool_call', protocol: result.protocol, sessionId,
+    toolCallId: update.toolCallId, rootToolCallId: result.rootToolCallId,
+    toolName: result.toolName, rawInput: update.rawInput, presentation: result.presentation,
+  };
+}
+
 function bridgeCallFromAcpUpdate(
   update: AcpToolCall | undefined,
   sessionId: string,
 ): DshBridgeToolCallMessage | undefined {
   const filePresentation = update ? inferAcpFilePresentation(update) : undefined;
   const presentation = update
-    ? (hasRenderableDiff(filePresentation) ? filePresentation : inferAcpReadPresentation(update))
+    ? (hasRenderableDiff(filePresentation) ? filePresentation : inferAcpReadPresentation(update) ?? inferAcpTeamPresentation(update))
     : undefined;
   if (!update || !presentation) {return undefined;}
   return {
@@ -669,6 +722,15 @@ function bridgeCallFromAcpUpdate(
  * no-plugin path for an already-running DSH endpoint, and also covers a delayed
  * stderr bridge without turning the call into a generic completed tool card.
  */
+
+function isDshTeamToolName(value: unknown): boolean {
+  return value === 'team_task_create' || value === 'team_task_update' || value === 'wait_agent' || value === 'send_message';
+}
+
+function inferAcpTeamPresentation(update: AcpToolCall): DshBridgePresentation | undefined {
+  return isDshTeamToolName(update.title) ? { card: 'generic', kind: 'other', title: update.title } : undefined;
+}
+
 function inferAcpFilePresentation(update: AcpToolCall): DshBridgePresentation | undefined {
   const name = String(update.title ?? '').toLowerCase();
   if (!name.includes('write') && !name.includes('create') && !name.includes('edit')
@@ -847,6 +909,7 @@ function isReadOnlyPermissionKind(kind: RequestPermissionRequest['toolCall']['ki
 type AcpToolCall = Extract<SessionUpdate, { sessionUpdate: 'tool_call' }>;
 
 function genericFallbackDelay(update: AcpToolCall): number | undefined {
+  if (inferAcpTeamPresentation(update)) {return DSH_BRIDGE_TOOL_WAIT_MS;}
   const readPath = inferAcpReadPresentation(update)?.path;
   // Relative reads need the bridge's runtime path or the canonical result;
   // the original workspace alone cannot identify a resumed session's cwd.
@@ -881,7 +944,7 @@ function genericFallbackDelay(update: AcpToolCall): number | undefined {
 }
 
 function dshToolOutputToText(
-  update: Extract<SessionUpdate, { sessionUpdate: 'tool_call_update' }>,
+  update: AcpToolCall | Extract<SessionUpdate, { sessionUpdate: 'tool_call_update' }>,
 ): string | undefined {
   if (typeof update.rawOutput === 'string') {return update.rawOutput;}
   if (update.rawOutput !== undefined && update.rawOutput !== null) {
@@ -973,6 +1036,7 @@ function presentationInput(
   directory?: string,
 ): Record<string, unknown> {
   if (isRecord(rawInput)) {
+    if (isSearchPresentation(presentation)) {return rawInput;}
     return withCanonicalFilePath(presentation, rawInput, directory);
   }
   if (rawInput !== undefined) {return { value: rawInput };
@@ -980,11 +1044,13 @@ function presentationInput(
 
   if (!presentation) {return {};}
   if (isRecord(presentation.rawInput)) {
+    if (isSearchPresentation(presentation)) {return presentation.rawInput;}
     return withCanonicalFilePath(presentation, presentation.rawInput, directory);
   }
   if (presentation.card === 'read') {
     return withCanonicalFilePath(presentation, {}, directory);
   }
+  if (isSearchPresentation(presentation)) {return {};}
   const locations = presentationLocations(presentation);
   const firstLocation = locations?.[0];
   if (presentation.card === 'terminal') {
@@ -1025,24 +1091,46 @@ function resolvePresentationPath(filePath: string, directory?: string): string {
   // Keep absolute POSIX, Windows drive and UNC paths intact. Only relative
   // paths belong to the session workspace, never the extension host's cwd.
   if (path.isAbsolute(filePath) || path.win32.isAbsolute(filePath) || !directory) {return filePath;}
-  const resolver = path.win32.isAbsolute(directory) && !path.posix.isAbsolute(directory) ? path.win32 : path;
+  const resolver = path.posix.isAbsolute(directory) ? path.posix : path.win32.isAbsolute(directory) ? path.win32 : path;
   return resolver.resolve(directory, filePath);
 }
 
-function resolveReadPresentation(
+function resolveFilePresentation(
   presentation: DshBridgePresentation | undefined,
   directory?: string,
 ): DshBridgePresentation | undefined {
-  if (presentation?.card !== 'read') {return presentation;}
+  if (presentation?.card !== 'read' && presentation?.card !== 'search') {return presentation;}
+  const baseDirectory = presentation.card === 'search' ? firstString(presentation.cwd) ?? directory : directory;
   return {
     ...presentation,
-    ...(typeof presentation.path === 'string' ? { path: resolvePresentationPath(presentation.path, directory) } : {}),
+    ...(Array.isArray(presentation.paths) ? {
+      paths: presentation.paths.map(value => typeof value === 'string' ? resolvePresentationPath(value, baseDirectory) : value),
+    } : {}),
+    ...(Array.isArray(presentation.files) ? {
+      files: presentation.files.map(value => isRecord(value) && typeof value.path === 'string'
+        ? { ...value, path: resolvePresentationPath(value.path, baseDirectory) } : value),
+    } : {}),
+    ...(typeof presentation.path === 'string' ? { path: resolvePresentationPath(presentation.path, baseDirectory) } : {}),
     ...(Array.isArray(presentation.locations) ? {
       locations: presentation.locations.map(location => isRecord(location) && typeof location.path === 'string'
-        ? { ...location, path: resolvePresentationPath(location.path, directory) }
+        ? { ...location, path: resolvePresentationPath(location.path, baseDirectory) }
         : location),
     } : {}),
   };
+}
+
+function isSearchPresentation(presentation: DshBridgePresentation | undefined): boolean {
+  return presentation?.card === 'search' || presentation?.kind === 'search';
+}
+
+/** Keep a bridge-free search directory as input context, never a matched file. */
+function displaySearchInput(input: unknown): unknown {
+  if (!isRecord(input)) {return input;}
+  const result = { ...input };
+  const searchPath = firstString(result.path, result.filePath);
+  delete result.path;
+  delete result.filePath;
+  return { ...result, ...(searchPath ? { searchPath } : {}) };
 }
 
 function hasAbsoluteReadPath(presentation: DshBridgePresentation | undefined): boolean {
@@ -1126,7 +1214,6 @@ function bridgeOutputText(
   }
   return undefined;
 }
-
 
 function dshContentToText(value: unknown): string | undefined {
   if (!Array.isArray(value)) {return undefined;}

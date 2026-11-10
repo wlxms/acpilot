@@ -50,6 +50,7 @@ import type {
   ChatToolInvocationPart,
 } from '../../types/vscode-proposed-additions';
 import { ChatTodoStatus } from '../../types/vscode-proposed-additions';
+import { buildDshTeamToolPresentation } from './dsh-team-tools';
 
 // ---------------------------------------------------------------------------
 // Proposed vscode type accessor (runtime may not have these)
@@ -374,12 +375,13 @@ export class ToolInvocationSSP extends SerializableStreamPart<
       const pastMsg = state.metadata?.presentation === 'system'
         ? title
         : this.formatPastTenseMsg(toolName, title, state.startTime, state.endTime, input, isError);
+      const team = buildDshTeamToolPresentation(state);
       try {
         stream.updateToolInvocation?.(callId, {
           pastTenseMessage: typeof pastMsg === 'string' ? pastMsg : pastMsg.value,
           invocationMessage: state.metadata?.presentation === 'system'
             ? title
-            : isError ? `✗ ${toolName}` : `✓ ${toolName}`,
+            : team?.pastTenseMessage ?? (isError ? `✗ ${toolName}` : `✓ ${toolName}`),
           isAttachedToThinking: true,
         } as any);
       } catch { /* ignore */ }
@@ -399,6 +401,8 @@ export class ToolInvocationSSP extends SerializableStreamPart<
     input: Record<string, unknown>,
     title: string,
   ): string | vscode.MarkdownString {
+    const team = buildDshTeamToolPresentation({ ...this.payload.state, input });
+    if (team) {return team.invocationMessage;}
     const formatFileBubbleMessage = (
       verb: 'Read' | 'Editing' | 'Writing',
       filePath: string,
@@ -485,6 +489,9 @@ export class ToolInvocationSSP extends SerializableStreamPart<
     const duration = (timeStart !== undefined && timeEnd !== undefined)
       ? ` (${((timeEnd - timeStart) / 1000).toFixed(1)}s)`
       : '';
+
+    const team = buildDshTeamToolPresentation({ ...this.payload.state, input: input ?? {} });
+    if (team) {return team.pastTenseMessage + duration;}
 
     const formatFileBubbleMessage = (
       verb: 'Read' | 'Edited' | 'Wrote',
@@ -575,6 +582,8 @@ export class ToolInvocationSSP extends SerializableStreamPart<
     metadata?: Record<string, unknown>,
     status?: SerializableToolState['status'],
   ): ChatTerminalToolInvocationData | ChatSimpleToolResultData | ChatToolResourcesInvocationData | (ChatSubagentToolInvocationData & { kind?: 'subagent' }) | ChatTodoToolInvocationData | undefined {
+    const team = buildDshTeamToolPresentation({ ...this.payload.state, input, output, metadata, status: status ?? this.payload.state.status });
+    if (team) {return team.data;}
     const formatInput = (data: Record<string, unknown>, fallbackTitle: string): string => {
       const keys = Object.keys(data);
       if (keys.length === 0) {return fallbackTitle;}
@@ -610,7 +619,20 @@ export class ToolInvocationSSP extends SerializableStreamPart<
         state: exitCode !== undefined ? { exitCode } : undefined,
       } satisfies ChatTerminalToolInvocationData;
     }
-    if (dshPresentation?.card === 'search' || dshPresentation?.card === 'read') {
+    const searchOrigin = metadata?.dshToolName ?? this.payload.state.originalToolName ?? toolName;
+    const isFilesystemSearch = searchOrigin === 'glob' || searchOrigin === 'grep' || searchOrigin === 'list';
+    if (dshPresentation?.card === 'search'
+      || (dshPresentation?.card === 'generic' && dshPresentation.kind === 'search' && isFilesystemSearch)) {
+      const values = buildDshResourceValues(dshPresentation);
+      if (values.length > 0) {return { values } satisfies ChatToolResourcesInvocationData;}
+      // A filesystem search scope is an argument, not a matched file. Web
+      // search also uses generic.kind=search and keeps its native URL branch.
+      return status === 'running' || status === 'pending' ? undefined : {
+        input: formatInput(input, title),
+        output: truncate(output, 2000),
+      } satisfies ChatSimpleToolResultData;
+    }
+    if (dshPresentation?.card === 'read') {
       const values = buildDshResourceValues(dshPresentation);
       if (values.length > 0) {return { values } satisfies ChatToolResourcesInvocationData;}
     }

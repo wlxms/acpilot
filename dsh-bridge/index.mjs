@@ -32,6 +32,7 @@ export function apply(ctx) {
   const childScopes = new Map()
   const wrappedAgents = new Map()
   const cancellationEpochs = new WeakMap()
+  const searchDirectories = new WeakMap()
 
   const messageScope = (agent) => {
     const agentSessionId = sessionIdentity({ agent })
@@ -538,6 +539,26 @@ export function apply(ctx) {
     return presentation
   }
 
+  const resolveSearchPresentation = (exec, presentation) => {
+    if (presentation?.card !== 'search') return presentation
+    // DSH search uses the session header cwd rather than read's filesystem
+    // service. Relative result paths refer to that exact execution directory.
+    const cwd = searchDirectories.get(exec) ?? exec.agent?.session?.header?.cwd ?? process.cwd()
+    const resolver = path.posix.isAbsolute(cwd) ? path.posix : path.win32.isAbsolute(cwd) ? path.win32 : path
+    const resolveReference = (value) => typeof value === 'string' && value.trim()
+      && !path.posix.isAbsolute(value) && !path.win32.isAbsolute(value)
+      ? resolver.resolve(cwd, value) : value
+    const resolveItem = (item) => isRecord(item) && typeof item.path === 'string'
+      ? { ...item, path: resolveReference(item.path) } : item
+    return {
+      ...presentation,
+      cwd,
+      ...(Array.isArray(presentation.paths) ? { paths: presentation.paths.map(resolveReference) } : {}),
+      ...(Array.isArray(presentation.files) ? { files: presentation.files.map(resolveItem) } : {}),
+      ...(Array.isArray(presentation.locations) ? { locations: presentation.locations.map(resolveItem) } : {}),
+    }
+  }
+
   /**
    * Reject an edit that is already known to fail before DSH reaches its
    * approval gate. A permission request creates ACPilot's ExternalEdit
@@ -571,7 +592,8 @@ export function apply(ctx) {
 
   ctx.on('tools/pre-execute', async (exec, next) => {
     const sessionId = sessionIdentity(exec)
-    const presentation = await resolveReadCallPresentation(exec, callPresentation(exec))
+    searchDirectories.set(exec, exec.agent?.session?.header?.cwd ?? process.cwd())
+    const presentation = resolveSearchPresentation(exec, await resolveReadCallPresentation(exec, callPresentation(exec)))
     rememberExecAgent(sessionId, exec.agent)
     emitBridgeDiagnostic('pre-execute.begin', {
       sessionId: sessionId ?? null,
@@ -684,7 +706,7 @@ export function apply(ctx) {
     const activation = typeof childId === 'string' ? childScopes.get(childId) : undefined
     // An unusually fast child can end before its admission tool returns.
     if (activation && !activation.active) return undefined
-    const presentation = activation?.presentation ?? resultPresentation(exec, result)
+    const presentation = resolveSearchPresentation(exec, activation?.presentation ?? resultPresentation(exec, result))
     emit({
       type: 'tool_result',
       protocol: ACPILOT_DSH_BRIDGE_PROTOCOL,

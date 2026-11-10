@@ -32,6 +32,7 @@ afterEach(async () => {
   await deactivate();
   BUILTIN_BACKENDS.splice(0, BUILTIN_BACKENDS.length, ...originalBackends);
   testWorkspace.workspaceFolders = undefined;
+  vi.unstubAllEnvs();
   vi.restoreAllMocks();
   for (const root of roots.splice(0)) { rmSync(root, { recursive: true, force: true }); }
 });
@@ -39,6 +40,10 @@ afterEach(async () => {
 function fixture(write: () => Promise<void>) {
   const root = mkdtempSync(join(tmpdir(), 'acpilot-desktop-activation-'));
   roots.push(root);
+  // Desktop detection needs a configuration home. Keep this fixture independent
+  // of the host's APPDATA availability and any real Desktop profile selection.
+  vi.stubEnv('APPDATA', join(root, 'Roaming'));
+  vi.stubEnv('DSH_HOME', undefined);
   const desktop = join(root, 'DSH Desktop');
   const workspace = join(root, 'workspace');
   mkdirSync(join(desktop, 'resources'), { recursive: true });

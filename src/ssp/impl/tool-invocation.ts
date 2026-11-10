@@ -122,7 +122,17 @@ export class ToolInvocationSSP extends SerializableStreamPart<
     if (data.state) {
       this.payload.state = { ...this.payload.state, ...data.state };
     }
-    if (data.toolName !== undefined) {this.payload.toolName = data.toolName;}
+    if (data.toolName !== undefined) {
+      const becomesSubagent = (data.toolName === 'subagent' || data.toolName === 'task')
+        && this.payload.toolName !== 'subagent' && this.payload.toolName !== 'task';
+      this.payload.toolName = data.toolName;
+      if (becomesSubagent) {
+        // A generic ACP row may already be running when delegation starts.
+        // Republish the same call with native subagent data before completion.
+        this._progressivePushed = false;
+        this.nextRenderMode = undefined;
+      }
+    }
     if (data.callId !== undefined) {this.payload.callId = data.callId;}
     if (data.messageId !== undefined) {this.payload.messageId = data.messageId;}
     if (data.sessionId !== undefined) {this.payload.sessionId = data.sessionId;}
@@ -388,7 +398,7 @@ export class ToolInvocationSSP extends SerializableStreamPart<
       offset?: number,
       limit?: number,
     ): vscode.MarkdownString => {
-      const uri = vscode.Uri.file(filePath).toString().toLowerCase();
+      const uri = vscode.Uri.file(filePath).toString();
       const range = offset !== undefined || limit !== undefined
         ? (() => {
             const start = offset ?? 1;
@@ -475,7 +485,7 @@ export class ToolInvocationSSP extends SerializableStreamPart<
       limit?: number,
       suffix = '',
     ): vscode.MarkdownString => {
-      const uri = vscode.Uri.file(filePath).toString().toLowerCase();
+      const uri = vscode.Uri.file(filePath).toString();
       const range = offset !== undefined || limit !== undefined
         ? (() => {
             const start = offset ?? 1;

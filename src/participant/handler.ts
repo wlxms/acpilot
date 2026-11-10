@@ -1118,6 +1118,7 @@ export function createParticipantHandler(
           sessionId: backendSessionId,
           turnIndex: liveTurnIndex,
           requestId: request.id,
+          persistTitles: false,
           onTitleChanged: (update) => {
             if (cancelRequested || token.isCancellationRequested || !isRequestRuntimeCurrent()) {
               return;

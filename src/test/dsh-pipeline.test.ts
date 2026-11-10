@@ -46,6 +46,68 @@ function stop(): ActiveSessionMessage {
 }
 
 describe('DshPipeline', () => {
+
+  it.each(['C:/Other/Script/Actor.cs', '\\\\Server\\Share\\Script\\Actor.cs', '/srv/Script/Actor.cs', '\\Script\\Actor.cs'])('preserves an absolute DSH read path: %s', async (filePath) => {
+    const target = createStream();
+    const pipeline = new DshPipeline({ sessionId: 'session-1', directory: 'D:/workspace', stream: target.value });
+    await pipeline.run((async function* () {
+      yield sessionUpdate({ sessionUpdate: 'tool_call', toolCallId: 'read-absolute', title: 'read', kind: 'read', status: 'in_progress', rawInput: { filePath } });
+      yield sessionUpdate({ sessionUpdate: 'tool_call_update', toolCallId: 'read-absolute', status: 'completed', rawOutput: 'content' });
+      yield stop();
+    })(), { isCancellationRequested: false });
+    expect(target.pushed[0]?.toJSON?.().payload).toMatchObject({ state: { input: { filePath } } });
+  });
+
+  it.each([false, true])('resolves a DSH relative read link in the session workspace (bridge=%s)', async (useBridge) => {
+    const target = createStream();
+    const pipeline = new DshPipeline({
+      sessionId: 'session-1',
+      directory: 'D:/ue_wangyue/wangyuesrc',
+      stream: target.value,
+    });
+    if (useBridge) {
+      pipeline.handleBridgeMessage({
+        type: 'tool_call', protocol: 1, sessionId: 'session-1',
+        toolCallId: 'read-path', rootToolCallId: 'read-path', toolName: 'read',
+        rawInput: { filePath: 'Script/GamePlay/WorldLogic/Unit/Core/EventDriven/AWYEventDrivenActorCS.cs', offset: 12, limit: 3 },
+        presentation: { card: 'read', path: 'Script/GamePlay/WorldLogic/Unit/Core/EventDriven/AWYEventDrivenActorCS.cs', offset: 12, limit: 3 },
+      });
+    }
+    await pipeline.run((async function* () {
+      yield sessionUpdate({
+        sessionUpdate: 'tool_call', toolCallId: 'read-path', title: 'read', kind: 'read', status: 'in_progress',
+        rawInput: { filePath: 'Script/GamePlay/WorldLogic/Unit/Core/EventDriven/AWYEventDrivenActorCS.cs', offset: 12, limit: 3 },
+      });
+      yield sessionUpdate({ sessionUpdate: 'tool_call_update', toolCallId: 'read-path', status: 'completed', rawOutput: 'content' });
+      yield stop();
+    })(), { isCancellationRequested: false });
+    const row = target.pushed[0] as unknown as { render(stream: { push(part: unknown): void; markdown(value: unknown): void; progress(value: string): void }): void };
+    const rendered: Array<{ invocationMessage?: unknown }> = [];
+    row.render({ push(part) { rendered.push(part as typeof rendered[number]); }, markdown() {}, progress() {} });
+    expect(String(rendered[0]?.invocationMessage)).toBe('Read [](file:///D:/ue_wangyue/wangyuesrc/Script/GamePlay/WorldLogic/Unit/Core/EventDriven/AWYEventDrivenActorCS.cs#12-14)');
+    const resources = (rendered[0] as unknown as { toolSpecificData: { values: Array<{ uri: { path: string }; range: { start: { line: number } } }> } }).toolSpecificData.values;
+    expect(resources[0]?.uri.path).toBe('/D:/ue_wangyue/wangyuesrc/Script/GamePlay/WorldLogic/Unit/Core/EventDriven/AWYEventDrivenActorCS.cs');
+    expect(resources[0]?.range.start.line).toBe(11);
+  });
+
+  it('uses a presentation-only read path and line range for the file link', async () => {
+    const target = createStream();
+    const pipeline = new DshPipeline({ sessionId: 'session-1', directory: 'D:/workspace', stream: target.value });
+    pipeline.handleBridgeMessage({
+      type: 'tool_call', protocol: 1, sessionId: 'session-1',
+      toolCallId: 'read-presentation', rootToolCallId: 'read-presentation', toolName: 'read',
+      presentation: { card: 'read', path: 'Script/Actor.cs', offset: 4, limit: 2 },
+    });
+    await pipeline.run((async function* () {
+      yield sessionUpdate({ sessionUpdate: 'tool_call', toolCallId: 'read-presentation', title: 'read', kind: 'read', status: 'in_progress' });
+      yield stop();
+    })(), { isCancellationRequested: false });
+    const rendered: Array<{ invocationMessage?: unknown }> = [];
+    (target.pushed[0] as unknown as { render(stream: { push(part: unknown): void; markdown(value: unknown): void; progress(value: string): void }): void })
+      .render({ push(part) { rendered.push(part as typeof rendered[number]); }, markdown() {}, progress() {} });
+    expect(String(rendered[0]?.invocationMessage)).toBe('Read [](file:///D:/workspace/Script/Actor.cs#4-5)');
+  });
+
   it('waits for a late bridge call before resolving an incomplete permission request', async () => {
     const target = createStream();
     const pipeline = new DshPipeline({
@@ -965,7 +1027,7 @@ describe('DshPipeline', () => {
       toolName: 'read',
       state: {
         input: expect.objectContaining({
-          filePath: 'src/no-bridge.ts',
+          filePath: 'D:/workspace/src/no-bridge.ts',
           offset: 10,
           limit: 2,
         }),

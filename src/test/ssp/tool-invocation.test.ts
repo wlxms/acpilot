@@ -80,6 +80,16 @@ describe('ToolInvocationSSP', () => {
   // ════════════════════════════════════════════════════════════════════════
 
   describe('Contract C1: read complete tense preservation', () => {
+    it.each(['running', 'completed'] as const)('preserves case in an absolute file link while %s', (status) => {
+      const stream = mockStream();
+      const ssp = new ToolInvocationSSP({
+        partId: 'read-case', toolName: 'read', callId: 'read-case',
+        state: toolState({ status, input: { filePath: '/Workspace/Script/AWYActor.cs', offset: 2, limit: 2 } }),
+      });
+      ssp.render(stream);
+      expect(String(lastPushedPart(stream).invocationMessage)).toBe('Read [](file:///Workspace/Script/AWYActor.cs#2-3)');
+    });
+
     it('read completed should set invocationMessage, NOT pastTenseMessage', () => {
       const stream = mockStream();
       const ssp = new ToolInvocationSSP({
@@ -177,6 +187,24 @@ describe('ToolInvocationSSP', () => {
   // ════════════════════════════════════════════════════════════════════════
 
   describe('Contract C3: progressive push idempotency', () => {
+    it('promotes a generic running call once while preserving its parent subagent group', () => {
+      const stream = mockStream();
+      const ssp = new ToolInvocationSSP({
+        partId: 'nested-delegate', callId: 'nested-delegate', toolName: 'spawn_worker',
+        subAgentInvocationId: 'parent-call', state: toolState({ input: { description: 'Inspect source', prompt: 'Review code' } }),
+      });
+      ssp.render(stream);
+      ssp.update({ toolName: 'subagent', state: { input: { description: 'Inspect source', agentName: 'reviewer', prompt: 'Review code' } }, renderMode: 'updateOnly' } as never);
+      ssp.render(stream);
+      expect(lastPushedPart(stream)).toMatchObject({ toolName: 'subagent', toolCallId: 'nested-delegate', subAgentInvocationId: 'parent-call', isComplete: false,
+        toolSpecificData: { description: 'Inspect source', agentName: 'reviewer', prompt: 'Review code' } });
+      expect(countPushes(stream)).toBe(2);
+      ssp.update({ toolName: 'subagent', state: { title: 'Waiting for review' }, renderMode: 'updateOnly' } as never);
+      ssp.render(stream);
+      expect(countPushes(stream)).toBe(2);
+      expect(stream.updateToolInvocation).toHaveBeenCalledWith('nested-delegate', expect.objectContaining({ invocationMessage: 'Waiting for review' }));
+    });
+
     it('multiple running updates should only push once, then updateToolInvocation', () => {
       const stream = mockStream();
       const ssp = new ToolInvocationSSP({

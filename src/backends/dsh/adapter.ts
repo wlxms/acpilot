@@ -22,6 +22,7 @@ import {
   type DshBridgeToolMessage,
 } from './bridge-protocol';
 import { DshPipeline } from './pipeline';
+import { isPlaceholderSessionTitle } from '../../backend/session-title';
 
 export type DshBackendOptions = AcpBackendOptions;
 
@@ -37,6 +38,9 @@ export class DshBackend extends AcpBackend {
   private desktopSavedSelection: DshDesktopSavedSelection | undefined;
   private readonly pipelines = new Map<string, DshPipeline>();
   private readonly pendingBridgeMessages = new Map<string, DshBridgeToolMessage[]>();
+  /** DSH ACP omits titles from new/resume/list responses. SessionStore persists
+   * these host titles; retain them here for active reads and list refreshes. */
+  private readonly sessionTitles = new Map<string, string>();
   /** Exact model metadata emitted after the DSH LLM service is ready. */
   private bridgeCatalog = new Map<string, DshBridgeCatalogModel>();
   /** Notified after bridge metadata invalidates the backend model catalog. */
@@ -60,6 +64,21 @@ export class DshBackend extends AcpBackend {
       missingOptionsMessage: options.missingOptionsMessage
         ?? 'No DSH target selected. Configure a DSH command in ACP Settings.',
     });
+  }
+
+  protected override rememberSessionTitle(sessionId: string, title: string | undefined): void {
+    const normalized = title?.replace(/\s+/g, ' ').trim();
+    if (normalized && !isPlaceholderSessionTitle(normalized)) {
+      this.sessionTitles.set(sessionId, normalized);
+    }
+  }
+
+  protected override resolveSessionTitle(sessionId: string, title: string | undefined): string {
+    const cached = this.sessionTitles.get(sessionId);
+    if (cached) {return cached;}
+    const resolved = super.resolveSessionTitle(sessionId, title);
+    this.rememberSessionTitle(sessionId, resolved);
+    return resolved;
   }
 
   protected override async configModels(directory?: string) {
@@ -141,6 +160,7 @@ export class DshBackend extends AcpBackend {
     } finally {
       this.pipelines.clear();
       this.pendingBridgeMessages.clear();
+      this.sessionTitles.clear();
     }
   }
 

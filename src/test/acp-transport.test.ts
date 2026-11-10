@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { once } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { WebSocketServer } from 'ws';
@@ -139,15 +140,17 @@ describe('ACP local transport lifecycle', () => {
     const exits: string[] = [];
     const spawned = spawnAcpAgent({
       command: process.execPath,
-      args: nodeScript(`process.stderr.write(${JSON.stringify(marker + '\n')}); setTimeout(() => { process.stderr.write('profile boot failed\\n'); process.exit(3); }, 10);`),
+      // Keep the child alive after readiness to exercise asynchronous exit reporting.
+      args: nodeScript(`process.stderr.write(${JSON.stringify(marker + '\n')}); setTimeout(() => { process.stderr.write('profile boot failed\\n'); process.exit(3); }, 250);`),
       stderr: 'pipe',
       readiness: { parse: parseDshBridgeReadyLine, timeoutMs: 1_000 },
       onExit: message => exits.push(message),
     });
     children.push(spawned);
+    const exited = once(spawned.process, 'exit', { signal: AbortSignal.timeout(2_000) });
 
     await expect(spawned.ready).resolves.toMatchObject({ nonce });
-    await new Promise(resolve => setTimeout(resolve, 100));
+    await expect(exited).resolves.toEqual([3, null]);
     expect(exits).toHaveLength(1);
     expect(exits[0]).toContain('code=3, signal=none');
     expect(exits[0]).toContain('profile boot failed');

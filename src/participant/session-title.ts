@@ -2,6 +2,8 @@ import * as vscode from 'vscode';
 import type { ExtensionState, BackendContext } from '../types';
 import type { SerializableSessionMeta, SessionTitleSource } from '../backend/serializable/types';
 import type { SessionState } from '../types';
+import { isPlaceholderSessionTitle } from '../backend/session-title';
+export { isPlaceholderSessionTitle } from '../backend/session-title';
 
 export interface ApplySessionTitleOptions {
   /** Real backend session id. */
@@ -29,6 +31,7 @@ export interface ApplyProvisionalSessionTitleOptions {
 export interface ResolvedSessionTitle {
   title: string;
   source: SessionTitleSource;
+  provisional?: boolean;
 }
 
 export interface ResolveRestoredSessionTitleOptions {
@@ -60,22 +63,6 @@ export interface ResolveFinalTurnTitleOptions {
     titleSource?: SessionTitleSource;
     provisionalTitle?: boolean;
   };
-}
-
-export function isPlaceholderSessionTitle(title: string | undefined): boolean {
-  const normalized = title?.trim() ?? '';
-  return !normalized
-    || normalized === 'New OpenCode Session'
-    || normalized === 'New ACP Agent Session'
-    || normalized === 'New Reasonix Session'
-    || normalized === 'New DeepSeek Harness Session'
-    || normalized.startsWith('OpenCode Session ')
-    || normalized.startsWith('ACP Session ')
-    || normalized.startsWith('ACP Agent Session ')
-    || normalized.startsWith('Reasonix Session ')
-    || normalized.startsWith('DSH Session ')
-    || normalized.startsWith('DeepSeek Harness Session ')
-    || normalized.startsWith('Session ');
 }
 
 function titlePriority(source: SessionTitleSource | undefined): number {
@@ -231,32 +218,35 @@ export class SessionTitleService {
 
   resolveRestoredTitle(options: ResolveRestoredSessionTitleOptions): ResolvedSessionTitle {
     const persistedTitle = getPersistedFinalSessionTitle(options.meta);
-    if (persistedTitle) {
-      return persistedTitle;
-    }
-
-    const candidates: Array<{ title: string; source: SessionTitleSource; order: number }> = [];
+    const candidates: Array<{ title: string; source: SessionTitleSource; order: number; provisional?: boolean }> = [];
     let order = 0;
-    const addCandidate = (title: string | undefined, source: SessionTitleSource) => {
+    const addCandidate = (title: string | undefined, source: SessionTitleSource, provisional?: boolean) => {
       const normalized = getMeaningfulRestoredTitle(title);
       if (!normalized) {
         return;
       }
-      candidates.push({ title: normalized, source, order: order++ });
+      candidates.push({ title: normalized, source, order: order++, provisional });
     };
+
+    if (persistedTitle) {addCandidate(persistedTitle.title, persistedTitle.source);}
+    const sessionStates = [...this.ctx.sessions.values()]
+      .filter(session => session.backendSessionId === options.backendSessionId);
+    const backendTitle = normalizeTitleText(options.backendTitle);
+    const backendIsProvisional = isProvisionalTitleEcho(backendTitle, options.meta)
+      || sessionStates.some(session => isProvisionalTitleEcho(backendTitle, session));
 
     // Fresh backend metadata wins ties with cached runtime titles from the
     // same source; stronger runtime provenance (manual/copilot-style) still
     // outranks plain backend/history titles.
-    addCandidate(options.backendTitle, 'backend');
+    addCandidate(backendTitle, backendIsProvisional ? 'history' : 'backend', backendIsProvisional);
 
     const seenStates = new Set<SessionState>();
-    for (const sessionState of this.ctx.sessions.values()) {
+    for (const sessionState of sessionStates) {
       if (sessionState.backendSessionId !== options.backendSessionId || seenStates.has(sessionState)) {
         continue;
       }
       seenStates.add(sessionState);
-      addCandidate(sessionState.title, getRuntimeTitleSource(sessionState));
+      addCandidate(sessionState.title, getRuntimeTitleSource(sessionState), sessionState.provisionalTitle);
     }
 
     candidates.sort((a, b) => {
@@ -266,12 +256,13 @@ export class SessionTitleService {
 
     const best = candidates[0];
     if (best) {
-      return { title: best.title, source: best.source };
+      return { title: best.title, source: best.source, ...(best.provisional ? { provisional: true } : {}) };
     }
 
     return {
       title: getHistoryDerivedSessionTitle(options.history, options.backendSessionId),
       source: 'history',
+      provisional: true,
     };
   }
 
@@ -283,19 +274,26 @@ export class SessionTitleService {
       emitListChanged?: boolean;
     },
   ): Promise<ResolvedSessionTitle> {
-    const resolved = this.resolveRestoredTitle(options);
-    if (!isPlaceholderSessionTitle(resolved.title)) {
-      await this.applyFinal({
-        backendSessionId: options.backendSessionId,
-        vscodeSessionId: options.vscodeSessionId,
-        title: resolved.title,
-        createdAt: options.createdAt,
-        overwrite: options.overwrite,
-        emitListChanged: options.emitListChanged,
-        source: resolved.source,
-      });
-    }
-    return resolved;
+    return enqueueSessionTitleApplication(this.ctx, options.backendSessionId, async () => {
+      const resolved = this.resolveRestoredTitle(options);
+      if (!isPlaceholderSessionTitle(resolved.title)) {
+        const titleOptions = {
+          backendSessionId: options.backendSessionId,
+          vscodeSessionId: options.vscodeSessionId,
+          title: resolved.title,
+          createdAt: options.createdAt,
+          emitListChanged: options.emitListChanged,
+        };
+        if (resolved.provisional) {
+          await applyProvisionalSessionTitleNow(this.state, this.ctx, titleOptions);
+        } else {
+          await applySessionTitleNow(this.state, this.ctx, {
+            ...titleOptions, overwrite: options.overwrite, source: resolved.source,
+          });
+        }
+      }
+      return resolved;
+    });
   }
 
   async resolveLiveBackendTitle(
@@ -413,11 +411,43 @@ export class SessionTitleService {
   }
 }
 
+// Runtime snapshots clone BackendContext, while sharing its SessionStore.
+// Queue the whole title application so older disk appends cannot finish after
+// a newer manual title, including across separate SessionTitleService objects.
+const titleApplicationQueues = new WeakMap<BackendContext['sessionStore'], Map<string, Promise<void>>>();
+
+function enqueueSessionTitleApplication<T>(ctx: BackendContext, sessionId: string, apply: () => Promise<T>): Promise<T> {
+  const store = ctx.sessionStore;
+  let queue = titleApplicationQueues.get(store);
+  if (!queue) {
+    queue = new Map();
+    titleApplicationQueues.set(store, queue);
+  }
+  const result = (queue.get(sessionId) ?? Promise.resolve()).then(apply);
+  const settled = result.then(() => undefined, () => undefined);
+  queue.set(sessionId, settled);
+  void settled.then(() => {
+    if (queue.get(sessionId) === settled) {
+      queue.delete(sessionId);
+      if (queue.size === 0) {titleApplicationQueues.delete(store);}
+    }
+  });
+  return result;
+}
+
 /**
  * Keep the three title surfaces in sync:
  * backend session, in-memory VS Code session mapping, and SessionStore metadata.
  */
-export async function applySessionTitle(
+export function applySessionTitle(
+  state: ExtensionState,
+  ctx: BackendContext,
+  options: ApplySessionTitleOptions,
+): Promise<string | undefined> {
+  return enqueueSessionTitleApplication(ctx, options.backendSessionId, () => applySessionTitleNow(state, ctx, options));
+}
+
+async function applySessionTitleNow(
   state: ExtensionState,
   ctx: BackendContext,
   options: ApplySessionTitleOptions,
@@ -428,6 +458,16 @@ export async function applySessionTitle(
   }
 
   const logger = state.outputChannel;
+  const canApplyTitle = (): boolean => {
+    const sessions = new Set(ctx.sessions.values());
+    const requestedSession = options.vscodeSessionId ? ctx.sessions.get(options.vscodeSessionId) : undefined;
+    if (requestedSession) {sessions.add(requestedSession);}
+    return [...sessions].every(session => session.backendSessionId !== options.backendSessionId
+      || shouldOverwriteTitle(session.title, session.titleSource, options.source, options.overwrite));
+  };
+  // Decide before writing either durable surface, not just before mutating
+  // the runtime mapping. A late generator must not unpin a manual title.
+  if (!canApplyTitle()) {return undefined;}
 
   if (options.updateBackend) {
     try {
@@ -445,6 +485,7 @@ export async function applySessionTitle(
       );
     }
   }
+  if (!canApplyTitle()) {return undefined;}
 
   let createdAt = options.createdAt;
   const updateState = (stateKey?: string) => {
@@ -492,7 +533,15 @@ export async function applySessionTitle(
   return title;
 }
 
-export async function applyProvisionalSessionTitle(
+export function applyProvisionalSessionTitle(
+  state: ExtensionState,
+  ctx: BackendContext,
+  options: ApplyProvisionalSessionTitleOptions,
+): Promise<string | undefined> {
+  return enqueueSessionTitleApplication(ctx, options.backendSessionId, () => applyProvisionalSessionTitleNow(state, ctx, options));
+}
+
+async function applyProvisionalSessionTitleNow(
   state: ExtensionState,
   ctx: BackendContext,
   options: ApplyProvisionalSessionTitleOptions,
@@ -503,6 +552,14 @@ export async function applyProvisionalSessionTitle(
   }
 
   const logger = state.outputChannel;
+  const canApplyTitle = (): boolean => {
+    const sessions = new Set(ctx.sessions.values());
+    const requestedSession = options.vscodeSessionId ? ctx.sessions.get(options.vscodeSessionId) : undefined;
+    if (requestedSession) {sessions.add(requestedSession);}
+    return [...sessions].every(session => session.backendSessionId !== options.backendSessionId
+      || isPlaceholderSessionTitle(session.title) || session.provisionalTitle === true);
+  };
+  if (!canApplyTitle()) {return undefined;}
   if (options.updateBackend) {
     try {
       const updateResult = await ctx.backend.sessions.update(options.backendSessionId, {
@@ -517,6 +574,7 @@ export async function applyProvisionalSessionTitle(
       );
     }
   }
+  if (!canApplyTitle()) {return undefined;}
 
   let createdAt = options.createdAt;
   const updateState = (stateKey?: string) => {

@@ -81,7 +81,13 @@ function makeBackend(): Backend {
 }
 
 describe('session provider title restore', () => {
-  it('keeps persisted final title when opened session has placeholder backend title', async () => {
+  it.each([
+    { name: 'keeps persisted final title when opened session has placeholder backend title', title: 'Persisted Generated Title', source: 'copilot-style' as const, provisional: false, liveState: true, backendEcho: false },
+    { name: 'keeps an existing prompt fallback provisional when reopened', title: 'first prompt should not overwrite title', source: 'history' as const, provisional: true, liveState: true, backendEcho: false },
+    { name: 'keeps a restored prompt fallback provisional when rebuilding the session mapping', title: 'first prompt should not overwrite title', source: 'history' as const, provisional: true, liveState: false, backendEcho: false },
+    { name: 'keeps a DSH-style backend echo of the existing provisional title provisional', title: 'first prompt should not overwrite title', source: 'history' as const, provisional: true, liveState: true, backendEcho: true },
+    { name: 'keeps a DSH-style backend echo of persisted provisional metadata provisional', title: 'first prompt should not overwrite title', source: 'history' as const, provisional: true, liveState: false, backendEcho: true },
+  ])('$name', async ({ title, source, provisional, liveState, backendEcho }) => {
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'acpilot-title-restore-'));
     try {
       const sessionDir = path.join(tmpDir, '.acpilot', 'opencode', 'ses_restore');
@@ -105,20 +111,25 @@ describe('session provider title restore', () => {
       ].join(''), 'utf-8');
 
       const backend = makeBackend();
+      if (backendEcho) {
+        vi.mocked(backend.sessions.get).mockResolvedValue({
+          data: { id: 'ses_restore', title, createdAt: new Date('2026-05-28T03:00:00Z') },
+        });
+      }
       const sessionMap = new Map<string, unknown>();
-      sessionMap.set('acpilot.opencode:/ses_restore', {
+      if (liveState) {sessionMap.set('acpilot.opencode:/ses_restore', {
         backendSessionId: 'ses_restore',
         turnMap: [],
         title: 'first prompt should not overwrite title',
         titleSource: 'history',
         provisionalTitle: true,
         createdAt: new Date('2026-05-28T03:00:00.000Z'),
-      });
+      });}
       const meta = {
         id: 'ses_restore',
-        title: 'Persisted Generated Title',
-        titleSource: 'copilot-style' as const,
-        provisionalTitle: false,
+        title,
+        titleSource: source,
+        provisionalTitle: provisional,
         createdAt: '2026-05-28T03:00:00.000Z',
         backendName: 'opencode',
       };
@@ -180,26 +191,29 @@ describe('session provider title restore', () => {
         { inputState: {} as vscode.ChatSessionInputState },
       );
 
-      expect(session.title).toBe('Persisted Generated Title');
-      expect(sessionMap.get('acpilot.opencode:/ses_restore')).toEqual(
+      expect(session.title).toBe(title);
+      expect([...sessionMap.values()].find(value =>
+        (value as { backendSessionId?: string }).backendSessionId === 'ses_restore')).toEqual(
         expect.objectContaining({
-          title: 'Persisted Generated Title',
-          titleSource: 'copilot-style',
-          provisionalTitle: false,
+          title,
+          titleSource: source,
+          provisionalTitle: provisional,
         }),
       );
       expect(ctx.sessionStore.updateMeta).toHaveBeenCalledWith(
         'ses_restore',
         expect.objectContaining({
-          title: 'Persisted Generated Title',
-          titleSource: 'copilot-style',
-          provisionalTitle: false,
+          title,
+          titleSource: source,
+          provisionalTitle: provisional,
         }),
       );
-      expect(ctx.sessionStore.updateMeta).not.toHaveBeenCalledWith(
-        'ses_restore',
-        expect.objectContaining({ title: 'first prompt should not overwrite title' }),
-      );
+      if (!provisional) {
+        expect(ctx.sessionStore.updateMeta).not.toHaveBeenCalledWith(
+          'ses_restore',
+          expect.objectContaining({ title: 'first prompt should not overwrite title' }),
+        );
+      }
     } finally {
       await fs.rm(tmpDir, { recursive: true, force: true });
     }

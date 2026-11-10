@@ -1,4 +1,5 @@
 import type {
+  ActiveSessionMessage,
   RequestPermissionRequest,
   RequestPermissionResponse,
   SessionUpdate,
@@ -6,6 +7,9 @@ import type {
 import path from 'node:path';
 import type {
   BackendPipelineOptions,
+  BackendPipelineResult,
+  BackendPipelineStream,
+  BackendPipelineToken,
 } from '../../backend/backend';
 import { ToolInvocationSSP } from '../../ssp/impl/tool-invocation';
 import { AcpPipeline } from '../acp/pipeline';
@@ -51,6 +55,88 @@ export class DshPipeline extends AcpPipeline {
   private readonly pendingExternalEditTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly deferredDiffToolCalls = new Set<string>();
   private disposed = false;
+  private readonly scopedStreams = new Map<string, BackendPipelineStream>();
+  private readonly liveTools = new Map<string, { target: BackendPipelineStream; status: string; subagent: boolean }>();
+
+  override async run(events: AsyncIterable<ActiveSessionMessage>, token: BackendPipelineToken): Promise<BackendPipelineResult> {
+    let stopped = false;
+    let result: BackendPipelineResult | undefined;
+    const observed = (async function* () {
+      for await (const message of events) {
+        if (message.kind === 'stop') {stopped = true;}
+        yield message;
+      }
+    })();
+    try {
+      result = await super.run(observed, token);
+      // DSH waits for its children and resumes their parent inside the ACP
+      // prompt. The host must not schedule a second empty continuation prompt.
+      return { ...result, hadSubagentTasks: false };
+    } finally {
+      // A user Stop closes ACP's stream before DSH can emit terminal updates.
+      // Natural completion keeps authoritative subagent/end delivery intact.
+      if (token.isCancellationRequested || !stopped || !result?.completed) {
+        this.beforeStop();
+        for (const [id, tool] of this.liveTools) {
+          if (tool.status !== 'completed' && tool.status !== 'error') {
+            tool.target.update(id, { state: { status: 'error', error: token.isCancellationRequested ? 'Cancelled' : 'Stream closed before tool completion' } });
+            tool.status = 'error';
+          }
+        }
+        this.dispose();
+      }
+    }
+  }
+
+  private scopeStream(id: string, parentId?: string): BackendPipelineStream {
+    const existing = this.scopedStreams.get(id);
+    if (existing) {return existing;}
+    const parent = parentId && parentId !== id ? this.scopeStream(parentId) : this.sss;
+    const target = parent.subsession(id) as BackendPipelineStream;
+    this.scopedStreams.set(id, target);
+    return target;
+  }
+
+  private handleManagedTool(message: DshBridgeToolMessage): void {
+    const call = message.type === 'tool_call' ? message : this.bridgeCalls.get(message.toolCallId);
+    if (message.type === 'tool_result' && !call && !this.liveTools.has(message.toolCallId)) {return;}
+    if (message.type === 'tool_call') {
+      this.bridgeCalls.set(message.toolCallId, message);
+      this.flushPendingAcpToolCall(message.toolCallId);
+    }
+    const presentation = resolveReadPresentation(message.presentation ?? call?.presentation, this.directory);
+    const subagent = presentation?.card === 'subagent';
+    const tracked = this.liveTools.get(message.toolCallId);
+    const target = tracked?.target ?? (message.subAgentInvocationId
+      ? this.scopeStream(message.subAgentInvocationId, message.parentSubAgentInvocationId)
+      : this.sss);
+    const status: 'running' | 'completed' | 'error' = subagent
+      ? presentation?.status === 'completed' ? 'completed' : presentation?.status === 'error' ? 'error' : 'running'
+      : message.type === 'tool_result' ? (message.isError ? 'error' : 'completed') : 'running';
+    // Start-tool results describe admission, while subagent/end describes work.
+    const output = message.type === 'tool_result' && status !== 'running'
+      ? bridgeOutputText(message, presentation) : undefined;
+    const input = {
+      ...presentationInput(presentation, call?.rawInput, this.directory),
+      ...(subagent && typeof presentation?.agentName === 'string' ? { agentName: presentation.agentName } : {}),
+    };
+    const state = {
+      status, input, title: presentationTitle(presentation) ?? call?.toolName ?? message.toolName,
+      originalToolName: message.toolName, metadata: presentationMetadata(message.toolName, presentation),
+      ...(output !== undefined ? { output } : {}),
+      ...(status === 'error' ? { error: output || String(presentation?.stopReason ?? 'Subagent failed') } : {}),
+    };
+    const toolName = subagent ? 'subagent' : displayToolName(message.toolName, presentation);
+    if (target.has(message.toolCallId)) {
+      target.update(message.toolCallId, { toolName, state });
+    } else {
+      target.push(new ToolInvocationSSP({ partId: message.toolCallId, callId: message.toolCallId, toolName, state,
+        sessionId: message.agentSessionId ?? message.sessionId,
+        ...(message.subAgentInvocationId ? { subAgentInvocationId: message.subAgentInvocationId } : {}),
+      }));
+    }
+    this.liveTools.set(message.toolCallId, { target, status, subagent });
+  }
 
   constructor(options: BackendPipelineOptions) {
     super(options);
@@ -59,6 +145,12 @@ export class DshPipeline extends AcpPipeline {
   /** Called by DshBackend when one bridge line is received from the user's DSH process. */
   handleBridgeMessage(message: DshBridgeToolMessage): void {
     if (this.disposed || message.sessionId !== this.sessionId) {return;}
+    if (message.subAgentInvocationId && !this.liveTools.get(message.subAgentInvocationId)?.subagent) {return;}
+    if (message.subAgentInvocationId || message.presentation?.card === 'subagent'
+      || this.liveTools.get(message.toolCallId)?.subagent) {
+      this.handleManagedTool(message);
+      return;
+    }
     if (message.type === 'tool_call') {
       this.bridgeCalls.set(message.toolCallId, message);
       const externalEditTimer = this.pendingExternalEditTimers.get(message.toolCallId);
@@ -268,11 +360,31 @@ export class DshPipeline extends AcpPipeline {
   }
 
   private dispatchAcpUpdate(update: SessionUpdate, eventSessionId: string | null | undefined): void {
+    if (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update') {
+      const call = this.bridgeCalls.get(update.toolCallId);
+      if (call?.presentation.card === 'subagent' || this.liveTools.get(update.toolCallId)?.subagent) {
+        if (call && !this.liveTools.has(update.toolCallId)) {this.handleManagedTool(call);}
+        if (update.status === 'failed') {
+          const tracked = this.liveTools.get(update.toolCallId);
+          tracked?.target.update(update.toolCallId, { state: { status: 'error', error: (update.sessionUpdate === 'tool_call_update' ? dshToolOutputToText(update) : undefined) || 'Subagent activation failed' } });
+          if (tracked) {tracked.status = 'error';}
+        }
+        return;
+      }
+    }
     if (update.sessionUpdate === 'tool_call_update' && this.deferredDiffToolCalls.has(update.toolCallId)) {
       this.applyDeferredDiffUpdate(update);
       return;
     }
     super.handleSessionUpdate(update, eventSessionId);
+    if (update.sessionUpdate === 'tool_call' && this.sss.has(update.toolCallId)) {
+      this.liveTools.set(update.toolCallId, { target: this.sss, status: update.status === 'completed' ? 'completed' : update.status === 'failed' ? 'error' : 'running', subagent: false });
+    } else if (update.sessionUpdate === 'tool_call_update') {
+      const tracked = this.liveTools.get(update.toolCallId);
+      if (tracked && (update.status === 'completed' || update.status === 'failed')) {
+        tracked.status = update.status === 'completed' ? 'completed' : 'error';
+      }
+    }
     if (update.sessionUpdate === 'tool_call') {
       const bridgeCall = this.bridgeCalls.get(update.toolCallId)
         ?? bridgeCallFromAcpUpdate(update, this.sessionId);
@@ -405,8 +517,8 @@ export class DshPipeline extends AcpPipeline {
   private applyBridgeCall(message: DshBridgeToolCallMessage): void {
     const partId = message.toolCallId;
     if (!this.sss.has(partId)) {return;}
-    const presentation = message.presentation;
-    const input = presentationInput(presentation, message.rawInput);
+    const presentation = resolveReadPresentation(message.presentation, this.directory);
+    const input = presentationInput(presentation, message.rawInput, this.directory);
     const title = presentationTitle(presentation) ?? message.toolName;
     this.sss.update(partId, {
       toolName: displayToolName(message.toolName, presentation),
@@ -428,12 +540,14 @@ export class DshPipeline extends AcpPipeline {
       this.acpToolCalls.get(message.toolCallId),
       output,
     );
-    const presentation = message.presentation?.card === 'read'
+    const presentation = resolveReadPresentation(message.presentation?.card === 'read'
       ? message.presentation
-      : parsedReadPresentation ?? message.presentation ?? callPresentation;
-    const input = presentationInput(presentation, call?.rawInput);
+      : parsedReadPresentation ?? message.presentation ?? callPresentation, this.directory);
+    const input = presentationInput(presentation, call?.rawInput, this.directory);
     const title = presentationTitle(presentation) ?? call?.toolName ?? message.toolName;
     const status = message.isError ? 'error' : 'completed';
+    const tracked = this.liveTools.get(message.toolCallId);
+    if (tracked) {tracked.status = status;}
     const metadata = presentationMetadata(message.toolName, presentation, message);
 
     const externalEditId = `external-edit-${message.toolCallId}`;
@@ -812,16 +926,20 @@ function mergeToolLocations(
 function presentationInput(
   presentation: DshBridgePresentation | undefined,
   rawInput?: unknown,
+  directory?: string,
 ): Record<string, unknown> {
   if (isRecord(rawInput)) {
-    return withCanonicalFilePath(presentation, rawInput);
+    return withCanonicalFilePath(presentation, rawInput, directory);
   }
   if (rawInput !== undefined) {return { value: rawInput };
   }
 
   if (!presentation) {return {};}
   if (isRecord(presentation.rawInput)) {
-    return withCanonicalFilePath(presentation, presentation.rawInput);
+    return withCanonicalFilePath(presentation, presentation.rawInput, directory);
+  }
+  if (presentation.card === 'read') {
+    return withCanonicalFilePath(presentation, {}, directory);
   }
   const locations = presentationLocations(presentation);
   const firstLocation = locations?.[0];
@@ -833,7 +951,7 @@ function presentationInput(
   }
   if (firstLocation) {
     return {
-      filePath: firstLocation.path,
+      filePath: resolvePresentationPath(firstLocation.path, directory),
       ...(firstLocation.line !== undefined ? { line: firstLocation.line } : {}),
     };
   }
@@ -843,17 +961,44 @@ function presentationInput(
 function withCanonicalFilePath(
   presentation: DshBridgePresentation | undefined,
   rawInput: Record<string, unknown>,
+  directory?: string,
 ): Record<string, unknown> {
-  const filePath = firstString(
-    rawInput.filePath,
-    rawInput.file_path,
-    rawInput.filepath,
-    rawInput.path,
-    rawInput.filename,
-  ) ?? (presentation?.card === 'read' ? firstString(presentation.path) : presentationLocations(presentation)?.[0]?.path);
-  return filePath && rawInput.filePath === undefined
-    ? { ...rawInput, filePath }
-    : rawInput;
+  const filePath = (presentation?.card === 'read' ? firstString(presentation.path) : undefined)
+    ?? firstString(rawInput.filePath, rawInput.file_path, rawInput.filepath, rawInput.path, rawInput.filename)
+    ?? presentationLocations(presentation)?.[0]?.path;
+  if (!filePath) {return rawInput;}
+  return {
+    ...rawInput,
+    filePath: resolvePresentationPath(filePath, directory),
+    ...(presentation?.card === 'read' ? {
+      offset: rawInput.offset ?? presentation.offset,
+      limit: rawInput.limit ?? presentation.limit,
+    } : {}),
+  };
+}
+
+function resolvePresentationPath(filePath: string, directory?: string): string {
+  // Keep absolute POSIX, Windows drive and UNC paths intact. Only relative
+  // paths belong to the session workspace, never the extension host's cwd.
+  if (path.isAbsolute(filePath) || path.win32.isAbsolute(filePath) || !directory) {return filePath;}
+  const resolver = path.win32.isAbsolute(directory) && !path.posix.isAbsolute(directory) ? path.win32 : path;
+  return resolver.resolve(directory, filePath);
+}
+
+function resolveReadPresentation(
+  presentation: DshBridgePresentation | undefined,
+  directory?: string,
+): DshBridgePresentation | undefined {
+  if (presentation?.card !== 'read') {return presentation;}
+  return {
+    ...presentation,
+    ...(typeof presentation.path === 'string' ? { path: resolvePresentationPath(presentation.path, directory) } : {}),
+    ...(Array.isArray(presentation.locations) ? {
+      locations: presentation.locations.map(location => isRecord(location) && typeof location.path === 'string'
+        ? { ...location, path: resolvePresentationPath(location.path, directory) }
+        : location),
+    } : {}),
+  };
 }
 
 function displayToolName(toolName: string, presentation: DshBridgePresentation | undefined): string {

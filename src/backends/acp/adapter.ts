@@ -1306,6 +1306,7 @@ export class AcpBackend implements Backend<ActiveSessionMessage> {
           this.transientCleanupStates.get(connection)?.delete(session.sessionId);
           this.clearTransientCleanupResult(connection, session.sessionId);
         }
+        if (!opts?.transient) {this.rememberSessionTitle(session.sessionId, opts?.title);}
         return { data: { id: session.sessionId, title: opts?.title ?? `${this.sessionTitlePrefix} ${session.sessionId.slice(0, 8)}`, createdAt: new Date() } };
       } catch (err) {
         return { error: err instanceof Error ? err.message : String(err) };
@@ -1532,7 +1533,7 @@ export class AcpBackend implements Backend<ActiveSessionMessage> {
         return {
           data: response.sessions.map(item => ({
             id: item.sessionId,
-            title: item.title ?? `${this.sessionTitlePrefix} ${item.sessionId.slice(0, 8)}`,
+            title: this.resolveSessionTitle(item.sessionId, item.title ?? undefined),
             createdAt: new Date(item.updatedAt ?? Date.now()),
           })),
         };
@@ -1551,9 +1552,9 @@ export class AcpBackend implements Backend<ActiveSessionMessage> {
         return {
           data: {
             id,
-            title: active.meta && typeof active.meta.title === 'string'
+            title: this.resolveSessionTitle(id, active.meta && typeof active.meta.title === 'string'
               ? active.meta.title
-              : `${this.sessionTitlePrefix} ${id.slice(0, 8)}`,
+              : undefined),
             createdAt: new Date(),
           },
         };
@@ -1578,7 +1579,7 @@ export class AcpBackend implements Backend<ActiveSessionMessage> {
         return {
           data: {
             id: item.sessionId,
-            title: item.title ?? `${this.sessionTitlePrefix} ${id.slice(0, 8)}`,
+            title: this.resolveSessionTitle(id, item.title ?? undefined),
             createdAt: new Date(item.updatedAt ?? Date.now()),
           },
         };
@@ -1586,9 +1587,19 @@ export class AcpBackend implements Backend<ActiveSessionMessage> {
         return { error: error instanceof Error ? error.message : String(error) };
       }
     },
-    update: async (id: string, opts: { title?: string }) => ({ data: { id, title: opts?.title ?? id, createdAt: new Date() } }),
+    update: async (id: string, opts: { title?: string }) => {
+      this.rememberSessionTitle(id, opts?.title);
+      return { data: { id, title: opts?.title ?? id, createdAt: new Date() } };
+    },
     messages: async () => ({ data: { items: [] } as BackendMessageHistory }),
   };
+
+  /** ACP has no standard title write; titleless backends can retain host titles. */
+  protected rememberSessionTitle(_sessionId: string, _title: string | undefined): void {}
+
+  protected resolveSessionTitle(sessionId: string, title: string | undefined): string {
+    return title ?? `${this.sessionTitlePrefix} ${sessionId.slice(0, 8)}`;
+  }
 
   // -------------------------------------------------------------------------
   // Config operations (ACP agents own their config; minimal stubs)

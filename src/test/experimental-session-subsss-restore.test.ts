@@ -164,6 +164,44 @@ function streamRecord(
 }
 
 describe('SubSSS externalEdit restore', () => {
+  it('restores a legacy DSH Read link to an existing workspace file', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-read-restore-'));
+    const previousFolders = vscode.workspace.workspaceFolders;
+    try {
+      const sessionDir = path.join(tmpDir, '.acpilot', 'dsh', 'ses_restore');
+      const file = path.join(tmpDir, 'Script', 'AWYActor.cs');
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, 'existing file', 'utf8');
+      writeJsonl(path.join(sessionDir, 'session.jsonl'), [
+        buildLine('version', '2.0'),
+        buildLine('stream-part', streamRecord('userPrompt', 'userPrompt:0', { text: 'read actor' }, { sequence: 0 })),
+        buildLine('stream-part', streamRecord('toolInvocation', 'legacy-read', {
+          partId: 'legacy-read', toolName: 'read', callId: 'legacy-read',
+          state: { status: 'completed', input: { path: 'Script/AWYActor.cs', offset: 2, limit: 2 },
+            metadata: { dshToolName: 'read', dshPresentation: { card: 'read', path: 'Script/AWYActor.cs', offset: 2 } } },
+        }, { sequence: 1 })),
+      ]);
+      (vscode.workspace as { workspaceFolders?: Array<{ uri: vscode.Uri; name: string; index: number }> }).workspaceFolders = [
+        { uri: vscode.Uri.file(tmpDir), name: 'test', index: 0 },
+      ];
+      const { state, ctx } = makeState(sessionDir);
+      const { provider } = createSessionContentProvider(state, ctx, { subscriptions: [] } as unknown as vscode.ExtensionContext);
+      const session = await provider.provideChatSessionContent(
+        vscode.Uri.parse('acpilot.opencode:/ses_restore'),
+        { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
+        { inputState: {} as vscode.ChatSessionInputState },
+      );
+      const part = getFirstResponseParts(session).find(value => (value as { toolCallId?: string }).toolCallId === 'legacy-read') as {
+        invocationMessage: unknown; toolSpecificData: { values: Array<{ uri: vscode.Uri }> };
+      };
+      expect(String(part.invocationMessage)).toBe('Read [](' + vscode.Uri.file(file).toString() + '#2-3)');
+      expect(fs.existsSync(part.toolSpecificData.values[0].uri.fsPath)).toBe(true);
+    } finally {
+      (vscode.workspace as { workspaceFolders: typeof previousFolders }).workspaceFolders = previousFolders;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   it('does not restore subagent assistant text or reasoning as root response parts', async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'subsss-text-restore-'));
     try {

@@ -55,7 +55,14 @@ export interface DshBridgePresentation {
   [key: string]: unknown;
 }
 
-export interface DshBridgeToolCallMessage {
+/** Actual event owner and Copilot scope when a managed child emits a tool. */
+export interface DshBridgeAgentScope {
+  agentSessionId?: string;
+  subAgentInvocationId?: string;
+  parentSubAgentInvocationId?: string;
+}
+
+export interface DshBridgeToolCallMessage extends DshBridgeAgentScope {
   type: 'tool_call';
   protocol: typeof DSH_BRIDGE_PROTOCOL;
   sessionId: string;
@@ -66,7 +73,7 @@ export interface DshBridgeToolCallMessage {
   presentation: DshBridgePresentation;
 }
 
-export interface DshBridgeToolResultMessage {
+export interface DshBridgeToolResultMessage extends DshBridgeAgentScope {
   type: 'tool_result';
   protocol: typeof DSH_BRIDGE_PROTOCOL;
   sessionId: string;
@@ -149,7 +156,11 @@ export function parseDshBridgeToolLine(line: string): DshBridgeToolMessage | und
       || !nonEmptyString(value.sessionId)
       || !nonEmptyString(value.toolCallId)
       || !nonEmptyString(value.rootToolCallId)
-      || !nonEmptyString(value.toolName)) {
+      || !nonEmptyString(value.toolName)
+      || (value.agentSessionId !== undefined && !nonEmptyString(value.agentSessionId))
+      || (value.subAgentInvocationId !== undefined && !nonEmptyString(value.subAgentInvocationId))
+      || (value.parentSubAgentInvocationId !== undefined && (!nonEmptyString(value.parentSubAgentInvocationId)
+        || value.parentSubAgentInvocationId === value.subAgentInvocationId))) {
       return undefined;
     }
 

@@ -1,12 +1,13 @@
 /**
  * ACPilot's optional DeepSeek Harness presentation bridge.
  *
- * ACP owns stdout. This plugin only observes the DSH tool lifecycle and emits
- * versioned, JSON-safe presentation messages on stderr, where ACPilot's DSH
- * backend can merge them with standard ACP tool updates.
+ * ACP owns stdout. This plugin projects DSH tool and subagent lifecycles,
+ * coordinates cancellation for ACPilot-managed descendants, and emits
+ * versioned, JSON-safe presentation messages on stderr for the DSH backend.
  */
 
 import path from 'node:path'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { readFile } from 'node:fs/promises'
 
 export const name = 'acpilot-dsh-bridge'
@@ -26,6 +27,206 @@ export function apply(ctx) {
   const approvalEnabledSessions = new WeakSet()
   /** Most recent tool agent observed for each session; used for identity diagnostics. */
   const recentExecAgents = new Map()
+  // The execution waterfall retains exact identity across parallel delegations.
+  const execution = new AsyncLocalStorage()
+  const childScopes = new Map()
+  const wrappedAgents = new Map()
+  const cancellationEpochs = new WeakMap()
+
+  const messageScope = (agent) => {
+    const agentSessionId = sessionIdentity({ agent })
+    const scope = childScopes.get(agentSessionId)
+    return scope ? {
+      sessionId: scope.sessionId,
+      agentSessionId,
+      subAgentInvocationId: scope.callId,
+      ...(scope.subAgentInvocationId ? { parentSubAgentInvocationId: scope.subAgentInvocationId } : {}),
+    } : { sessionId: agentSessionId }
+  }
+
+  const interruptScope = (id, parentAgent) => {
+    const runtime = ctx.get?.('subagents') ?? ctx.subagents
+    if (typeof runtime?.interrupt !== 'function') return
+    const scope = childScopes.get(id)
+    // interrupt authorizes the exact ancestor and throws on refusal. It keeps
+    // the local inbox, so a user Stop must also discard already-queued work.
+    runtime.interrupt(id, { kind: 'ancestor', agent: parentAgent })
+    const child = scope?.childAgent
+    const registry = ctx.get?.('agents') ?? ctx.agents
+    if (scope?.cancelled && scope.active && childScopes.get(id) === scope && child
+      && registry?.get?.(id) === child) {
+      child.cancel({ kind: 'parent' })
+    }
+  }
+
+  const observeCancellation = (agent) => {
+    if (!bridgeAttached || !agent || typeof agent.cancel !== 'function' || wrappedAgents.has(agent)) return
+    const original = agent.cancel
+    const cancel = function(cause, ...args) {
+      if (this === agent) cancellationEpochs.set(agent, (cancellationEpochs.get(agent) ?? 0) + 1)
+      const result = original.call(this, cause, ...args)
+      if (this !== agent || cause?.kind !== 'user') return result
+      const registry = ctx.get?.('agents') ?? ctx.agents
+      if (registry?.get && registry.get(agent.id) !== agent) return result
+      const runtime = ctx.get?.('subagents') ?? ctx.subagents
+      if (typeof runtime?.interrupt !== 'function') return result
+      const rootSessionId = sessionIdentity({ agent })
+      const descendantIds = new Set([rootSessionId])
+      let changed = true
+      while (changed) {
+        changed = false
+        for (const [id, scope] of childScopes) {
+          if ((descendantIds.has(scope.parentSessionId) || scope.sessionId === rootSessionId) && !descendantIds.has(id)) {
+            descendantIds.add(id)
+            changed = true
+          }
+        }
+      }
+      descendantIds.delete(sessionIdentity({ agent }))
+      // Mark the whole snapshot before interrupting any child: settlement can
+      // synchronously notify another stopped ancestor during this loop.
+      for (const id of descendantIds) {
+        const scope = childScopes.get(id)
+        if (scope?.active) scope.cancelled = true
+      }
+      for (const id of descendantIds) {
+        if (!childScopes.get(id)?.active) continue
+        try {
+          // interrupt preserves this root's ability to delegate in later turns.
+          interruptScope(id, agent)
+        } catch (error) {
+          emitBridgeDiagnostic('subagent.interrupt-error', { sessionId: agent.id, childSessionId: id, error: String(error) })
+        }
+      }
+      return result
+    }
+    try {
+      agent.cancel = cancel
+      const deliveries = []
+      wrappedAgents.set(agent, { original, cancel, deliveries })
+      if (typeof agent.inject === 'function') {
+        const inject = agent.inject
+        for (const method of ['followup', 'steer']) {
+          const original = agent[method]
+          if (typeof original !== 'function') continue
+          const deliver = function(message, ...args) {
+            const source = message?.source
+            const scope = source?.kind === 'subagent-settled' ? childScopes.get(source.senderSessionId) : undefined
+            // Desktop delivers its notice before subagent/end, so this is the
+            // sender's current residency epoch, including reused child ids.
+            if (this === agent && scope?.cancelled && scope.parentAgent === agent) {
+              const receiver = childScopes.get(sessionIdentity({ agent }))
+              // An injected inbox item would prevent this stopped managed
+              // ancestor from settling. Its child tool records retain results.
+              if (receiver?.cancelled && receiver.childAgent === agent) return undefined
+              return inject.call(this, message, ...args)
+            }
+            return original.call(this, message, ...args)
+          }
+          try {
+            agent[method] = deliver
+            deliveries.push({ method, original, deliver })
+          } catch {
+            // Immutable custom Agents retain their own delivery semantics.
+          }
+        }
+      }
+    } catch {
+      // Custom providers may expose an immutable Agent; presentation still works.
+    }
+  }
+
+  const restoreAgent = (agent, wrapped) => {
+    if (agent.cancel === wrapped.cancel) agent.cancel = wrapped.original
+    for (const { method, original, deliver } of wrapped.deliveries) {
+      if (agent[method] === deliver) agent[method] = original
+    }
+  }
+
+  ctx.effect?.(() => () => {
+    for (const [agent, wrapped] of wrappedAgents) {
+      restoreAgent(agent, wrapped)
+    }
+    wrappedAgents.clear()
+  })
+
+  ctx.on('agent/created', ({ agent }) => observeCancellation(agent))
+  ctx.on('agent/disposed', ({ agent }) => {
+    const wrapped = wrappedAgents.get(agent)
+    if (wrapped) restoreAgent(agent, wrapped)
+    wrappedAgents.delete(agent)
+  })
+  ctx.on('tools/execute', (exec, next) => {
+    observeCancellation(exec.agent)
+    return execution.run({ exec, cancellationEpoch: cancellationEpochs.get(exec.agent) ?? 0 }, next)
+  }, { prepend: true })
+
+  ctx.on('subagent/start', (info) => {
+    const executing = execution.getStore()
+    const exec = executing?.exec
+    if (!exec || !sessionIdentity(exec) || typeof info.id !== 'string' || typeof info.runId !== 'string') return
+    const registry = ctx.get?.('agents') ?? ctx.agents
+    const scope = {
+      ...messageScope(exec.agent),
+      parentSessionId: sessionIdentity(exec),
+      parentAgent: exec.agent,
+      childAgent: info.local ? registry?.get?.(info.id) : undefined,
+      callId: exec.callId,
+      rootCallId: exec.rootCallId ?? exec.callId,
+      toolName: exec.name,
+      rawInput: exec.arguments,
+      runId: info.runId,
+      active: true,
+      cancelled: false,
+      presentation: {
+        card: 'subagent',
+        title: exec.arguments?.description ?? exec.name,
+        agentName: exec.arguments?.agent_preset ?? info.provider,
+        childSessionId: info.id,
+        runId: info.runId,
+        status: 'running',
+      },
+    }
+    childScopes.set(info.id, scope)
+    emit({ type: 'tool_call', protocol: ACPILOT_DSH_BRIDGE_PROTOCOL,
+      sessionId: scope.sessionId,
+      ...(scope.agentSessionId ? { agentSessionId: scope.agentSessionId } : {}),
+      ...(scope.subAgentInvocationId ? { subAgentInvocationId: scope.subAgentInvocationId } : {}),
+      ...(scope.parentSubAgentInvocationId ? { parentSubAgentInvocationId: scope.parentSubAgentInvocationId } : {}),
+      toolCallId: scope.callId, rootToolCallId: scope.rootCallId, toolName: scope.toolName,
+      rawInput: scope.rawInput, presentation: scope.presentation,
+    })
+    if (exec.signal?.aborted || executing.cancellationEpoch !== (cancellationEpochs.get(exec.agent) ?? 0)) {
+      scope.cancelled = true
+      try {
+        interruptScope(info.id, exec.agent)
+      } catch (error) {
+        emitBridgeDiagnostic('subagent.interrupt-error', { sessionId: scope.parentSessionId, childSessionId: info.id, error: String(error) })
+      }
+    }
+  })
+  ctx.on('subagent/end', (info) => {
+    const scope = childScopes.get(info.id)
+    if (!scope || scope.runId !== info.runId) return
+    scope.active = false
+    const isError = info.stopReason !== 'completed' && info.stopReason !== 'end_turn'
+    scope.presentation = { ...scope.presentation, status: isError ? 'error' : 'completed', stopReason: info.stopReason }
+    emit({ type: 'tool_result', protocol: ACPILOT_DSH_BRIDGE_PROTOCOL,
+      sessionId: scope.sessionId,
+      ...(scope.agentSessionId ? { agentSessionId: scope.agentSessionId } : {}),
+      ...(scope.subAgentInvocationId ? { subAgentInvocationId: scope.subAgentInvocationId } : {}),
+      toolCallId: scope.callId, rootToolCallId: scope.rootCallId, toolName: scope.toolName,
+      isError, output: info.lastAssistantMessage ?? '', presentation: scope.presentation,
+    })
+    // Retain recent ended scopes for trailing child results, without evicting
+    // running descendants needed by cancellation.
+    if (childScopes.size > 256) {
+      for (const [id, candidate] of childScopes) {
+        if (!candidate.active) childScopes.delete(id)
+        if (childScopes.size <= 256) break
+      }
+    }
+  })
 
   const rememberExecAgent = (sessionId, agent) => {
     if (!sessionId || !agent || typeof agent !== 'object') return
@@ -346,7 +547,7 @@ export function apply(ctx) {
       emit({
         type: 'tool_call',
         protocol: ACPILOT_DSH_BRIDGE_PROTOCOL,
-        sessionId,
+        ...messageScope(exec.agent),
         toolCallId: exec.callId,
         rootToolCallId: exec.rootCallId ?? exec.callId,
         toolName: exec.name,
@@ -441,11 +642,15 @@ export function apply(ctx) {
   ctx.on('tools/result', (exec, result) => {
     const sessionId = sessionIdentity(exec)
     if (!sessionId) return undefined
-    const presentation = resultPresentation(exec, result)
+    const childId = result.value?.kind === 'activation' ? result.value.subagentId : undefined
+    const activation = typeof childId === 'string' ? childScopes.get(childId) : undefined
+    // An unusually fast child can end before its admission tool returns.
+    if (activation && !activation.active) return undefined
+    const presentation = activation?.presentation ?? resultPresentation(exec, result)
     emit({
       type: 'tool_result',
       protocol: ACPILOT_DSH_BRIDGE_PROTOCOL,
-      sessionId,
+      ...messageScope(exec.agent),
       toolCallId: exec.callId,
       rootToolCallId: exec.rootCallId ?? exec.callId,
       toolName: exec.name,

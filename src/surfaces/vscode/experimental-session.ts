@@ -43,6 +43,8 @@ import type { StreamPartRecord } from '../../ssp/types';
 import { getCheckpointApproval, snapshotTurnIndex } from '../../backend/checkpoint/approval-state';
 import { pushSnapshotTextEditParts, replaySnapshotsToWorkspace } from '../../backend/checkpoint/replay';
 import { SessionTitleService } from '../../participant/session-title';
+import { isPlaceholderSessionTitle } from '../../backend/session-title';
+export { isPlaceholderSessionTitle } from '../../backend/session-title';
 import type { SessionTitleSource } from '../../backend/serializable/types';
 
 // ---------------------------------------------------------------------------
@@ -124,27 +126,6 @@ function createSessionResource(ctx: BackendContext, sessionId: string): vscode.U
  * @returns Object with `provider` (ChatSessionContentProvider) and
  *          `controller` (ChatSessionItemController), both ready for registration.
  */
-/**
- * Returns true if `title` is a placeholder/auto-generated session title
- * that carries no meaningful information (e.g. "New OpenCode Session",
- * "OpenCode Session abc", "Session abc", or empty).
- */
-export function isPlaceholderSessionTitle(title: string | undefined): boolean {
-  const normalized = title?.trim() ?? '';
-  return !normalized
-    || normalized === 'New OpenCode Session'
-    || normalized === 'New ACP Agent Session'
-    || normalized === 'New Reasonix Session'
-    || normalized === 'New DeepSeek Harness Session'
-    || normalized.startsWith('OpenCode Session ')
-    || normalized.startsWith('ACP Session ')
-    || normalized.startsWith('ACP Agent Session ')
-    || normalized.startsWith('Reasonix Session ')
-    || normalized.startsWith('DSH Session ')
-    || normalized.startsWith('DeepSeek Harness Session ')
-    || normalized.startsWith('Session ');
-}
-
 export function createSessionContentProvider(
   state: ExtensionState,
   ctx: BackendContext,
@@ -2156,7 +2137,7 @@ export function createSessionContentProvider(
         for (const entry of entriesForResponse) {
           if (token.isCancellationRequested) {break;}
           if (shouldRenderRestoredEntry(entry)) {
-            createSSPFromRecord(entry.record, entry.metaIndex).render(collector as never);
+            createSSPFromRecord(entry.record, entry.metaIndex, directory).render(collector as never);
           }
           const restoredEditCallId = getRestoredEditSnapshotCallId(entry.record);
           const restoredEditScopeKey = restoredEditCallId
@@ -2431,6 +2412,7 @@ export function createSessionContentProvider(
               existingState.title = resolvedTitle.title;
               existingState.titleSource = resolvedTitle.source;
             }
+            existingState.provisionalTitle = resolvedTitle.provisional === true;
             existingState.createdAt = sessionInfo.data?.createdAt ?? existingState.createdAt ?? new Date();
           } else {
             runtime.sessions.set(vscodeSessionKey, {
@@ -2438,6 +2420,7 @@ export function createSessionContentProvider(
               turnMap: [],
               title: resolvedTitle.title,
               titleSource: resolvedTitle.source,
+              provisionalTitle: resolvedTitle.provisional === true,
               createdAt: sessionInfo.data?.createdAt ?? new Date(),
             });
           }
